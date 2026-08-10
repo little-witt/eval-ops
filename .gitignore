@@ -1,0 +1,36 @@
+# OS and editors
+.DS_Store
+.idea/
+.vscode/
+
+# Secrets and local configuration
+.env
+.env.*
+!.env.example
+
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+dist/
+build/
+*.egg-info/
+
+# JavaScript, if a UI is added later
+node_modules/
+
+# Local EvalOps state may contain internal prompts, traces, and artifacts
+.aceval/
+*.sqlite3
+*.db
+reports/generated/
+
+# Logs and temporary files
+*.log
+*.tmp
+*.swp
