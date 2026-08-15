@@ -8,6 +8,8 @@
 
 Skill Doctor 将目前依赖人工复制日志、反复对话和手工重测的 Skill 调试过程，转化为一个可复现、可归因、有预算限制、经过隐藏回归验证的自动评测与候选修复工作流。
 
+项目从 D1 起采用通用 **EvalOps Kernel + EvalPack** 架构：Kernel 负责执行、Trace、预算、候选 lineage、数据隔离和回归门禁；EvalPack 声明某类任务的 Case、fixture、Oracle、Driver、Grader 与可选 Optimizer policy。D20 不等到赛后再重构通用内核，而是用两个不同 Pack 验证这一边界。
+
 ## 项目背景
 
 在日常 Skill 开发中，初版通常由 Agent 根据用户 Prompt 生成。用户随后建立测试 Case、运行 Skill、发现失败，再把会话日志交给另一个 Agent 分析和修改。
@@ -22,10 +24,10 @@ Skill Doctor 将目前依赖人工复制日志、反复对话和手工重测的 
 
 ## 解决方案
 
-用户提供一个 Skill、少量种子 Case 和成功标准，Skill Doctor 自动完成：
+用户提供一个被测 Skill、EvalPack、少量种子 Case 和成功标准，Skill Doctor 自动完成：
 
 ```text
-Skill + Case + 成功标准
+Subject + EvalPack + Case + 成功标准
           |
           v
 建立 without/with 或 old/new 基线
@@ -60,6 +62,7 @@ dev 筛选 -> validation 门禁 -> holdout 验证
 - **防止测试集刷分**：Optimizer 只看 dev，validation 只返回晋级结果，holdout 最终运行。
 - **控制成本与风险**：候选数、轮数、Token、费用、时间和修改范围均有硬上限。
 - **沉淀团队资产**：真实失败转化为版本化 Case；D40 先进入 Evaluator Replay CI，具备凭证、Runtime 能力和预算后再进入 Subject Online Eval Gate。
+- **量化扩展成本**：新任务通过 EvalPack 接入，并记录工程工时、Pack LOC、Kernel 改动、新依赖和 conformance 结果，避免只用“可插拔”作口头承诺。
 
 ## 核心创新点
 
@@ -79,33 +82,45 @@ Agent 只负责语义诊断、Judge 和候选补丁生成；状态、预算、�
 
 项目会特意展示一个“表面提升但产生误报”的候选被 validation 拒绝，证明系统不仅会生成修改，也能发现修改带来的回归。
 
-### 5. 可迁移到完整 Agent
+### 5. D1 通用 Kernel 与低成本 EvalPack
 
-核心抽象面向 `SubjectUnderTest`，Skill 只是第一种实现。后续同一套 Runner、Trace 和 Grader 可迁移到 system prompt、工具配置、Workflow 和完整 Agent；D40 对 Agent 只承诺 capability-gated 评测与诊断，受控优化目前只支持 `SkillSubject`。
+Kernel 从第一天就不包含安全审查、漏洞类型或 CSV 字段等领域分支。`security-review` 和 `csv-summary-smoke` 只能依赖公共 Registry 与协议；若接入第二个 Pack 必须修改 Orchestrator、状态机、存储协议或报告器，则 D20 的通用性验收失败。
+
+D20 冻结 `EvalPack v1alpha1` 后，以第二 Pack 的实际接入时间、Kernel Diff 和 conformance test 证明扩展成本，而不是等到 D21 再抽象一个已被 Demo 逻辑污染的 Core。
+
+### 6. 可迁移到完整 Agent
+
+通用 Kernel 从 D1 面向 `SubjectAdapter` 公共契约；D20 首先实现 `SkillSubject`，后续再增加 system prompt、工具配置、Workflow 和完整 Agent 的具体 Adapter。D40 对 Agent 只承诺 capability-gated 评测与诊断，受控优化目前只支持 `SkillSubject`。
 
 ## 系统形态
 
 Skill Doctor 不是重新实现一个 Agent Runtime，也不是多个 Agent 自由聊天。它采用：
 
-> 确定性评测工作流 + 受约束的语义 Agent 节点 + 可插拔 Subject/Runtime/Grader。
+> 通用 EvalOps Kernel + 声明式 EvalPack + 受约束的语义 Agent 节点。
 
 ```text
 CLI / Report / CI
         |
-Evaluation Orchestrator
+EvalOps Kernel
+(Orchestrator / Budget / CAS / Gate / Replay)
         |
-Subject Adapter --- Runtime Adapter --- Scenario Suite
-        |                  |
-        +----------- Sandbox Runner
-                           |
-                  Trace + Artifacts
-                           |
-       Deterministic Grader + LLM Judge
-                           |
-               Analyzer + Optimizer
-                           |
-                  Regression Gate
+        +----------------------+----------------------+
+        |                      |                      |
+ Subject Adapter        Runtime Adapter            EvalPack
+ Skill / Agent          Company API / Replay       Case + Fixture + Oracle
+                                                   Driver + Graders
+                                                   Optimizer Policy
+        |                      |                      |
+        +--------------- Sandbox Runner -------------+
+                               |
+                    RunObservation + CAS
+                               |
+                 Grade / Analyze / Optimize
+                               |
+                       Regression Gate
 ```
+
+Kernel 只通过公共 Contract 和显式 Registry 调度组件，不 import 具体 Pack，也不允许出现 `if pack == "security-review"` 或 `if csv` 之类领域分支。
 
 公司内部 Agent API 将作为首个 Runtime：评测系统负责创建独立 Session、指定被测版本、提交 Case、获取工具调用与 Agent 输出序列，并将公司日志转换为统一 Trace。
 
@@ -119,13 +134,14 @@ Agent Runtime 解决“Agent 如何执行任务”，Skill Doctor 解决的是�
 - 如何校准 LLM Judge；
 - 如何区分 Skill 缺陷和非 Skill 故障；
 - 如何防止候选对少量 Case 过拟合；
-- 如何在预算、安全和回归约束内停止优化。
+- 如何在预算、安全和回归约束内停止优化；
+- 如何以可测量成本接入新的任务类型，而不修改 Kernel 状态机。
 
 项目的技术重点是实验控制、Trace 语义化、混合评测、故障归因和受控优化，而不是重复建设模型调用与工具循环。
 
-## 黑客松旗舰 Demo
+## 黑客松双 Pack Demo
 
-首个 Demo 选择“安全代码审查 Skill”：
+旗舰主链使用 `security-review` EvalPack，展示完整自迭代闭环：
 
 - 原始 Skill 漏报路径穿越或命令注入；
 - 确定性 Grader 判断漏洞是否被正确报告；
@@ -134,7 +150,11 @@ Agent Runtime 解决“Agent 如何执行任务”，Skill Doctor 解决的是�
 - 一个精确候选进入 holdout 并完成最终验证；
 - 一个工具超时 Case 被判断为非 Skill 故障，系统拒绝错误修改。
 
-现场采用三层演示保障：一个最小 Live Case、一次真实历史 Run Replay，以及完整流程录屏。
+主链之后增加 30–45 秒 `csv-summary-smoke` 扩展证据：同一 Runtime、CLI、RunObservation、聚合和报告链路读取销售 CSV 并生成 `summary.json`；初版 Skill 的金额或空地区汇总失败，最小候选在 1 lineage、1 round 内修复 dev，且 validation 无硬回退。
+
+这段扩展不包装成第二个完整 Benchmark，而是直接展示 `kernel_files_touched = 0`、`kernel_loc_changed = 0`、自定义 Python 为 0、新 Runtime/依赖为 0、Pack conformance 为 100%，以及从空 Pack 到首个可评分 Run/首个 validated candidate 的实际工时。
+
+现场采用三层演示保障：安全审查的一个最小 Live Compare、赛前真实完整 Run Replay，以及完整流程录屏；CSV 使用冻结 Run 和扩展成本报告快速展示，不挤占旗舰闭环。
 
 ## 技术架构
 
@@ -145,6 +165,7 @@ Agent Runtime 解决“Agent 如何执行任务”，Skill Doctor 解决的是�
 | 核心语言 | Python 3.12、Pydantic v2 |
 | CLI | Typer |
 | 工作流 | 显式状态机、`asyncio` |
+| 领域扩展 | EvalPack v1alpha1、显式 Registry、Pack conformance |
 | Runtime | 公司 Agent API Adapter、Replay Adapter |
 | Trace | Raw JSONL + Canonical JSONL |
 | 评分 | 确定性 Grader、轨迹指标、结构化 LLM Judge |
@@ -153,27 +174,35 @@ Agent Runtime 解决“Agent 如何执行任务”，Skill Doctor 解决的是�
 | 隔离 | MVP 受限工作区；求职版受限 Worker，容器为条件扩展 |
 | CI | pytest、Golden Replay、GitHub Action |
 
-完整接口、数据模型、状态机、安全边界和逐日计划见 [TECHNICAL_DESIGN.md](./TECHNICAL_DESIGN.md)。公开 Skill 排行、分类口径、代表任务输入输出与分类自迭代方案见 [SKILL_CATEGORY_AND_ITERATION_DESIGN.md](./SKILL_CATEGORY_AND_ITERATION_DESIGN.md)。
+EvalPack 边界、Manifest、公共 Protocol、两个 D20 Pack 和扩展成本验收见 [EVALPACK_SPEC.md](./EVALPACK_SPEC.md)。完整接口、数据模型、状态机、安全边界和逐日计划见 [TECHNICAL_DESIGN.md](./TECHNICAL_DESIGN.md)。公开 Skill 排行、分类口径、代表任务输入输出与分类自迭代方案见 [SKILL_CATEGORY_AND_ITERATION_DESIGN.md](./SKILL_CATEGORY_AND_ITERATION_DESIGN.md)。
 
 ## 交付计划
 
 ### 20 天：黑客松 MVP
 
+- D1 起建立不含安全审查或 CSV 领域分支的 EvalOps Kernel、公共 Registry 与 `EvalPack v1alpha1` Contract；
 - 一个真实 Agent Runtime Adapter；
-- Skill 新旧版本配对执行；
+- `security-review` EvalPack：6 dev + 2 validation + 2 holdout，完成诊断、2 lineages × 2 dev-only rounds、候选拒绝/晋级和人工审批建议；
+- `csv-summary-smoke` EvalPack：2 dev + 1 validation，复用通用 Skill Optimizer 完成 1 lineage × 1 round 的最小自迭代；
 - 机器可读 Case、Trace 和 artifact；
 - 确定性 Grader + 结构化 LLM Judge；
 - 带证据和证据等级的失败诊断假设；
-- 候选 `SKILL.md` Diff、validation 和 holdout 门禁；
+- Pack lint、FakeRuntime conformance、GoldenOptimizer 和冻结 Observation Replay；
+- 候选 `SKILL.md` Diff、validation 和 holdout 门禁；CSV smoke 不设 holdout，不冒充完整 Benchmark；
 - 预算、超时、停止条件、静态报告和 Replay；
-- 6 分钟演示脚本与录屏降级方案。
+- `kernel_contract_hash` 与第二 Pack 扩展成本报告；
+- 6 分钟演示脚本、30–45 秒 CSV 扩展证据与录屏降级方案。
+
+所有 D20 Pack 必须通过 Manifest/Scenario/Oracle 引用校验、`prepare -> execute -> collect -> cleanup` 幂等性、Oracle 与隐藏集不可见、确定性 Replay 一致、`not_evaluable/error` 不聚合为 pass、路径与预算 fail closed、Optimizer 只能读取 dev 等 conformance test。
+
+第二 Pack 的预注册目标是：接入期间 Kernel 文件与 LOC 改动均为 0，自定义 Python、新 Runtime 和新依赖均为 0；从空 Pack 到首个可评分 Run 不超过 4 工时，到一次候选 validation 不超过 8 工时；Pack conformance 100%。这些是待测目标，最终报告必须展示实际值和偏差原因，不能提前写成简历成果。
 
 ### 40 天：求职作品
 
-- 新增 capability-gated `AgentSubject`；若公司 API 配置不可控，则明确降级为 `FixedAgentTarget`；
+- 在 D1 已通用的 Kernel 上新增 capability-gated `AgentSubject`；若公司 API 配置不可控，则明确降级为 `FixedAgentTarget`；
 - 支持在线执行和带 completeness flags 的离线 Trace Import，缺少 Case/artifact/state 时只做局部评分；
 - 受限 Worker；容器为条件扩展；
-- 至少 2 个被测配置或任务族、12–20 个分层 Case；
+- 在 D20 两个版本化 EvalPack 上扩展到 12–20 个分层 Case，并增加 Agent/Fixed Agent target 证据；
 - 20–30 个标注单元的 Judge pilot calibration；
 - 多次重复实验、成本和波动统计；
 - Output-only vs Trace-aware 消融实验；
@@ -194,6 +223,9 @@ XLSX 结构化产物 Grader、第二真实 Runtime、20–30 Case、独立归因
 - `judge_human_agreement`
 - `median_time_to_fix`
 - `fix_success_within_budget`
+- `pack_extension_hours`
+- `kernel_files_touched` / `kernel_loc_changed`
+- `pack_conformance_pass_rate`
 - Token、费用和延迟
 
 所有提升数字都将在真实 Benchmark 完成后填写，不使用未经实验验证的宣传数据。
@@ -201,6 +233,7 @@ XLSX 结构化产物 Grader、第二真实 Runtime、20–30 Case、独立归因
 ## 当前仓库内容
 
 - [README.md](./README.md)：黑客松项目简介与仓库首页；
+- [EVALPACK_SPEC.md](./EVALPACK_SPEC.md)：D1 通用 Kernel/EvalPack 边界、Manifest、公共 Protocol、D20 双 Pack 和扩展成本验收；
 - [TECHNICAL_DESIGN.md](./TECHNICAL_DESIGN.md)：初版技术方案、D1–D40 计划和验收标准；
 - [SKILL_CATEGORY_AND_ITERATION_DESIGN.md](./SKILL_CATEGORY_AND_ITERATION_DESIGN.md)：Skill 排行分析、双轴分类、输入输出契约和自迭代设计；
 - [research/skill-ranking](./research/skill-ranking)：榜单原始快照、时间/hash 和可复算分类脚本。
@@ -211,8 +244,9 @@ XLSX 结构化产物 Grader、第二真实 Runtime、20–30 Case、独立归因
 - 不将合成 Case 自动视为真实标准；
 - 不让 Optimizer 修改 Case、Grader、holdout 或 Runner；
 - 不自动覆盖、合并或发布生产 Skill；
+- D20 不自动加载任意 Python Pack、不执行 Pack 自带 shell grader，也不建设插件市场；
 - MVP 的同机目录隔离不是生产级安全沙箱，该限制会被明确披露。
 
 ## 长期定位
 
-> Agent Capability EvalOps：面向 Agent 能力组件和完整 Agent 的持续评测与故障归因框架；仅在存在受约束 Optimizer Adapter 时提供候选优化，首个可优化对象是 Agent Skills。
+> Agent Capability EvalOps：从 D1 采用通用 Kernel + EvalPack，面向 Agent 能力组件和完整 Agent 提供持续评测与故障归因；仅在存在受约束 Optimizer Adapter 时生成候选改进，D20 首先用两个 Skill EvalPack 验证完整自迭代与低成本扩展。

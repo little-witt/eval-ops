@@ -27,10 +27,10 @@
 
 | 阶段 | 范围 | 目的 |
 |---|---|---|
-| D1-D20 | 只做深代码/安全审查 Skill | 用确定性金标完成可信的自动修复闭环 |
-| D1-D20 余量 | D10 前决定是否加 3-5 个 CSV smoke Case | 只复用已有 file/schema grader |
-| D21-D40 | 迁移到 Agent/Fixed Agent 与历史 Trace | 证明核心不绑定 Skill，并诚实处理不完整日志 |
-| D21-D40 余量 | 增加 3-5 个 XLSX smoke Case | 展示 artifact parser、公式结构和模板 Diff |
+| D1-D20 | 建立 Kernel v1 / EvalPack 公共契约，并完成 `security-review` Pack | 用确定性金标完成可信的自动修复闭环 |
+| D1-D20 硬验收 | 增加 `csv-summary-smoke` Pack，完成 baseline -> candidate -> dev + validation | 证明新增 Pack 不需要修改 Kernel |
+| D21-D40 | 用 Agent/Fixed Agent 与历史 Trace 验证 Kernel v1 兼容性 | 证明核心不绑定 Skill，并诚实处理不完整日志 |
+| D21-D40 余量 | 增加 3-5 个 XLSX smoke Case | 条件展示 artifact parser、公式结构和模板 Diff，不提升为 Core |
 | D40 后扩展 | 增加完整富产物或状态型工具模拟环境 | 展示渲染、状态 diff、幂等和安全 |
 
 不建议在 20 天内同时实现三个完整 Benchmark。项目的核心竞争力是可信闭环，不是类别数量。
@@ -156,28 +156,34 @@ Hot 榜比较当前小时和前一天同小时。本次头部增量很小、噪�
 
 这套双轴分类不依赖 `SKILL.md` 这种载体。未来即使 Skill 被 Workflow、Plugin 或完整 Agent 取代，Case、Trace 和 Grader 仍可复用。
 
-这里的执行契约首先是 Case 元数据，用于路由 Grader，不直接替代 `SubjectAdapter` 或 `RuntimeAdapter`。D40 若需要按契约管理 fixture 生命周期，新增边界清晰的 `ScenarioDriver`：
+这里的执行契约首先是 Case 元数据，用于路由 Grader，不直接替代 `SubjectAdapter` 或 `RuntimeAdapter`。`ScenarioDriver` 从 D1 起就是 Kernel v1 公共契约，用于管理 fixture 生命周期和观察收集：
 
 ```python
 class ScenarioDriver(Protocol):
-    def required_capabilities(self, case: Scenario) -> set[str]: ...
-    async def prepare(self, case: Scenario, workspace: Path) -> PreparedScenario: ...
-    async def collect_observation(
-        self, run: RunResult, prepared: PreparedScenario
+    id: str
+    def required_capabilities(self, scenario: FrozenScenario) -> set[str]: ...
+    async def prepare(
+        self, scenario: FrozenScenario, context: RunContext
+    ) -> PreparedScenario: ...
+    async def collect(
+        self, prepared: PreparedScenario, result: RuntimeResult
     ) -> RunObservation: ...
     async def cleanup(self, prepared: PreparedScenario) -> None: ...
 ```
 
-`SubjectAdapter` 管理被测版本，`RuntimeAdapter` 负责执行，`ScenarioDriver` 只管理 Case fixture、pre/post state 和观察收集。`collect_observation` 必须在 `cleanup` 前将 Canonical Trace、artifact、pre/post state 写入不可变的 content-addressed storage（CAS），`RunObservation` 中只保留带 hash 的引用；`cleanup` 只能删除临时 fixture。
+`SubjectAdapter` 管理被测版本，`RuntimeAdapter` 负责执行，`ScenarioDriver` 只管理 Case fixture、pre/post state 和观察收集。`collect` 必须在 `cleanup` 前将 Canonical Trace、artifact、pre/post state 写入不可变的 content-addressed storage（CAS），`RunObservation` 中只保留带 hash 的引用；`cleanup` 只能删除临时 fixture。
 
 Grader 不能只读运行结果，还必须读取被冻结的 Case 规则或 State Oracle：
 
 ```python
 class Grader(Protocol):
+    id: str
+    version: str
     async def evaluate(
         self,
         observation: RunObservation,
-        scenario_or_oracle: FrozenScenario,
+        oracle: FrozenOracle,
+        params: dict,
     ) -> GradeResult: ...
 ```
 
@@ -222,6 +228,28 @@ risk_level: low
 | 前端/UI/设计 | `ui_design` |
 | 研究/检索/教学、浏览器/Web 自动化 | `browser_research` |
 | 营销/内容运营 | `marketing_communications` |
+
+### 3.4 D20 Kernel v1 / EvalPack 公共契约
+
+D1-D20 不是先写一个 Security Review 特例、再在 D21-D40 抽象通用接口。D20 直接冻结一套最小公共契约，并用两个 Pack 验收：
+
+| Kernel v1 负责 | EvalPack 负责 |
+|---|---|
+| 状态机、预算、候选 lineage、validation/holdout 隔离 | Subject 兼容契约、Scenario、fixture 和 Oracle；实际 Subject ref 由运行配置提供 |
+| Runtime 调用、临时工作区、Canonical Trace、CAS 和 Replay | 选择 `ScenarioDriver`、内置 Grader 及其参数 |
+| Grader 调度、固定 Gate 语义、Patch 应用和越界检查 | `OptimizerPolicy`、Pack 元数据和报告说明 |
+| SQLite 运行记录、聚合结果和人工审批状态 | 不定义状态转换、任意 DAG、模型供应商或存储结构 |
+
+D20 稳定的公共面只有四项：
+
+- `EvalPackManifest`：`api_version`、`name`、`version`、`subject_contract`、`driver`、`required_capabilities`、`suite`、`graders`、`optimizer_policy`；
+- `ScenarioDriver`：`required_capabilities`、`prepare`、`collect`、`cleanup`；
+- `Grader`：读取冻结的 `RunObservation` 和 Scenario/Oracle，返回 `pass | fail | not_evaluable | error`、score、metrics 和 evidence reference；
+- `OptimizerPolicy`：`allowed_paths`、`patchable_components`、`visible_splits`、`beam_width`、`max_rounds`、`max_candidate_snapshots` 和 Patch 大小限制。
+
+实现采用 Python `Protocol`、Pydantic Manifest 和显式内置注册表。D20 不做 setuptools entry point、动态 import、依赖注入容器或通用 DAG 引擎。Pack 只能按 ID 选择内置 Driver/Grader；新增 Pack 不应要求修改 Kernel 源码。
+
+`security-review` 是完整自动优化闭环；`csv-summary-smoke` 是跨 Pack 硬验收。后者必须仅增加 Pack 目录、Subject、Scenario、fixture、Oracle 和候选快照，在零 Kernel 改动下完成 baseline -> candidate -> dev + validation。
 
 ## 4. 分类统计与热门结论
 
@@ -645,7 +673,7 @@ D20 约束：
 ```text
 validation_eligible =
   no_hard_regression
-  AND no_safety_violation
+  AND all_hard_policy_gates_pass
   AND validation_case_gates_pass
   AND absolute_budget_pass
 
@@ -660,7 +688,7 @@ utility =
 
 D20 的 validation 样本很少，使用 Case 级门禁，不使用“提升若干百分点”。D40 数据规模扩大后，才可增加预注册的聚合 uplift 阈值和置信区间。
 
-最优候选进入一次预注册 holdout 批次。批次内部可以为随机任务预先规定多次重复，但整个批次的任何结果都不能反馈给 Optimizer。只有 holdout 的所有硬门禁通过、质量不低于预注册下限且绝对预算通过，状态才是 `READY_FOR_REVIEW`；否则为 `REJECTED`，本实验结束。
+Pack 声明 holdout 时，最优候选进入一次预注册 holdout 批次。批次内部可以为随机任务预先规定多次重复，但整个批次的任何结果都不能反馈给 Optimizer。只有 holdout 的所有硬门禁通过、质量不低于预注册下限且绝对预算通过，状态才是 `READY_FOR_REVIEW`；否则为 `REJECTED`，本实验结束。未声明 holdout 的 Pack 在 validation 通过后直接进入人工评审。
 
 相对 baseline 的成本变化只作为排序和报告指标，因为提前失败的 baseline 天然更便宜。硬门禁使用预注册的绝对调用数、Token、金额和墙钟预算。
 
@@ -672,7 +700,7 @@ D20 的 validation 样本很少，使用 Case 级门禁，不使用“提升若�
 - 可修复证据不完整或失败无法重复；
 - 需要修改 `SKILL.md` 以外的文件；
 - 主要失败来自 Runtime、权限、工具或 Eval Spec；
-- 最优候选 holdout 失败；
+- Pack 声明 holdout 且最优候选未通过；
 - 人工策略要求审批。
 
 ## 7. 类别一：代码/安全审查自迭代
@@ -681,13 +709,12 @@ D20 的 validation 样本很少，使用 Case 级门禁，不使用“提升若�
 
 | Split | 数量 | 内容 |
 |---|---:|---|
-| activation | 2 | 明确安全审查请求、普通代码摘要请求 |
 | dev | 6 | 命令注入和路径穿越两个 family；每类 2 个 source/sink 变体 + 1 个 hard negative |
 | validation | 2 | 一个未见语法变体、一个正常代码负例 |
 | holdout | 2 | 不同项目结构中的同 family 漏洞、一个正常实现 |
 | infra_sentinel | 1 | 注入文件读取失败或工具超时 |
 
-输出契约在所有 Case 中共同检查，不单独占一个样本。D20 只声称对这两个漏洞 family 的当前 Benchmark 有可验证提升。按“仓库/实现模式”分组切分，不能把同一漏洞模板的轻微改写随机分到 dev 和 holdout。
+输出契约在所有 Case 中共同检查，不单独占一个样本。D20 不建设独立 activation suite；只有 Runtime 原生暴露 Skill 加载事件时才记录非阻断 activation 指标，否则为 `not_evaluable`。D20 只声称对这两个漏洞 family 的当前 Benchmark 有可验证提升。按“仓库/实现模式”分组切分，不能把同一漏洞模板的轻微改写随机分到 dev 和 holdout。
 
 金标 finding：
 
@@ -749,7 +776,7 @@ LLM Judge 不负责判断漏洞是否存在，只评价无法用确定性规则�
 - holdout 漏洞 finding 存在、正常实现无高严重度误报，Schema/引用/安全硬门禁全部通过；
 - holdout 失败即 `REJECTED`，不得把结果反馈给 Optimizer。
 
-现场 Live Compare Profile 通过 `baseline_ref`/`candidate_ref` 使用赛前 dev 阶段已生成并冻结的一个候选，只选择一个锚点 Case，运行 baseline/candidate 两次执行；它不在现场重新诊断或生成候选，也不把单次 baseline 失败宣称为“已证明可重复”。完整 validation 和 holdout 闭环使用赛前真实 Run Replay。
+现场 Live Compare Profile 通过 `subject_ref`/`candidate_ref` 使用赛前 dev 阶段已生成并冻结的一个候选，只选择一个锚点 Case，运行 baseline/candidate 两次执行；它不在现场重新诊断或生成候选，也不把单次 baseline 失败宣称为“已证明可重复”。完整 validation 和 holdout 闭环使用赛前真实 Run Replay。
 
 ## 8. 类别二：状态型工具工作流自迭代
 
@@ -1044,52 +1071,54 @@ completeness:
 
 ### 12.1 D1-D20
 
-保持现有技术方案的旗舰 Demo，不改方向：
+D20 必须同时交付三个结果，缺少任一项都不算完成黑客松 Core：
 
-- 安全代码审查 Skill；
-- 6 dev + 2 validation + 2 holdout；
-- 2 activation + 1 infra sentinel；
-- Schema、finding、Trace 和低权重 Judge；
-- `beam_width = 2`、`max_rounds = 2`、`max_candidate_snapshots = 4`，之后冻结最多两个候选 lineage；
-- 展示一个过度修复候选被 validation 拒绝；
-- 现场一个最小 Live Case，其余真实结果 Replay。
+1. **Kernel v1 与 conformance suite**：冻结 `EvalPackManifest`、`ScenarioDriver`、`Grader`、`OptimizerPolicy` 四个公共面，验证 Manifest 校验、Driver 生命周期、内置 ID 路由、四态评分、split 可见性、预算与 Patch 越界门禁、Canonical Trace/CAS Replay；
+2. **完整的 `security-review` Pack**：保留 6 dev + 2 validation + 2 holdout，执行 baseline 失败 -> Failure Card/根因 -> 候选生成 -> dev 选择 -> validation 晋级或拒绝 -> sealed holdout 报告的完整优化闭环；另用一个非评分 infra sentinel 验证系统拒绝把 Runtime 故障修成 Skill；
+3. **必做的 `csv-summary-smoke` Pack**：输入销售 CSV、输出 `summary.json`，用 2 dev + 1 validation 完成 baseline -> candidate -> dev + validation。它只组合 `artifact_workspace`、`artifact_exists`、`json_schema`、`json_path`、`workspace_diff`，复用 `skill_markdown_v1` Optimizer，限制为 1 lineage、1 round、1 snapshot。
 
-只有在 D10 前主闭环已稳定时，才决定是否加入 3-5 个 CSV smoke Case，并且只能复用现有 file/schema grader。D12 冻结后不增加 XLSX parser 或其他黑客松功能。
+`security-review` 继续使用 Schema、`record_match`、`source_reference`、Trace 和低权重 Judge，设置 `beam_width = 2`、`max_rounds = 2`、`max_candidate_snapshots = 4`，之后冻结最多两个候选 lineage。演示必须包含一个过度修复候选被 validation 拒绝；现场只运行一个最小 Live Case，其余展示由真实 Run 生成的 Replay。
+
+CSV 硬验收要求新增内容仅位于 Pack、Subject/候选快照、Scenario、fixture 和 Oracle，Kernel 源码树前后 hash 不变，且 Security Pack 与 Kernel conformance suite 继续通过。D20 不开发 XLSX parser、不加入 XLSX Case，也不把其他黑客松功能塞入 Core。
 
 ### 12.2 D21-D40
 
-本节与主技术方案使用同一优先级。D40 首先证明评测核心可迁移到 Agent 和历史 Trace；第二种产物类型只有在核心门禁按时通过后才加入。
+Kernel v1 的公共契约已在 D20 冻结。D21-D40 的目标不是“完成”或泛化这套契约，而是在不破坏 v1 公共面的前提下，用 Agent/Fixed Agent 和历史 Trace 验证兼容性；第二种富产物类型只有在核心门禁按时通过后才加入。若验证中发现必须破坏接口的问题，记录为 Kernel v2 提案，不在 D40 静默修改 v1 语义。
 
 | 时间 | 工作 | 验收 |
 |---|---|---|
-| D21-D27 | 完成通用 Subject 契约、能力门禁、`ImportedRunBundle`、部分评分和受限 Worker | Skill 在线、Agent/Fixed Agent、Import 三条支持边界可由 conformance test 证明 |
-| D28-D31 | Grader 插件化；冻结 12-20 个 Case；完成 Judge pilot calibration | 至少两个被测配置/任务族，确定性结果可 Replay，20-30 个 Judge 标注单元只作 pilot |
+| D21-D27 | 在 Kernel v1 上实现 Agent/Fixed Agent 兼容 Adapter、能力门禁、`ImportedRunBundle`、部分评分和受限 Worker | 不修改 v1 公共接口；Skill 在线、Agent/Fixed Agent、Import 三条支持边界由 compatibility/conformance test 证明 |
+| D28-D31 | 通过显式可信 Extension Loader 注册向后兼容的 Adapter/Grader；冻结 12-20 个 Case；完成 Judge pilot calibration | Security/CSV Pack 回归继续通过；至少两个 EvalPack 的确定性结果可 Replay，20-30 个 Judge 标注单元只作 pilot |
 | D32-D35 | 重复实验、Trace-aware 诊断消融、安全测试和确定性 Evaluator Replay CI | 报告配对结果、方差、成本、基础设施失败；CI 不调用模型 |
 | D36-D38 | 完整 Benchmark、稳定性运行和 P0 修复 | 关键 Case 至少三次重复，局限和 `not_evaluable` 完整呈现 |
 | D39-D40 | 文档、报告、视频和干净环境复现 | 可安装、可 Replay、可讲解 |
 
 XLSX 是有条件的 D40 扩展：只有 D27 三条核心路径通过、D31 Benchmark 冻结后仍有余量，才加入 3-5 个 smoke Case；最低发布标准必须同时覆盖 workbook/sheet 结构、公式文本与引用、模板保护 Diff，并输出完整 baseline/candidate 报告。否则完全移到 D40 后，不把半成品计入 Core。最小 Mock State Server、视觉渲染、Vision Judge、LibreOffice 重算和 OTLP 都是 D40 后目标。
 
-若 D27 门禁失败，立即切换到降级线：保留通用 Subject conformance、`FixedAgentTarget` Case 评测、Trace Import 局部指标和 Replay 报告；取消 XLSX、独立归因金标集、容器化和在线 CI，继续使用经过测试的受限 subprocess。降级作品必须明确 capability/completeness 矩阵，不能用“AgentSubject”或“完整离线评分”包装缺失能力。
+若 D27 门禁失败，立即切换到降级线：保留 Kernel v1 compatibility/conformance test、`FixedAgentTarget` Case 评测、Trace Import 局部指标和 Replay 报告；取消 XLSX、独立归因金标集、容器化和在线 CI，继续使用经过测试的受限 subprocess。降级作品必须明确 capability/completeness 矩阵，不能用“AgentSubject”或“完整离线评分”包装缺失能力。
 
 ## 13. 最终作品叙事
 
 ```text
-D20 Implemented/Measured:
-  代码审查 Skill 的失败证据 -> 根因假设 -> 最小 Diff -> 隐藏回归
+D20 Core / Contract Proof:
+  Kernel v1 + conformance suite
+  security-review 完整闭环：失败证据 -> 根因假设 -> 最小 Diff -> validation/隐藏回归
+  csv-summary-smoke：零 Kernel 源码改动完成 baseline -> candidate -> dev + validation
 
-D40 Core:
+D40 Compatibility Evidence:
   capability-gated AgentSubject（或诚实降级为 FixedAgentTarget）
   ImportedRunBundle + 按数据完整度执行的局部评分/诊断
   12-20 Case Benchmark + 重复实验 + Trace-aware 消融 + Evaluator Replay CI
 
 D40 Conditional:
-  3-5 Case 的 XLSX 结构化产物 Grader
+  仅 3-5 Case 的 XLSX 结构化产物 Grader，不计入 Core
 
 Roadmap:
   前端/多媒体视觉评测
   状态型工具的在线 Mock State Server
 ```
+
+因此，40 天作品不是在 D40 才把 Security Review 特例重构成通用框架；它在 D20 已交付并由两个 Pack 验证 Kernel v1，D40 增加的是 Agent/Trace 兼容性证据。XLSX 始终是条件扩展。
 
 完整路线最终覆盖：
 
