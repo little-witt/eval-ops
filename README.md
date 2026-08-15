@@ -37,7 +37,7 @@ Skill + Case + 成功标准
 确定性断言 + 轨迹指标 + 结构化 LLM Judge
           |
           v
-生成带 Trace 证据和置信度的失败假设
+生成带 Trace 证据和证据等级的失败假设
           |
           v
 生成受约束的最小候选 Diff
@@ -59,7 +59,7 @@ dev 筛选 -> validation 门禁 -> holdout 验证
 - **避免错误修复**：区分 Skill、模型、工具、权限、环境和 Eval Spec 故障。
 - **防止测试集刷分**：Optimizer 只看 dev，validation 只返回晋级结果，holdout 最终运行。
 - **控制成本与风险**：候选数、轮数、Token、费用、时间和修改范围均有硬上限。
-- **沉淀团队资产**：真实失败转化为版本化 Case，并进入后续 CI 回归门禁。
+- **沉淀团队资产**：真实失败转化为版本化 Case；D40 先进入 Evaluator Replay CI，具备凭证、Runtime 能力和预算后再进入 Subject Online Eval Gate。
 
 ## 核心创新点
 
@@ -81,7 +81,7 @@ Agent 只负责语义诊断、Judge 和候选补丁生成；状态、预算、�
 
 ### 5. 可迁移到完整 Agent
 
-核心抽象面向 `SubjectUnderTest`，Skill 只是第一种实现。后续同一套 Runner、Trace、Grader 和 Regression Gate 将扩展到 system prompt、工具配置、Workflow 和完整 Agent。
+核心抽象面向 `SubjectUnderTest`，Skill 只是第一种实现。后续同一套 Runner、Trace 和 Grader 可迁移到 system prompt、工具配置、Workflow 和完整 Agent；D40 对 Agent 只承诺 capability-gated 评测与诊断，受控优化目前只支持 `SkillSubject`。
 
 ## 系统形态
 
@@ -150,10 +150,10 @@ Agent Runtime 解决“Agent 如何执行任务”，Skill Doctor 解决的是�
 | 评分 | 确定性 Grader、轨迹指标、结构化 LLM Judge |
 | 存储 | SQLite + content-addressed artifacts |
 | 报告 | Jinja2 静态 HTML/Markdown |
-| 隔离 | MVP 受限工作区；求职版容器/受限 Worker |
+| 隔离 | MVP 受限工作区；求职版受限 Worker，容器为条件扩展 |
 | CI | pytest、Golden Replay、GitHub Action |
 
-完整接口、数据模型、状态机、安全边界和逐日计划见 [TECHNICAL_DESIGN.md](./TECHNICAL_DESIGN.md)。
+完整接口、数据模型、状态机、安全边界和逐日计划见 [TECHNICAL_DESIGN.md](./TECHNICAL_DESIGN.md)。公开 Skill 排行、分类口径、代表任务输入输出与分类自迭代方案见 [SKILL_CATEGORY_AND_ITERATION_DESIGN.md](./SKILL_CATEGORY_AND_ITERATION_DESIGN.md)。
 
 ## 交付计划
 
@@ -163,23 +163,23 @@ Agent Runtime 解决“Agent 如何执行任务”，Skill Doctor 解决的是�
 - Skill 新旧版本配对执行；
 - 机器可读 Case、Trace 和 artifact；
 - 确定性 Grader + 结构化 LLM Judge；
-- 带证据和置信度的失败诊断假设；
+- 带证据和证据等级的失败诊断假设；
 - 候选 `SKILL.md` Diff、validation 和 holdout 门禁；
 - 预算、超时、停止条件、静态报告和 Replay；
 - 6 分钟演示脚本与录屏降级方案。
 
 ### 40 天：求职作品
 
-- 新增 `AgentSubject`，证明架构不绑定 Skill；
-- 支持在线执行和离线 Trace Import；
-- 容器或受限 Worker；
-- 2–4 个 Subject、20–30 个分层 Case；
-- Judge 校准与失败归因金标评测；
+- 新增 capability-gated `AgentSubject`；若公司 API 配置不可控，则明确降级为 `FixedAgentTarget`；
+- 支持在线执行和带 completeness flags 的离线 Trace Import，缺少 Case/artifact/state 时只做局部评分；
+- 受限 Worker；容器为条件扩展；
+- 至少 2 个被测配置或任务族、12–20 个分层 Case；
+- 20–30 个标注单元的 Judge pilot calibration；
 - 多次重复实验、成本和波动统计；
 - Output-only vs Trace-aware 消融实验；
-- Replay CI Gate、完整文档和可复现实验报告。
+- Evaluator Replay CI Gate、完整文档和可复现实验报告；Subject Online Eval Gate 为 D40 后条件能力。
 
-第二真实 Runtime、30–50 Case、第二组消融和 Web 历史趋势页属于扩展目标，不影响 D40 核心交付。
+XLSX 结构化产物 Grader、第二真实 Runtime、20–30 Case、独立归因金标集、容器、第二组消融和 Web 历史趋势页属于扩展目标，不影响 D40 核心交付。
 
 ## 评测指标
 
@@ -201,7 +201,9 @@ Agent Runtime 解决“Agent 如何执行任务”，Skill Doctor 解决的是�
 ## 当前仓库内容
 
 - [README.md](./README.md)：黑客松项目简介与仓库首页；
-- [TECHNICAL_DESIGN.md](./TECHNICAL_DESIGN.md)：初版技术方案、D1–D40 计划和验收标准。
+- [TECHNICAL_DESIGN.md](./TECHNICAL_DESIGN.md)：初版技术方案、D1–D40 计划和验收标准；
+- [SKILL_CATEGORY_AND_ITERATION_DESIGN.md](./SKILL_CATEGORY_AND_ITERATION_DESIGN.md)：Skill 排行分析、双轴分类、输入输出契约和自迭代设计；
+- [research/skill-ranking](./research/skill-ranking)：榜单原始快照、时间/hash 和可复算分类脚本。
 
 ## 项目边界
 
@@ -213,4 +215,4 @@ Agent Runtime 解决“Agent 如何执行任务”，Skill Doctor 解决的是�
 
 ## 长期定位
 
-> Agent Capability EvalOps：面向 Agent 能力组件和完整 Agent 的持续评测、故障归因与受控优化框架，首个支持对象是 Agent Skills。
+> Agent Capability EvalOps：面向 Agent 能力组件和完整 Agent 的持续评测与故障归因框架；仅在存在受约束 Optimizer Adapter 时提供候选优化，首个可优化对象是 Agent Skills。
