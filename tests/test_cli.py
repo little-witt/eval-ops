@@ -105,6 +105,114 @@ class CliBlackBoxTests(unittest.TestCase):
             [item["split"] for item in payload["summary"]["splits"]],
         )
 
+    def test_pack_generate_calibrate_freeze_and_lint_lifecycle(self) -> None:
+        cases = self.output_root / "cases.json"
+        cases.write_text(
+            json.dumps(
+                {
+                    "name": "generated-cli-pack",
+                    "cases": [
+                        {
+                            "id": "answer-dev",
+                            "prompt": "Return JSON.",
+                            "expected_output": {"answer": 42},
+                        }
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+        pack = self.output_root / "generated-pack"
+
+        code, _, stderr, payload = self.invoke(
+            [
+                "pack",
+                "generate",
+                "--type",
+                "generic",
+                "--cases",
+                str(cases),
+                "--goal",
+                "保持正确并减少 token",
+                "--output",
+                str(pack),
+            ]
+        )
+        self.assertEqual(0, code, stderr)
+        self.assertEqual("draft", payload["calibration_status"])
+        self.assertFalse(payload["optimization_eligible"])
+        manifest = json.loads((pack / "pack.yaml").read_text(encoding="utf-8"))
+        self.assertEqual(
+            "total_tokens",
+            manifest["optimizer_policy"]["objective"]["source"]["key"],
+        )
+
+        code, _, stderr, payload = self.invoke(["pack", "calibrate", str(pack)])
+        self.assertEqual(0, code, stderr)
+        self.assertEqual("calibrating", payload["calibration_status"])
+
+        code, output, stderr, payload = self.invoke(["pack", "freeze", str(pack)])
+        self.assertEqual(2, code)
+        self.assertEqual("", output)
+        self.assertIsNone(payload)
+        self.assertIn("approve=True", stderr)
+
+        code, _, stderr, payload = self.invoke(
+            ["pack", "freeze", str(pack), "--approve"]
+        )
+        self.assertEqual(0, code, stderr)
+        self.assertTrue(payload["trusted"])
+        self.assertTrue((pack / ".aceval-pack-lock.json").is_file())
+
+        code, _, stderr, payload = self.invoke(["pack", "lint", str(pack)])
+        self.assertEqual(0, code, stderr)
+        self.assertEqual("frozen", payload["calibration_status"])
+        self.assertTrue(payload["optimization_eligible"])
+
+    def test_unknown_pack_type_uses_generic_calibration_fallback(self) -> None:
+        cases = self.output_root / "unknown-cases.json"
+        cases.write_text(
+            json.dumps(
+                {
+                    "cases": [
+                        {
+                            "id": "legal-dev",
+                            "prompt": "Return JSON.",
+                            "expected_output": {"ok": True},
+                        }
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+        pack = self.output_root / "legal-pack"
+
+        code, _, stderr, payload = self.invoke(
+            [
+                "doctor",
+                "--subject",
+                str(BASELINE),
+                "--cases",
+                str(cases),
+                "--type",
+                "legal-analysis",
+                "--goal",
+                "结果准确",
+                "--pack-output",
+                str(pack),
+                "--approve-pack",
+                "--runtime",
+                "fake",
+                "--output-root",
+                str(self.output_root / "doctor-runs"),
+            ]
+        )
+        self.assertEqual(0, code, stderr)
+        self.assertEqual("calibration_required", payload["status"])
+        self.assertEqual("generic", payload["template"])
+        self.assertEqual("legal-analysis", payload["requested_type"])
+        self.assertEqual("calibrating", payload["calibration_status"])
+
     def test_run_requires_runtime_and_baseline_candidate_exit_codes(self) -> None:
         # Runtime selection is deliberately mandatory; silently choosing FakeRuntime
         # would make an accidental simulation look like a real evaluation.
@@ -271,6 +379,72 @@ class CliBlackBoxTests(unittest.TestCase):
         self.assertEqual("", output)
         self.assertIsNone(payload)
         self.assertIn("requires --model-command", stderr)
+
+    def test_company_profile_validate_and_local_session_import(self) -> None:
+        profile = self.output_root / "company-profile.json"
+        profile.write_text(
+            json.dumps(
+                {
+                    "api_version": "aceval.company-profile/v1",
+                    "name": "company-agent",
+                    "base_url": "https://agent.company.test",
+                    "auth": {
+                        "type": "bearer_env",
+                        "env": "COMPANY_AGENT_TOKEN",
+                    },
+                    "execute": {"path": "/runs"},
+                    "session_log": {
+                        "path_template": "/sessions/{session_id}",
+                        "output_path": "$.data.output",
+                        "trace_path": "$.data.events",
+                        "usage_path": "$.data.usage",
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        code, _, stderr, payload = self.invoke(
+            ["profile", "validate", str(profile)]
+        )
+        self.assertEqual(0, code, stderr)
+        self.assertEqual("COMPANY_AGENT_TOKEN", payload["auth"]["env"])
+        self.assertFalse(payload["secret_loaded"])
+
+        source = self.output_root / "session.json"
+        source.write_text(
+            json.dumps(
+                {
+                    "data": {
+                        "output": {"ok": True},
+                        "events": [{"kind": "tool_call", "name": "read_file"}],
+                        "usage": {"total_tokens": 10},
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+        imported = self.output_root / "imported-session.json"
+        code, _, stderr, payload = self.invoke(
+            [
+                "session",
+                "import",
+                "--profile",
+                str(profile),
+                "--session-id",
+                "session-1",
+                "--input",
+                str(source),
+                "--output",
+                str(imported),
+            ]
+        )
+        self.assertEqual(0, code, stderr)
+        self.assertTrue(payload["complete"])
+        normalized = json.loads(imported.read_text(encoding="utf-8"))
+        self.assertEqual("aceval.imported-session/v1", normalized["schema_version"])
+        self.assertEqual(
+            "tool_call", normalized["observation"]["trace"][0]["kind"]
+        )
 
     def test_reference_runtime_executes_json_bridge_and_file_tools(self) -> None:
         bridge = self.output_root / "deterministic_bridge.py"

@@ -17,11 +17,13 @@ from .contracts import (
     CandidatePatch,
     PatchConstraints,
     SubjectSnapshot,
+    as_primitive,
 )
 from .subjects import SkillMarkdownSubjectAdapter, hash_skill_subject
 
 
 SKILL_MARKDOWN_GENERATOR_CONTRACT = "aceval.optimizer/skill-markdown-generator-v1"
+SKILL_MARKDOWN_IMPROVER_CONTRACT = "aceval.optimizer/skill-markdown-improver-v2"
 
 
 class CandidateRejected(ValueError):
@@ -38,6 +40,15 @@ class FailureEvidence:
     grader_id: str
     summary: str
     evidence: Sequence[Mapping[str, Any]] = ()
+
+
+@dataclass(frozen=True)
+class TuneEvidence:
+    mode: str
+    goal: str
+    objective: Mapping[str, Any]
+    baseline_value: float
+    scenario_values: Mapping[str, float]
 
 
 @dataclass(frozen=True)
@@ -61,7 +72,8 @@ class SkillPatchPolicy:
 
 class SkillMarkdownOptimizer:
     id = "skill_markdown_v1"
-    proposal_contract = SKILL_MARKDOWN_GENERATOR_CONTRACT
+    proposal_contract = SKILL_MARKDOWN_IMPROVER_CONTRACT
+    supported_modes = frozenset(("repair", "tune"))
 
     def __init__(self, model_client: ModelClient) -> None:
         self._model = model_client
@@ -69,27 +81,20 @@ class SkillMarkdownOptimizer:
     def propose(
         self,
         subject: Path,
-        failures: Sequence[FailureEvidence],
+        failures: Sequence[Any],
         output_root: Path,
         policy: Optional[SkillPatchPolicy] = None,
         forbidden_literals: Iterable[str] = (),
     ) -> MaterializedCandidateSnapshot:
         if not failures:
-            raise CandidateRejected("optimizer requires at least one dev failure")
+            raise CandidateRejected("optimizer requires at least one dev evidence item")
         active_policy = policy or SkillPatchPolicy()
         skill_file = _skill_file(subject)
         original = skill_file.read_text(encoding="utf-8")
+        serialized_evidence = [as_primitive(item) for item in failures]
         request = {
             "current_skill": original,
-            "failures": [
-                {
-                    "scenario_id": failure.scenario_id,
-                    "grader_id": failure.grader_id,
-                    "summary": failure.summary,
-                    "evidence": list(failure.evidence),
-                }
-                for failure in failures
-            ],
+            "evidence": serialized_evidence,
             "output_contract": {
                 "skill_markdown": "complete replacement SKILL.md",
                 "rationale": "short evidence-based explanation",
@@ -100,7 +105,7 @@ class SkillMarkdownOptimizer:
                 {
                     "role": "system",
                     "content": (
-                        "Improve the Agent Skill using only the supplied dev failures. "
+                        "Repair or tune the Agent Skill using only the supplied dev evidence. "
                         "Return one JSON object with skill_markdown and rationale. "
                         "Do not mention case IDs, fixture literals, grader internals, or hidden data."
                     ),
@@ -138,6 +143,7 @@ class FrozenCandidateOptimizer:
 
     id = "skill_markdown_v1"
     proposal_contract = SKILL_MARKDOWN_GENERATOR_CONTRACT
+    supported_modes = frozenset(("repair", "tune"))
 
     def __init__(self, candidate: Path) -> None:
         self._candidate = candidate
@@ -145,13 +151,13 @@ class FrozenCandidateOptimizer:
     def propose(
         self,
         subject: Path,
-        failures: Sequence[FailureEvidence],
+        failures: Sequence[Any],
         output_root: Path,
         policy: Optional[SkillPatchPolicy] = None,
         forbidden_literals: Iterable[str] = (),
     ) -> MaterializedCandidateSnapshot:
         if not failures:
-            raise CandidateRejected("optimizer requires at least one dev failure")
+            raise CandidateRejected("optimizer requires at least one dev evidence item")
         candidate_text = _skill_file(self._candidate).read_text(encoding="utf-8")
         return materialize_candidate(
             subject=subject,
@@ -358,11 +364,13 @@ __all__ = [
     "CandidateRejected",
     "CandidateSnapshot",
     "FailureEvidence",
+    "TuneEvidence",
     "FrozenCandidateOptimizer",
     "MaterializedCandidateSnapshot",
     "SkillMarkdownOptimizer",
     "SkillOptimizerBridge",
     "SkillPatchPolicy",
     "SKILL_MARKDOWN_GENERATOR_CONTRACT",
+    "SKILL_MARKDOWN_IMPROVER_CONTRACT",
     "materialize_candidate",
 ]

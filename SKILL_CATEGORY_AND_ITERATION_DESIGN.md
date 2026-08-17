@@ -5,6 +5,8 @@
 > 数据快照：2026-08-15 14:56-15:01，Asia/Shanghai
 > 数据来源：skills.sh All Time 与 Trending 榜单前 200 条、代表性公开 `SKILL.md`
 
+> 2026-08-18 实现更新：D20 Core 已从“仅修复 hard failure”扩展为 `auto | repair | tune`。`v1alpha2` 支持单一可测 Objective；Tune 在 hard gate 非劣前提下优化 Grader score/metric、Token、成本、延迟或工具调用，并在 validation/holdout 上做 paired comparison。项目同时实现了 Case + Goal 的 EvalPack Builder、`draft -> calibrating -> frozen` 内容锁生命周期，以及公司 API Profile / Session Log 导入契约。本文后续按日期书写的原始 D20/D40 取舍保留为研究过程记录；当前实现状态以 README、EVALPACK_SPEC 和 TECHNICAL_DESIGN 为准。
+
 ## 1. 结论先行
 
 公开榜单支持这个项目继续以 Skill Eval 为切入口，但不能把安装榜直接当成真实使用量或质量榜。

@@ -21,7 +21,12 @@ from aceval.contracts import (
 )
 from aceval.drivers import ArtifactWorkspaceDriver, builtin_drivers
 from aceval.graders import builtin_graders
-from aceval.optimizer import CandidateRejected, FrozenCandidateOptimizer, SkillOptimizerBridge
+from aceval.optimizer import (
+    CandidateRejected,
+    FrozenCandidateOptimizer,
+    SkillOptimizerBridge,
+    TuneEvidence,
+)
 from aceval.orchestrator import (
     EvalOrchestrator,
     OrchestrationError,
@@ -29,6 +34,8 @@ from aceval.orchestrator import (
     _BudgetLedger,
 )
 from aceval.pack import ComponentRegistry, EvalPackLoader
+from aceval.pack_builder import generate_evalpack
+from aceval.pack_lifecycle import write_pack_lock
 from aceval.reporting import to_report_dict
 from aceval.runtime import FakeRuntime
 from aceval.subjects import SkillMarkdownSubjectAdapter
@@ -241,6 +248,48 @@ class SequencedGenericOptimizer:
         )
 
 
+class UsageTuningRuntime(FakeRuntime):
+    """Use passing declarative outputs while varying paired usage telemetry."""
+
+    def __init__(
+        self,
+        baseline_hash,
+        *,
+        baseline_tokens=100,
+        candidate_tokens=50,
+        token_overrides=None,
+        hard_failures=(),
+        missing_usage=(),
+    ):
+        super().__init__()
+        self.baseline_hash = baseline_hash
+        self.baseline_tokens = baseline_tokens
+        self.candidate_tokens = candidate_tokens
+        self.token_overrides = dict(token_overrides or {})
+        self.hard_failures = frozenset(hard_failures)
+        self.missing_usage = frozenset(missing_usage)
+
+    async def execute(self, prepared, subject, context=None):
+        result = await super().execute(prepared, subject, context)
+        scenario_id = prepared.metadata.get("scenario_id")
+        side = (
+            "baseline"
+            if subject.content_hash == self.baseline_hash
+            else "candidate"
+        )
+        self.calls[-1]["tune_side"] = side
+        key = (scenario_id, side)
+        if key in self.hard_failures:
+            result = replace(result, final_output={"findings": []})
+        if key in self.missing_usage:
+            return replace(result, usage={})
+        tokens = self.token_overrides.get(
+            key,
+            self.baseline_tokens if side == "baseline" else self.candidate_tokens,
+        )
+        return replace(result, usage={"total_tokens": tokens})
+
+
 class OrchestratorTest(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
@@ -254,6 +303,46 @@ class OrchestratorTest(unittest.IsolatedAsyncioTestCase):
 
     def subject(self, name):
         return ROOT / "examples" / "subjects" / name
+
+    def tune_pack(self, registry):
+        pack_root = Path(self.temporary.name) / "tune-pack"
+        shutil.copytree(ROOT / "evalpacks" / "security-review", pack_root)
+        manifest_path = pack_root / "pack.yaml"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest["api_version"] = "aceval.dev/v1alpha2"
+        manifest["metadata"]["calibration_status"] = "frozen"
+        manifest["optimizer_policy"].update(
+            {
+                "mode": "tune",
+                "goal": "Preserve review correctness while reducing tokens.",
+                "objective": {
+                    "id": "token-efficiency",
+                    "source": {"type": "usage", "key": "total_tokens"},
+                    "direction": "minimize",
+                    "aggregation": "mean",
+                    "min_delta": 10,
+                    "max_case_regression": 0,
+                },
+                "beam_width": 1,
+                "max_rounds": 1,
+                "max_candidate_snapshots": 1,
+            }
+        )
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+        write_pack_lock(pack_root, manifest["metadata"]["version"])
+        return EvalPackLoader(registry).load(pack_root)
+
+    def tune_subjects(self):
+        baseline = self.subject("security-review-skill-candidate")
+        candidate = Path(self.temporary.name) / "tuned-security-review-skill"
+        shutil.copytree(baseline, candidate)
+        skill_path = candidate / "SKILL.md"
+        skill_path.write_text(
+            skill_path.read_text(encoding="utf-8")
+            + "\nPrefer the shortest sufficient tool sequence.\n",
+            encoding="utf-8",
+        )
+        return baseline, candidate
 
     def test_soft_grader_errors_never_count_as_hard_passes(self):
         for status in (GradeStatus.ERROR, GradeStatus.NOT_EVALUABLE):
@@ -291,6 +380,40 @@ class OrchestratorTest(unittest.IsolatedAsyncioTestCase):
                 self.subject("security-review-skill"),
                 self.subject("security-review-skill-candidate"),
                 ("holdout",),
+            )
+
+        self.assertEqual([], runtime.calls)
+
+    async def test_optimize_rejects_generated_draft_before_runtime_execution(self):
+        registry = component_registry()
+        generated = generate_evalpack(
+            {
+                "cases": [
+                    {
+                        "id": "draft-dev",
+                        "prompt": "Return JSON.",
+                        "expected_output": {"ok": True},
+                    }
+                ]
+            },
+            "generic",
+            "Return the correct result.",
+            self.output_root / "draft-pack",
+            registry=registry,
+        )
+        pack = EvalPackLoader(registry).load(generated.root)
+        runtime = FakeRuntime()
+        orchestrator = EvalOrchestrator(
+            registry, runtime, output_root=self.output_root / "draft-runs"
+        )
+
+        with self.assertRaisesRegex(OrchestrationError, "explicitly freeze"):
+            await orchestrator.optimize(
+                pack,
+                self.subject("csv-summary-skill"),
+                FrozenCandidateOptimizer(
+                    self.subject("csv-summary-skill-candidate")
+                ),
             )
 
         self.assertEqual([], runtime.calls)
@@ -421,6 +544,11 @@ class OrchestratorTest(unittest.IsolatedAsyncioTestCase):
             .snapshot(str(result.selected_candidate_path))
             .content_hash,
         )
+
+        self.assertEqual("repair", result.mode)
+        self.assertIsNone(result.objective)
+        self.assertIsNone(result.baseline_holdout)
+        self.assertEqual(0, result.holdout_pair_count)
         self.assertNotEqual(source.resolve(), result.selected_candidate_path.resolve())
         self.assertEqual(original, (source / "SKILL.md").read_bytes())
         self.assertEqual(
@@ -443,6 +571,291 @@ class OrchestratorTest(unittest.IsolatedAsyncioTestCase):
             .snapshot(str(result.selected_candidate_path))
             .content_hash,
         )
+
+    async def test_tune_reduces_tokens_through_paired_dev_validation_and_holdout(self):
+        registry = component_registry()
+        pack = self.tune_pack(registry)
+        baseline, candidate = self.tune_subjects()
+        baseline_hash = SkillMarkdownSubjectAdapter().snapshot(
+            str(baseline)
+        ).content_hash
+        runtime = UsageTuningRuntime(baseline_hash)
+        optimizer = RecordingCandidateOptimizer(candidate)
+
+        result = await EvalOrchestrator(
+            registry, runtime, output_root=self.output_root
+        ).optimize(pack, baseline, optimizer)
+
+        self.assertTrue(result.accepted)
+        self.assertEqual("tune", result.mode)
+        self.assertTrue(result.baseline_dev.passed)
+        self.assertEqual("token-efficiency", result.objective.id)
+        self.assertEqual(1, len(result.trials))
+        self.assertTrue(result.trials[0].promoted_from_dev)
+        self.assertEqual(50.0, result.dev_objective.improvement)
+        self.assertTrue(result.dev_objective.passed)
+        self.assertTrue(result.validation_objective.passed)
+        self.assertTrue(result.holdout_objective.passed)
+        self.assertEqual(1, result.holdout_batch_count)
+        self.assertEqual(1, result.holdout_pair_count)
+        self.assertIsNotNone(result.baseline_holdout)
+        self.assertIsNotNone(result.candidate_holdout)
+        self.assertEqual(1, len(optimizer.calls))
+        evidence = optimizer.calls[0]
+        self.assertEqual(1, len(evidence))
+        self.assertIsInstance(evidence[0], TuneEvidence)
+        self.assertEqual(
+            "Preserve review correctness while reducing tokens.", evidence[0].goal
+        )
+        self.assertEqual(
+            {
+                scenario.id
+                for scenario in pack.scenarios
+                if scenario.split == "dev"
+            },
+            set(evidence[0].scenario_values),
+        )
+        holdout_calls = [
+            call
+            for call in runtime.calls
+            if call["scenario_id"].endswith("-holdout")
+        ]
+        self.assertEqual(
+            {"baseline", "candidate"},
+            {call["tune_side"] for call in holdout_calls},
+        )
+        report = to_report_dict(result)["summary"]
+        self.assertEqual(1, report["holdout_pair_count"])
+        self.assertTrue(report["holdout_objective"]["passed"])
+
+    async def test_auto_selects_tune_for_a_passing_measured_baseline(self):
+        registry = component_registry()
+        pack = self.tune_pack(registry)
+        baseline, candidate = self.tune_subjects()
+        baseline_hash = SkillMarkdownSubjectAdapter().snapshot(
+            str(baseline)
+        ).content_hash
+
+        result = await EvalOrchestrator(
+            registry,
+            UsageTuningRuntime(baseline_hash),
+            output_root=self.output_root,
+        ).optimize(
+            pack,
+            baseline,
+            FrozenCandidateOptimizer(candidate),
+            mode="auto",
+        )
+
+        self.assertEqual("tune", result.mode)
+        self.assertTrue(result.accepted)
+        self.assertIsNotNone(result.dev_objective)
+
+    async def test_auto_selects_repair_for_a_failing_baseline(self):
+        registry = component_registry()
+        pack = self.load_pack("security-review", registry)
+
+        result = await EvalOrchestrator(
+            registry, FakeRuntime(), output_root=self.output_root
+        ).optimize(
+            pack,
+            self.subject("security-review-skill"),
+            FrozenCandidateOptimizer(
+                self.subject("security-review-skill-candidate")
+            ),
+            mode="auto",
+        )
+
+        self.assertEqual("repair", result.mode)
+        self.assertTrue(result.accepted)
+        self.assertIsNone(result.objective)
+
+    async def test_tune_rejects_hard_regression_even_when_tokens_improve(self):
+        registry = component_registry()
+        pack = self.tune_pack(registry)
+        baseline, candidate = self.tune_subjects()
+        baseline_hash = SkillMarkdownSubjectAdapter().snapshot(
+            str(baseline)
+        ).content_hash
+        runtime = UsageTuningRuntime(
+            baseline_hash,
+            hard_failures={("command-injection-dev", "candidate")},
+        )
+
+        result = await EvalOrchestrator(
+            registry, runtime, output_root=self.output_root
+        ).optimize(pack, baseline, FrozenCandidateOptimizer(candidate))
+
+        self.assertFalse(result.accepted)
+        self.assertEqual(1, len(result.trials))
+        trial = result.trials[0]
+        self.assertFalse(trial.promoted_from_dev)
+        self.assertEqual(50.0, trial.objective_comparison.improvement)
+        self.assertIn("hard gate", trial.rejection_reason)
+        self.assertIsNone(result.baseline_validation)
+        self.assertFalse(
+            any(
+                call["scenario_id"].endswith("-validation")
+                for call in runtime.calls
+            )
+        )
+
+    async def test_tune_missing_baseline_metric_stops_before_optimizer(self):
+        registry = component_registry()
+        pack = self.tune_pack(registry)
+        baseline, candidate = self.tune_subjects()
+        baseline_hash = SkillMarkdownSubjectAdapter().snapshot(
+            str(baseline)
+        ).content_hash
+        runtime = UsageTuningRuntime(
+            baseline_hash,
+            missing_usage={("command-injection-dev", "baseline")},
+        )
+        optimizer = RecordingCandidateOptimizer(candidate)
+
+        result = await EvalOrchestrator(
+            registry, runtime, output_root=self.output_root
+        ).optimize(pack, baseline, optimizer)
+
+        self.assertFalse(result.accepted)
+        self.assertEqual((), result.trials)
+        self.assertEqual([], optimizer.calls)
+        self.assertIn("not completely measurable", result.stop_reason)
+        self.assertIn(
+            "Missing objective values are not interpreted as zero.",
+            result.limitations,
+        )
+
+    async def test_tune_requires_validation_objective_improvement(self):
+        registry = component_registry()
+        pack = self.tune_pack(registry)
+        baseline, candidate = self.tune_subjects()
+        baseline_hash = SkillMarkdownSubjectAdapter().snapshot(
+            str(baseline)
+        ).content_hash
+        runtime = UsageTuningRuntime(
+            baseline_hash,
+            token_overrides={
+                ("allowlisted-command-validation", "candidate"): 100,
+                ("decoded-path-validation", "candidate"): 100,
+            },
+        )
+
+        result = await EvalOrchestrator(
+            registry, runtime, output_root=self.output_root
+        ).optimize(pack, baseline, FrozenCandidateOptimizer(candidate))
+
+        self.assertFalse(result.accepted)
+        self.assertEqual(1, len(result.validation_attempts))
+        attempt = result.validation_attempts[0]
+        self.assertFalse(attempt.passed_gate)
+        self.assertTrue(attempt.objective_comparison.evaluable)
+        self.assertEqual(0.0, attempt.objective_comparison.improvement)
+        self.assertFalse(attempt.objective_comparison.passed)
+        self.assertIsNone(result.candidate_holdout)
+        self.assertEqual(0, result.holdout_pair_count)
+        report = to_report_dict(result)["summary"]
+        validation_gate = next(
+            gate for gate in report["gates"] if gate["gate"] == "validation"
+        )
+        self.assertEqual("fail", validation_gate["status"])
+        self.assertFalse(validation_gate["objective"]["passed"])
+        self.assertEqual("fail", report["validation_attempts"][0]["status"])
+
+    async def test_tune_stops_when_baseline_validation_has_hard_failure(self):
+        registry = component_registry()
+        pack = self.tune_pack(registry)
+        baseline, candidate = self.tune_subjects()
+        baseline_hash = SkillMarkdownSubjectAdapter().snapshot(
+            str(baseline)
+        ).content_hash
+        runtime = UsageTuningRuntime(
+            baseline_hash,
+            hard_failures={("decoded-path-validation", "baseline")},
+        )
+
+        result = await EvalOrchestrator(
+            registry, runtime, output_root=self.output_root
+        ).optimize(pack, baseline, FrozenCandidateOptimizer(candidate))
+
+        self.assertFalse(result.accepted)
+        self.assertIsNotNone(result.baseline_validation)
+        self.assertFalse(result.baseline_validation.passed)
+        self.assertIsNone(result.candidate_validation)
+        self.assertIn("baseline is not tune-eligible", result.stop_reason)
+        self.assertFalse(
+            any(
+                call["tune_side"] == "candidate"
+                and call["scenario_id"].endswith("-validation")
+                for call in runtime.calls
+            )
+        )
+        validation_gate = next(
+            gate
+            for gate in to_report_dict(result)["summary"]["gates"]
+            if gate["gate"] == "validation"
+        )
+        self.assertEqual("fail", validation_gate["status"])
+
+    async def test_tune_stops_when_baseline_holdout_has_hard_failure(self):
+        registry = component_registry()
+        pack = self.tune_pack(registry)
+        baseline, candidate = self.tune_subjects()
+        baseline_hash = SkillMarkdownSubjectAdapter().snapshot(
+            str(baseline)
+        ).content_hash
+        runtime = UsageTuningRuntime(
+            baseline_hash,
+            hard_failures={("popen-command-holdout", "baseline")},
+        )
+
+        result = await EvalOrchestrator(
+            registry, runtime, output_root=self.output_root
+        ).optimize(pack, baseline, FrozenCandidateOptimizer(candidate))
+
+        self.assertFalse(result.accepted)
+        self.assertIsNotNone(result.baseline_holdout)
+        self.assertFalse(result.baseline_holdout.passed)
+        self.assertIsNone(result.candidate_holdout)
+        self.assertEqual(0, result.holdout_batch_count)
+        self.assertEqual(0, result.holdout_pair_count)
+        self.assertIn("baseline is not tune-eligible", result.stop_reason)
+        self.assertFalse(
+            any(
+                call["tune_side"] == "candidate"
+                and call["scenario_id"].endswith("-holdout")
+                for call in runtime.calls
+            )
+        )
+        holdout_gate = next(
+            gate
+            for gate in to_report_dict(result)["summary"]["gates"]
+            if gate["gate"] == "holdout"
+        )
+        self.assertEqual("fail", holdout_gate["status"])
+
+    async def test_tune_missing_candidate_holdout_metric_fails_closed(self):
+        registry = component_registry()
+        pack = self.tune_pack(registry)
+        baseline, candidate = self.tune_subjects()
+        baseline_hash = SkillMarkdownSubjectAdapter().snapshot(
+            str(baseline)
+        ).content_hash
+        runtime = UsageTuningRuntime(
+            baseline_hash,
+            missing_usage={("popen-command-holdout", "candidate")},
+        )
+
+        result = await EvalOrchestrator(
+            registry, runtime, output_root=self.output_root
+        ).optimize(pack, baseline, FrozenCandidateOptimizer(candidate))
+
+        self.assertFalse(result.accepted)
+        self.assertEqual(1, result.holdout_batch_count)
+        self.assertEqual(1, result.holdout_pair_count)
+        self.assertFalse(result.holdout_objective.evaluable)
+        self.assertFalse(result.holdout_objective.passed)
+        self.assertIn("paired holdout tune gate", result.stop_reason)
 
     async def test_generic_candidate_patch_optimizer_runs_without_skill_bridge(self):
         registry = component_registry()

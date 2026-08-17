@@ -10,14 +10,27 @@ import math
 import shlex
 import sys
 from pathlib import Path
-from typing import Any, Optional, Sequence, Tuple
+from typing import Any, Mapping, Optional, Sequence, Tuple
 
 from . import __version__
 from .agent_runtime import CommandModelClient, ReferenceAgentRuntime, ReferenceRuntimeConfig
-from .contracts import GradeStatus, RunBudget, SubjectSnapshot
+from .connections import (
+    CompanyApiProfile,
+    HTTPSessionLogProvider,
+    ImportedRunBundle,
+    load_session_log,
+)
+from .contracts import GradeStatus, RunBudget, SubjectSnapshot, as_primitive
 from .optimizer import FrozenCandidateOptimizer, SkillMarkdownOptimizer
 from .orchestrator import EvalOrchestrator
 from .pack import EvalPackLoader, PackError
+from .pack_builder import (
+    PACK_TYPES,
+    begin_calibration,
+    freeze_evalpack,
+    generate_evalpack,
+)
+from .pack_lifecycle import pack_calibration_status
 from .registry import build_builtin_registry
 from .reporting import to_report_dict, write_report
 from .runtime import FakeRuntime, ReferenceRuntimeAdapter
@@ -93,6 +106,38 @@ def build_parser() -> argparse.ArgumentParser:
     test.add_argument("--runtime", choices=("fake",), default="fake")
     _add_output_argument(test)
     test.set_defaults(handler=_pack_test)
+    generate = pack_commands.add_parser(
+        "generate",
+        help="Generate an untrusted draft Pack from a few cases and a goal",
+    )
+    generate.add_argument("--type", required=True, dest="pack_type")
+    generate.add_argument("--cases", required=True, help="Cases JSON file")
+    generate.add_argument("--goal", required=True)
+    generate.add_argument("--output", required=True, help="New Pack directory")
+    generate.add_argument(
+        "--objective",
+        help="Optional JSON object or @FILE; measurable efficiency goals are inferred when omitted",
+    )
+    generate.add_argument("--name")
+    generate.add_argument("--version")
+    generate.add_argument("--description")
+    generate.add_argument("--source-root")
+    generate.set_defaults(handler=_pack_generate)
+    calibrate = pack_commands.add_parser(
+        "calibrate", help="Move a generated draft into the editable calibration stage"
+    )
+    calibrate.add_argument("path")
+    calibrate.set_defaults(handler=_pack_calibrate)
+    freeze = pack_commands.add_parser(
+        "freeze", help="Explicitly approve and lock a calibrated generated Pack"
+    )
+    freeze.add_argument("path")
+    freeze.add_argument(
+        "--approve",
+        action="store_true",
+        help="Confirm that cases, Oracles, Graders, and objective were reviewed",
+    )
+    freeze.set_defaults(handler=_pack_freeze)
 
     run = commands.add_parser("run", help="Evaluate one frozen Subject")
     _add_pack_argument(run)
@@ -128,6 +173,64 @@ def build_parser() -> argparse.ArgumentParser:
     _add_runtime_arguments(optimize)
     _add_output_argument(optimize)
     optimize.set_defaults(handler=_optimize)
+
+    doctor = commands.add_parser(
+        "doctor",
+        help="Generate/freeze a Pack when needed, then auto-select repair or tune",
+    )
+    doctor.add_argument("--subject", required=True, help="Skill directory or SKILL.md")
+    doctor.add_argument("--pack", help="Use an existing Pack instead of generating one")
+    doctor.add_argument("--cases", help="Cases JSON used when --pack is omitted")
+    doctor.add_argument("--type", dest="pack_type", default="generic")
+    doctor.add_argument("--goal", help="Natural-language repair/tuning goal")
+    doctor.add_argument("--pack-output", help="New generated Pack directory")
+    doctor.add_argument("--objective", help="Optional JSON object or @FILE")
+    doctor.add_argument("--source-root")
+    doctor.add_argument(
+        "--approve-pack",
+        action="store_true",
+        help="Approve a supported generated template after reviewing its cases/Oracles",
+    )
+    doctor.add_argument("--candidate", help="Frozen candidate for simulation/offline runs")
+    doctor.add_argument("--optimizer-command")
+    doctor.add_argument("--max-rounds", type=int)
+    _add_runtime_arguments(doctor)
+    _add_output_argument(doctor)
+    doctor.set_defaults(handler=_doctor)
+
+    profile = commands.add_parser("profile", help="Manage company Agent API profiles")
+    profile_commands = profile.add_subparsers(dest="profile_command", required=True)
+    profile_validate = profile_commands.add_parser(
+        "validate", help="Validate a profile without reading its secret environment value"
+    )
+    profile_validate.add_argument("path")
+    profile_validate.set_defaults(handler=_profile_validate)
+
+    session = commands.add_parser("session", help="Fetch or import company Agent sessions")
+    session_commands = session.add_subparsers(dest="session_command", required=True)
+    session_fetch = session_commands.add_parser(
+        "fetch", help="Fetch and normalize one company Agent session log"
+    )
+    session_fetch.add_argument("--profile", required=True)
+    session_fetch.add_argument("--session-id", required=True)
+    session_fetch.add_argument("--output", required=True)
+    session_fetch.add_argument("--force", action="store_true")
+    session_fetch.set_defaults(handler=_session_fetch)
+    session_import = session_commands.add_parser(
+        "import", help="Normalize a previously downloaded session JSON file"
+    )
+    session_import.add_argument("--profile", required=True)
+    session_import.add_argument("--session-id", required=True)
+    session_import.add_argument("--input", required=True)
+    session_import.add_argument("--output", required=True)
+    session_import.add_argument("--force", action="store_true")
+    session_import.set_defaults(handler=_session_import)
+    session_execute = session_commands.add_parser(
+        "execute", help="Submit a request through the profile's reserved execute endpoint"
+    )
+    session_execute.add_argument("--profile", required=True)
+    session_execute.add_argument("--request", required=True, help="JSON file")
+    session_execute.set_defaults(handler=_session_execute)
     return parser
 
 
@@ -201,9 +304,102 @@ def _print_summary(value: Any, report_paths: Optional[Tuple[Path, Path]] = None)
     print(json.dumps(payload, ensure_ascii=False, sort_keys=True))
 
 
+def _reject_json_constant(value: str) -> None:
+    raise ValueError("non-standard JSON constant: %s" % value)
+
+
+def _unique_json_object(pairs: Sequence[Tuple[str, Any]]) -> Mapping[str, Any]:
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("duplicate JSON key: %s" % key)
+        result[key] = value
+    return result
+
+
+def _json_object(value: str, label: str) -> Mapping[str, Any]:
+    source = value
+    if value.startswith("@"):
+        try:
+            source = Path(value[1:]).read_text(encoding="utf-8")
+        except (OSError, UnicodeError) as exc:
+            raise ValueError("cannot read %s JSON file: %s" % (label, exc)) from exc
+    try:
+        payload = json.loads(
+            source,
+            parse_constant=_reject_json_constant,
+            object_pairs_hook=_unique_json_object,
+        )
+    except (json.JSONDecodeError, ValueError) as exc:
+        raise ValueError("%s must be a strict JSON object" % label) from exc
+    if not isinstance(payload, Mapping):
+        raise ValueError("%s must be a JSON object" % label)
+    return payload
+
+
+def _pack_state_payload(result: Any) -> Mapping[str, Any]:
+    return {
+        "ok": True,
+        "pack": str(result.root),
+        "manifest": str(result.manifest_path),
+        "requested_type": result.requested_type or result.pack_type,
+        "template": result.pack_type,
+        "calibration_status": result.calibration_status,
+        "trusted": result.trusted,
+        "pack_hash": result.pack_hash,
+        "optimization_eligible": result.trusted,
+    }
+
+
+def _pack_generate(args: argparse.Namespace) -> int:
+    objective = _json_object(args.objective, "objective") if args.objective else None
+    result = generate_evalpack(
+        args.cases,
+        args.pack_type,
+        args.goal,
+        args.output,
+        objective=objective,
+        name=args.name,
+        version=args.version,
+        description=args.description,
+        source_root=args.source_root,
+    )
+    payload = dict(_pack_state_payload(result))
+    payload["next_step"] = (
+        "Review the generated cases, Oracles, Graders, and objective; then run "
+        "`aceval pack calibrate` / `aceval pack freeze --approve`."
+    )
+    print(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True))
+    return 0
+
+
+def _pack_calibrate(args: argparse.Namespace) -> int:
+    result = begin_calibration(args.path)
+    payload = dict(_pack_state_payload(result))
+    payload["next_step"] = (
+        "Iterate only the EvalPack until its evaluator is trusted, then freeze it."
+    )
+    print(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True))
+    return 0
+
+
+def _pack_freeze(args: argparse.Namespace) -> int:
+    result = freeze_evalpack(args.path, approve=bool(args.approve))
+    print(
+        json.dumps(
+            _pack_state_payload(result),
+            ensure_ascii=False,
+            indent=2,
+            sort_keys=True,
+        )
+    )
+    return 0
+
+
 def _pack_lint(args: argparse.Namespace) -> int:
     registry, pack = _load_pack(args.path)
     report = EvalPackLoader().validate(pack, registry)
+    lifecycle = pack_calibration_status(pack)
     unresolved = []
     for split in ("validation", "holdout"):
         suite = pack.manifest.suite
@@ -223,6 +419,8 @@ def _pack_lint(args: argparse.Namespace) -> int:
         "version": pack.manifest.metadata.version,
         "pack_hash": pack.pack_hash,
         "suite_hash": pack.suite_hash,
+        "calibration_status": lifecycle,
+        "optimization_eligible": lifecycle in ("frozen", "legacy"),
         "scenarios": len(pack.scenarios),
         "components": registry.component_ids(),
         "issues": [
@@ -328,6 +526,206 @@ def _optimize(args: argparse.Namespace) -> int:
     report_paths = write_report(result, output_dir)
     _print_summary(result, report_paths)
     return 0 if result.accepted else 2
+
+
+def _doctor(args: argparse.Namespace) -> int:
+    pack_path = args.pack
+    if pack_path is None:
+        if not args.cases or not args.goal:
+            raise ValueError("doctor requires --cases and --goal when --pack is omitted")
+        output = args.pack_output
+        if output is None:
+            output = str(Path(".aceval/packs") / (Path(args.cases).stem + "-pack"))
+        objective = (
+            _json_object(args.objective, "objective") if args.objective else None
+        )
+        generated = generate_evalpack(
+            args.cases,
+            args.pack_type,
+            args.goal,
+            output,
+            objective=objective,
+            source_root=args.source_root,
+        )
+        pack_path = str(generated.root)
+        if generated.requested_type not in PACK_TYPES:
+            calibrating = begin_calibration(generated.root)
+            payload = dict(_pack_state_payload(calibrating))
+            payload.update(
+                {
+                    "status": "calibration_required",
+                    "reason": (
+                        "The requested type used the generic fallback. Review and "
+                        "calibrate its evaluator before a separate explicit freeze."
+                    ),
+                }
+            )
+            print(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True))
+            return 0
+        if not args.approve_pack:
+            calibrating = begin_calibration(generated.root)
+            payload = dict(_pack_state_payload(calibrating))
+            payload.update(
+                {
+                    "status": "calibration_required",
+                    "reason": (
+                        "Generated Pack is not allowed to optimize the Skill until "
+                        "you explicitly approve its evaluation contract."
+                    ),
+                }
+            )
+            print(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True))
+            return 0
+        freeze_evalpack(generated.root, approve=True)
+    else:
+        _, loaded = _load_pack(pack_path)
+        lifecycle = pack_calibration_status(loaded)
+        if lifecycle in ("draft", "calibrating"):
+            if not args.approve_pack:
+                payload = {
+                    "ok": True,
+                    "pack": str(loaded.root),
+                    "calibration_status": lifecycle,
+                    "optimization_eligible": False,
+                    "status": "calibration_required",
+                }
+                print(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True))
+                return 0
+            freeze_evalpack(loaded.root, approve=True)
+
+    registry, pack = _load_pack(str(pack_path))
+    runtime = _runtime(args)
+    if args.runtime == "fake" and not args.candidate:
+        raise ValueError(
+            "FakeRuntime doctor requires --candidate and is simulation-only"
+        )
+    if args.candidate:
+        optimizer = FrozenCandidateOptimizer(Path(args.candidate))
+    else:
+        command = args.optimizer_command or args.model_command
+        if not command:
+            raise ValueError(
+                "doctor requires --candidate or a model bridge via "
+                "--optimizer-command/--model-command"
+            )
+        optimizer = SkillMarkdownOptimizer(_model_client(command, args))
+    orchestrator = EvalOrchestrator(
+        registry, runtime, Path(args.output_root), _budget(args)
+    )
+    result = asyncio.run(
+        orchestrator.optimize(
+            pack, args.subject, optimizer, max_rounds=args.max_rounds
+        )
+    )
+    output_dir = result.output_dir or Path(args.output_root)
+    report_paths = write_report(result, output_dir)
+    _print_summary(result, report_paths)
+    return 0 if result.accepted else 2
+
+
+def _profile_validate(args: argparse.Namespace) -> int:
+    profile = CompanyApiProfile.load(args.path)
+    payload = {
+        "ok": True,
+        "api_version": profile.api_version,
+        "name": profile.name,
+        "base_url": profile.base_url,
+        "auth": {
+            "type": profile.auth.type,
+            "env": profile.auth.env,
+            "header": profile.auth.header,
+        },
+        "execute_configured": profile.execute is not None,
+        "session_log": as_primitive(profile.session_log),
+        "secret_loaded": False,
+    }
+    print(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True))
+    return 0
+
+
+def _imported_bundle_payload(bundle: ImportedRunBundle) -> Mapping[str, Any]:
+    return {
+        "schema_version": "aceval.imported-session/v1",
+        "session_id": bundle.session_id,
+        "profile_name": bundle.profile_name,
+        "source": bundle.source,
+        "completeness": bundle.completeness.as_dict(),
+        "observation": as_primitive(bundle.observation),
+    }
+
+
+def _write_json_output(path_value: str, payload: Mapping[str, Any], force: bool) -> Path:
+    requested = Path(path_value).expanduser()
+    if requested.is_symlink():
+        raise ValueError("output cannot be a symlink: %s" % requested)
+    path = requested.absolute()
+    if path.exists() and not force:
+        raise ValueError("output already exists; pass --force to replace it: %s" % path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True, allow_nan=False)
+        + "\n",
+        encoding="utf-8",
+    )
+    return path
+
+
+def _session_fetch(args: argparse.Namespace) -> int:
+    profile = CompanyApiProfile.load(args.profile)
+    bundle = HTTPSessionLogProvider(profile).fetch_session(args.session_id)
+    output = _write_json_output(
+        args.output, _imported_bundle_payload(bundle), bool(args.force)
+    )
+    print(
+        json.dumps(
+            {
+                "ok": True,
+                "session_id": bundle.session_id,
+                "profile": bundle.profile_name,
+                "complete": bundle.completeness.complete,
+                "output": str(output),
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+    )
+    return 0
+
+
+def _session_import(args: argparse.Namespace) -> int:
+    profile = CompanyApiProfile.load(args.profile)
+    bundle = load_session_log(profile, args.session_id, args.input)
+    output = _write_json_output(
+        args.output, _imported_bundle_payload(bundle), bool(args.force)
+    )
+    print(
+        json.dumps(
+            {
+                "ok": True,
+                "session_id": bundle.session_id,
+                "profile": bundle.profile_name,
+                "complete": bundle.completeness.complete,
+                "output": str(output),
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+    )
+    return 0
+
+
+def _session_execute(args: argparse.Namespace) -> int:
+    profile = CompanyApiProfile.load(args.profile)
+    request = _json_object("@" + args.request, "request")
+    session_id = HTTPSessionLogProvider(profile).execute(request)
+    print(
+        json.dumps(
+            {"ok": True, "profile": profile.name, "session_id": session_id},
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+    )
+    return 0
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:

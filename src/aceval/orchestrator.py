@@ -27,6 +27,8 @@ from .contracts import (
     FrozenScenario,
     GradeResult,
     GradeStatus,
+    ImprovementMode,
+    ObjectiveSpec,
     PatchConstraints,
     RunBudget,
     RunContext,
@@ -42,8 +44,20 @@ from .optimizer import (
     SkillOptimizerBridge,
     SkillPatchPolicy,
     SKILL_MARKDOWN_GENERATOR_CONTRACT,
+    SKILL_MARKDOWN_IMPROVER_CONTRACT,
+    TuneEvidence,
+)
+from .objectives import (
+    ObjectiveComparison,
+    compare_objective,
+    measure_objective,
 )
 from .pack import EvalPackLoader, PackError
+from .pack_lifecycle import (
+    CALIBRATION_FROZEN,
+    CALIBRATION_LEGACY,
+    pack_calibration_status,
+)
 from .subjects import with_variant
 
 
@@ -387,6 +401,7 @@ class CandidateTrial:
     promoted_from_dev: bool
     rejection_reason: Optional[str] = None
     usage: Mapping[str, Any] = None
+    objective_comparison: Optional[ObjectiveComparison] = None
 
 
 @dataclass(frozen=True)
@@ -396,6 +411,7 @@ class ValidationAttempt:
     run: EvalRun
     passed_gate: bool
     hard_regressions: Tuple[str, ...] = ()
+    objective_comparison: Optional[ObjectiveComparison] = None
 
 
 @dataclass(frozen=True)
@@ -407,8 +423,10 @@ class OptimizationResult:
     validation_attempts: Tuple[ValidationAttempt, ...] = ()
     baseline_validation: Optional[EvalRun] = None
     candidate_validation: Optional[EvalRun] = None
+    baseline_holdout: Optional[EvalRun] = None
     candidate_holdout: Optional[EvalRun] = None
     holdout_batch_count: int = 0
+    holdout_pair_count: int = 0
     selected_candidate_id: Optional[str] = None
     selected_candidate_path: Optional[Path] = None
     selected_candidate_hash: Optional[str] = None
@@ -420,6 +438,12 @@ class OptimizationResult:
     proposal_attempt_count: int = 0
     rejected_proposal_count: int = 0
     duplicate_proposal_count: int = 0
+    mode: str = ImprovementMode.REPAIR.value
+    goal: str = ""
+    objective: Optional[ObjectiveSpec] = None
+    dev_objective: Optional[ObjectiveComparison] = None
+    validation_objective: Optional[ObjectiveComparison] = None
+    holdout_objective: Optional[ObjectiveComparison] = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "trials", tuple(self.trials))
@@ -437,6 +461,15 @@ class OptimizationResult:
         if self.holdout_batch_count != expected:
             raise ValueError(
                 "holdout_batch_count must match whether candidate_holdout was run"
+            )
+        if self.holdout_pair_count not in (0, 1):
+            raise ValueError("holdout_pair_count must be 0 or 1")
+        expected_pair = int(
+            self.baseline_holdout is not None and self.candidate_holdout is not None
+        )
+        if self.holdout_pair_count != expected_pair:
+            raise ValueError(
+                "holdout_pair_count must match paired baseline/candidate holdout runs"
             )
 
 
@@ -739,12 +772,27 @@ class EvalOrchestrator:
         subject: Any,
         candidate_optimizer: Any,
         max_rounds: Optional[int] = None,
+        mode: Optional[str] = None,
+        goal: Optional[str] = None,
+        objective: Optional[ObjectiveSpec] = None,
     ) -> OptimizationResult:
         policy = pack.manifest.optimizer_policy
         if policy is None:
             raise OrchestrationError("EvalPack is eval-only and declares no optimizer policy")
+        calibration_status = pack_calibration_status(pack)
+        if calibration_status not in (CALIBRATION_FROZEN, CALIBRATION_LEGACY):
+            raise OrchestrationError(
+                "EvalPack calibration_status is %s; run calibration and explicitly "
+                "freeze the Pack before optimizing a Skill" % calibration_status
+            )
         if tuple(policy.visible_splits) != ("dev",):
             raise OrchestrationError("optimizer visibility must be exactly the dev split")
+        try:
+            requested_mode = ImprovementMode(mode or policy.mode)
+        except ValueError as exc:
+            raise OrchestrationError("mode must be auto, repair, or tune") from exc
+        active_goal = str(policy.goal if goal is None else goal).strip()
+        active_objective = objective or policy.objective
         optimizer_id = getattr(candidate_optimizer, "id", None)
         if optimizer_id != policy.adapter:
             raise OrchestrationError(
@@ -775,6 +823,7 @@ class EvalOrchestrator:
         proposal_attempt_count = 0
         rejected_proposal_count = 0
         duplicate_proposal_count = 0
+        active_mode = requested_mode
 
         def finish_optimization(**values: Any) -> OptimizationResult:
             values.setdefault("optimization_id", optimization_id)
@@ -783,6 +832,9 @@ class EvalOrchestrator:
             values.setdefault("proposal_attempt_count", proposal_attempt_count)
             values.setdefault("rejected_proposal_count", rejected_proposal_count)
             values.setdefault("duplicate_proposal_count", duplicate_proposal_count)
+            values.setdefault("mode", active_mode.value)
+            values.setdefault("goal", active_goal)
+            values.setdefault("objective", active_objective)
             return OptimizationResult(**values)
 
         baseline_dev = await self._evaluate(
@@ -799,7 +851,15 @@ class EvalOrchestrator:
                 ),
             )
         failures = self._failure_evidence(baseline_dev)
-        if not failures:
+        if requested_mode == ImprovementMode.AUTO:
+            active_mode = (
+                ImprovementMode.REPAIR if failures else ImprovementMode.TUNE
+            )
+        if active_mode == ImprovementMode.REPAIR:
+            # Auto mode may carry a tune objective for the eventual passing
+            # baseline.  A repair run must not report or optimize that metric.
+            active_objective = None
+        if active_mode == ImprovementMode.REPAIR and not failures:
             return finish_optimization(
                 baseline_dev=baseline_dev,
                 accepted=False,
@@ -807,6 +867,42 @@ class EvalOrchestrator:
                 output_dir=optimization_dir,
                 limitations=("No candidate is generated without dev failure evidence.",),
             )
+        if active_mode == ImprovementMode.TUNE:
+            if failures or not baseline_dev.passed:
+                return finish_optimization(
+                    baseline_dev=baseline_dev,
+                    accepted=False,
+                    stop_reason=(
+                        "baseline is not tune-eligible because dev hard gates do not all pass; run repair first"
+                    ),
+                    output_dir=optimization_dir,
+                    limitations=(
+                        "Tune mode never trades away correctness or safety hard gates.",
+                    ),
+                )
+            if active_objective is None:
+                return finish_optimization(
+                    baseline_dev=baseline_dev,
+                    accepted=False,
+                    stop_reason="tune mode requires a measurable objective",
+                    output_dir=optimization_dir,
+                    limitations=(
+                        "A natural-language goal alone cannot authorize an optimization result.",
+                    ),
+                )
+            baseline_measurement = measure_objective(
+                baseline_dev, active_objective
+            )
+            if baseline_measurement.status != "measured":
+                return finish_optimization(
+                    baseline_dev=baseline_dev,
+                    accepted=False,
+                    stop_reason="tune objective is not completely measurable on baseline dev",
+                    output_dir=optimization_dir,
+                    limitations=(
+                        "Missing objective values are not interpreted as zero.",
+                    ),
+                )
 
         configured_rounds = policy.max_rounds
         rounds = configured_rounds if max_rounds is None else min(configured_rounds, max_rounds)
@@ -822,9 +918,28 @@ class EvalOrchestrator:
         )
         forbidden_literals = self._forbidden_literals(pack)
         proposal_contract = getattr(candidate_optimizer, "proposal_contract", None)
+        supported_modes = getattr(candidate_optimizer, "supported_modes", None)
+        if (
+            active_mode == ImprovementMode.TUNE
+            and supported_modes is not None
+            and ImprovementMode.TUNE.value not in supported_modes
+        ):
+            raise OrchestrationError("optimizer does not support tune mode")
         if proposal_contract == CANDIDATE_PATCH_OPTIMIZER_CONTRACT:
             bridge = candidate_optimizer
-        elif proposal_contract == SKILL_MARKDOWN_GENERATOR_CONTRACT:
+        elif proposal_contract in (
+            SKILL_MARKDOWN_GENERATOR_CONTRACT,
+            SKILL_MARKDOWN_IMPROVER_CONTRACT,
+        ):
+            if (
+                active_mode == ImprovementMode.TUNE
+                and proposal_contract == SKILL_MARKDOWN_GENERATOR_CONTRACT
+                and ImprovementMode.TUNE.value
+                not in (supported_modes or ())
+            ):
+                raise OrchestrationError(
+                    "skill-markdown-generator-v1 is repair-only"
+                )
             bridge = SkillOptimizerBridge(
                 candidate_optimizer,
                 candidate_root,
@@ -843,6 +958,13 @@ class EvalOrchestrator:
                 "candidate_root": str(candidate_root),
                 "optimizer_params": dict(policy.params),
                 "patchable_components": tuple(policy.patchable_components),
+                "improvement_mode": active_mode.value,
+                "goal": active_goal,
+                "objective": (
+                    self._objective_payload(active_objective)
+                    if active_objective is not None
+                    else None
+                ),
             },
         )
         frontier = [(base_snapshot, baseline_dev)]
@@ -860,8 +982,13 @@ class EvalOrchestrator:
                     break
                 if self._has_non_skill_failure(parent_run):
                     continue
-                parent_failures = self._failure_evidence(parent_run)
-                if not parent_failures:
+                parent_evidence = self._improvement_evidence(
+                    active_mode,
+                    parent_run,
+                    active_goal,
+                    active_objective,
+                )
+                if not parent_evidence:
                     next_frontier.append((parent_snapshot, parent_run))
                     continue
                 for _ in range(policy.beam_width):
@@ -872,7 +999,7 @@ class EvalOrchestrator:
                         proposal_attempt_count += 1
                         patches = bridge.propose(
                             parent_snapshot,
-                            parent_failures,
+                            parent_evidence,
                             constraints,
                         )
                         if inspect.isawaitable(patches):
@@ -962,19 +1089,55 @@ class EvalOrchestrator:
                             ledger=ledger,
                         )
                         comparison = _comparison(baseline_dev, dev_run)
-                        improved = (
-                            comparison.paired_uplift is not None
-                            and comparison.paired_uplift > 0
-                            and not comparison.hard_regressions
-                            and not self._has_non_skill_failure(dev_run)
-                        )
-                        promoted = improved and dev_run.passed
-                        if promoted:
-                            reason = None
-                        elif improved:
-                            reason = "dev hard failures remain; candidate may continue to another dev-only round"
+                        objective_comparison = None
+                        if active_mode == ImprovementMode.REPAIR:
+                            improved = (
+                                comparison.paired_uplift is not None
+                                and comparison.paired_uplift > 0
+                                and not comparison.hard_regressions
+                                and not self._has_non_skill_failure(dev_run)
+                            )
+                            promoted = improved and dev_run.passed
+                            if promoted:
+                                reason = None
+                            elif improved:
+                                reason = "dev hard failures remain; candidate may continue to another dev-only round"
+                            else:
+                                reason = "no dev uplift, a hard regression, or a non-Skill failure"
                         else:
-                            reason = "no dev uplift, a hard regression, or a non-Skill failure"
+                            objective_comparison = compare_objective(
+                                baseline_dev, dev_run, active_objective
+                            )
+                            parent_objective = compare_objective(
+                                parent_run, dev_run, active_objective
+                            )
+                            parent_hard = _comparison(parent_run, dev_run)
+                            hard_safe = (
+                                dev_run.passed
+                                and not comparison.hard_regressions
+                                and not parent_hard.hard_regressions
+                                and not self._has_non_skill_failure(dev_run)
+                            )
+                            improved = (
+                                hard_safe
+                                and parent_objective.evaluable
+                                and parent_objective.improvement is not None
+                                and parent_objective.improvement > 0
+                                and not parent_objective.case_regressions
+                            )
+                            promoted = improved and objective_comparison.passed
+                            if promoted:
+                                reason = None
+                            elif not hard_safe:
+                                reason = "tune candidate violated a hard gate or introduced a hard regression"
+                            elif not objective_comparison.evaluable:
+                                reason = "tune objective was not completely measurable"
+                            elif objective_comparison.case_regressions:
+                                reason = "tune candidate exceeded the per-case objective regression limit"
+                            elif not improved:
+                                reason = "tune candidate did not improve its parent"
+                            else:
+                                reason = "tune candidate did not reach the objective delta or target"
                         trial = CandidateTrial(
                             round_index=round_index,
                             candidate_id=candidate_id,
@@ -987,6 +1150,7 @@ class EvalOrchestrator:
                             promoted_from_dev=promoted,
                             rejection_reason=reason,
                             usage=candidate_usage,
+                            objective_comparison=objective_comparison,
                         )
                         trials.append(trial)
                         if improved:
@@ -997,9 +1161,23 @@ class EvalOrchestrator:
                 break
             if not next_frontier or len(trials) >= policy.max_candidate_snapshots:
                 break
-            next_frontier.sort(key=lambda item: item[1].hard_pass_rate, reverse=True)
+            if active_mode == ImprovementMode.REPAIR:
+                next_frontier.sort(
+                    key=lambda item: item[1].hard_pass_rate, reverse=True
+                )
+            else:
+                next_frontier.sort(
+                    key=lambda item: self._objective_rank(
+                        item[1], active_objective
+                    ),
+                    reverse=True,
+                )
             frontier = next_frontier[: policy.beam_width]
-            if frontier and frontier[0][1].passed:
+            if active_mode == ImprovementMode.REPAIR and frontier and frontier[0][1].passed:
+                break
+            if active_mode == ImprovementMode.TUNE and any(
+                item.promoted_from_dev for item in trials
+            ):
                 break
 
         if budget_stop is not None:
@@ -1027,15 +1205,32 @@ class EvalOrchestrator:
             )
 
         promoted_trials = [item for item in trials if item.promoted_from_dev]
-        promoted_trials.sort(
-            key=lambda item: (item.dev_run.hard_pass_rate, -item.round_index), reverse=True
-        )
+        if active_mode == ImprovementMode.REPAIR:
+            promoted_trials.sort(
+                key=lambda item: (item.dev_run.hard_pass_rate, -item.round_index),
+                reverse=True,
+            )
+        else:
+            promoted_trials.sort(
+                key=lambda item: (
+                    item.objective_comparison.improvement
+                    if item.objective_comparison is not None
+                    and item.objective_comparison.improvement is not None
+                    else float("-inf"),
+                    -item.round_index,
+                ),
+                reverse=True,
+            )
         if not promoted_trials:
             return finish_optimization(
                 baseline_dev=baseline_dev,
                 trials=tuple(trials),
                 accepted=False,
-                stop_reason="no candidate improved dev without a hard regression",
+                stop_reason=(
+                    "no candidate improved dev without a hard regression"
+                    if active_mode == ImprovementMode.REPAIR
+                    else "no candidate met the tune objective without a hard regression"
+                ),
                 output_dir=optimization_dir,
                 limitations=("Optimizer received dev evidence only.",),
             )
@@ -1064,8 +1259,23 @@ class EvalOrchestrator:
                         "Validation infrastructure failures cannot authorize or reject a Skill change.",
                     ),
                 )
+            if active_mode == ImprovementMode.TUNE and not baseline_validation.passed:
+                return finish_optimization(
+                    baseline_dev=baseline_dev,
+                    trials=tuple(trials),
+                    baseline_validation=baseline_validation,
+                    accepted=False,
+                    stop_reason=(
+                        "baseline is not tune-eligible because validation hard gates do not all pass; run repair first"
+                    ),
+                    output_dir=optimization_dir,
+                    limitations=(
+                        "Tune mode never uses a candidate to hide a pre-existing hard failure on a promotion split.",
+                    ),
+                )
         selected_trial = None
         candidate_validation = None
+        selected_validation_objective = None
         validation_attempts = []  # type: List[ValidationAttempt]
         for trial in promoted_trials[: policy.beam_width]:
             candidate_snapshot = self._frozen_trial_snapshot(
@@ -1107,7 +1317,21 @@ class EvalOrchestrator:
                     ),
                 )
             gate = _comparison(baseline_validation, validation)
-            passed_validation = validation.passed and not gate.hard_regressions
+            validation_objective = (
+                compare_objective(
+                    baseline_validation, validation, active_objective
+                )
+                if active_mode == ImprovementMode.TUNE
+                else None
+            )
+            passed_validation = (
+                validation.passed
+                and not gate.hard_regressions
+                and (
+                    validation_objective is None
+                    or validation_objective.passed
+                )
+            )
             validation_attempts.append(
                 ValidationAttempt(
                     candidate_id=trial.candidate_id,
@@ -1115,11 +1339,13 @@ class EvalOrchestrator:
                     run=validation,
                     passed_gate=passed_validation,
                     hard_regressions=gate.hard_regressions,
+                    objective_comparison=validation_objective,
                 )
             )
             if passed_validation:
                 selected_trial = trial
                 candidate_validation = validation
+                selected_validation_objective = validation_objective
                 break
             if candidate_validation is None:
                 candidate_validation = validation
@@ -1142,8 +1368,11 @@ class EvalOrchestrator:
         candidate_snapshot = self._frozen_trial_snapshot(
             selected_trial, frozen_candidates, adapter, subject_params
         )
+        baseline_holdout = None
         candidate_holdout = None
         holdout_batch_count = 0
+        holdout_pair_count = 0
+        holdout_objective = None
         accepted = True
         stop_reason = (
             "candidate passed dev and validation"
@@ -1151,6 +1380,50 @@ class EvalOrchestrator:
             else "candidate passed dev; no validation split is declared"
         )
         if self._optional_run_placeholder(pack, "holdout"):
+            if active_mode == ImprovementMode.TUNE:
+                baseline_holdout = await self._evaluate(
+                    pack,
+                    base_snapshot,
+                    ("holdout",),
+                    "baseline-holdout",
+                    allow_holdout=True,
+                    ledger=ledger,
+                )
+                if self._has_non_skill_failure(baseline_holdout):
+                    return finish_optimization(
+                        baseline_dev=baseline_dev,
+                        trials=tuple(trials),
+                        validation_attempts=tuple(validation_attempts),
+                        baseline_validation=baseline_validation,
+                        candidate_validation=candidate_validation,
+                        baseline_holdout=baseline_holdout,
+                        accepted=False,
+                        stop_reason=(
+                            "baseline holdout contains runtime, evaluator, or missing-evidence failures; tune quality was not determined"
+                        ),
+                        output_dir=optimization_dir,
+                        limitations=(
+                            "Holdout results were not returned to the optimizer.",
+                        ),
+                    )
+                if not baseline_holdout.passed:
+                    return finish_optimization(
+                        baseline_dev=baseline_dev,
+                        trials=tuple(trials),
+                        validation_attempts=tuple(validation_attempts),
+                        baseline_validation=baseline_validation,
+                        candidate_validation=candidate_validation,
+                        baseline_holdout=baseline_holdout,
+                        accepted=False,
+                        stop_reason=(
+                            "baseline is not tune-eligible because holdout hard gates do not all pass; run repair first"
+                        ),
+                        output_dir=optimization_dir,
+                        limitations=(
+                            "Tune mode never uses a candidate to hide a pre-existing hard failure on the holdout split.",
+                            "Holdout results were not returned to the optimizer.",
+                        ),
+                    )
             candidate_holdout = await self._evaluate(
                 pack,
                 candidate_snapshot,
@@ -1160,6 +1433,8 @@ class EvalOrchestrator:
                 ledger=ledger,
             )
             holdout_batch_count = 1
+            if active_mode == ImprovementMode.TUNE:
+                holdout_pair_count = 1
             if self._has_non_skill_failure(candidate_holdout):
                 accepted = False
                 stop_reason = (
@@ -1167,22 +1442,53 @@ class EvalOrchestrator:
                     "failures; candidate quality was not determined"
                 )
             else:
-                accepted = candidate_holdout.passed
+                if active_mode == ImprovementMode.TUNE:
+                    holdout_gate = _comparison(
+                        baseline_holdout, candidate_holdout
+                    )
+                    holdout_objective = compare_objective(
+                        baseline_holdout,
+                        candidate_holdout,
+                        active_objective,
+                    )
+                    accepted = (
+                        candidate_holdout.passed
+                        and not holdout_gate.hard_regressions
+                        and holdout_objective.passed
+                    )
+                else:
+                    accepted = candidate_holdout.passed
                 passed_gates = (
                     "dev, validation, and holdout"
                     if baseline_validation is not None
                     else "dev and holdout"
                 )
                 stop_reason = (
-                    "candidate passed %s" % passed_gates
+                    (
+                        "candidate passed %s and the tune objective" % passed_gates
+                        if active_mode == ImprovementMode.TUNE
+                        else "candidate passed %s" % passed_gates
+                    )
                     if accepted
-                    else "candidate failed the final holdout gate"
+                    else (
+                        "candidate failed the paired holdout tune gate"
+                        if active_mode == ImprovementMode.TUNE
+                        else "candidate failed the final holdout gate"
+                    )
                 )
         limitations = [
-            "Optimizer received dev failure evidence only.",
+            (
+                "Optimizer received dev failure evidence only."
+                if active_mode == ImprovementMode.REPAIR
+                else "Optimizer received only the dev tuning objective and measurements."
+            ),
             "Acceptance applies to the built-in runtime profile, not every Agent platform.",
             "A FakeRuntime acceptance is a deterministic simulation, not a model benchmark result.",
         ]
+        if active_mode == ImprovementMode.TUNE:
+            limitations.append(
+                "Objective comparisons use one paired run per scenario and do not establish statistical significance."
+            )
         if baseline_validation is not None:
             limitations.append(
                 "Validation was a promotion-only gate and was not returned to the optimizer."
@@ -1190,7 +1496,13 @@ class EvalOrchestrator:
         else:
             limitations.append("No validation split was declared for this EvalPack.")
         if candidate_holdout is not None:
-            limitations.append("Holdout ran once for the selected candidate.")
+            limitations.append(
+                (
+                    "Holdout ran once as a paired baseline/candidate tune gate."
+                    if active_mode == ImprovementMode.TUNE
+                    else "Holdout ran once for the selected candidate."
+                )
+            )
         else:
             limitations.append("No holdout split was declared for this EvalPack.")
         selected_candidate_path = self._materialize_selected_candidate(
@@ -1205,8 +1517,10 @@ class EvalOrchestrator:
             validation_attempts=tuple(validation_attempts),
             baseline_validation=baseline_validation,
             candidate_validation=candidate_validation,
+            baseline_holdout=baseline_holdout,
             candidate_holdout=candidate_holdout,
             holdout_batch_count=holdout_batch_count,
+            holdout_pair_count=holdout_pair_count,
             selected_candidate_id=selected_trial.candidate_id,
             selected_candidate_path=selected_candidate_path,
             selected_candidate_hash=candidate_snapshot.content_hash,
@@ -1214,6 +1528,9 @@ class EvalOrchestrator:
             stop_reason=stop_reason,
             output_dir=optimization_dir,
             limitations=tuple(limitations),
+            dev_objective=selected_trial.objective_comparison,
+            validation_objective=selected_validation_objective,
+            holdout_objective=holdout_objective,
         )
 
     def _check_runtime_capabilities(
@@ -1488,6 +1805,58 @@ class EvalOrchestrator:
             if spec.type == "artifact_exists" and params.get("path"):
                 values.append(str(params["path"]))
         return tuple(dict.fromkeys(values))
+
+    @classmethod
+    def _improvement_evidence(
+        cls,
+        mode: ImprovementMode,
+        run: EvalRun,
+        goal: str,
+        objective: Optional[ObjectiveSpec],
+    ) -> Tuple[Any, ...]:
+        if mode == ImprovementMode.REPAIR:
+            return cls._failure_evidence(run)
+        if objective is None:
+            return ()
+        measurement = measure_objective(run, objective)
+        if measurement.status != "measured" or measurement.value is None:
+            return ()
+        return (
+            TuneEvidence(
+                mode=mode.value,
+                goal=goal,
+                objective=cls._objective_payload(objective),
+                baseline_value=measurement.value,
+                scenario_values=measurement.scenario_values,
+            ),
+        )
+
+    @staticmethod
+    def _objective_rank(run: EvalRun, objective: ObjectiveSpec) -> float:
+        measurement = measure_objective(run, objective)
+        if measurement.status != "measured" or measurement.value is None:
+            return float("-inf")
+        return (
+            measurement.value
+            if objective.direction.value == "maximize"
+            else -measurement.value
+        )
+
+    @staticmethod
+    def _objective_payload(objective: ObjectiveSpec) -> Mapping[str, Any]:
+        return {
+            "id": objective.id,
+            "source": {
+                "type": objective.source.type,
+                "grader_id": objective.source.grader_id,
+                "key": objective.source.key,
+            },
+            "direction": objective.direction.value,
+            "aggregation": objective.aggregation,
+            "min_delta": objective.min_delta,
+            "target": objective.target,
+            "max_case_regression": objective.max_case_regression,
+        }
 
     @staticmethod
     def _failure_evidence(run: EvalRun) -> Tuple[FailureEvidence, ...]:

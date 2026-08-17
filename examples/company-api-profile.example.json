@@ -1,0 +1,25 @@
+{
+  "api_version": "aceval.company-profile/v1",
+  "name": "company-agent",
+  "base_url": "https://agent.company.example",
+  "auth": {
+    "type": "bearer_env",
+    "env": "COMPANY_AGENT_TOKEN"
+  },
+  "execute": {
+    "path": "/api/runs",
+    "method": "POST",
+    "session_id_path": "$.data.session_id"
+  },
+  "session_log": {
+    "path_template": "/api/sessions/{session_id}",
+    "method": "GET",
+    "output_path": "$.data.output",
+    "trace_path": "$.data.events",
+    "usage_path": "$.data.usage",
+    "error_path": "$.data.error",
+    "metadata_path": "$.data.metadata"
+  },
+  "timeout_seconds": 30,
+  "max_response_bytes": 4194304
+}

@@ -2,11 +2,11 @@
 
 > Agent Capability EvalOps: 在一个可控的参考 Agent 环境中，对 Skill 做可复现评测、成对比较和受控迭代。
 
-当前状态：仓库已经包含可运行的 `aceval 0.1.0` 参考实现、两个 EvalPack、示例 Skill、命令行工具和自动测试。仓库中的 FakeRuntime 结果是确定性模拟，只用于验证 Kernel、Pack、Grader 和门禁流程；它们不是实际模型效果或提升数据。
+当前状态：仓库已经包含可运行的 `aceval 0.2.0` 参考实现、两个手写 EvalPack、Pack Builder、公司 Session 连接层、示例 Skill、命令行工具和自动测试。仓库中的 FakeRuntime 结果是确定性模拟，只用于验证 Kernel、Pack、Grader 和门禁流程；它们不是实际模型效果或提升数据。
 
 ## 一句话介绍
 
-Skill Doctor 把“人工运行 Skill -> 搬运会话日志 -> 请 Agent 分析 -> 修改 Skill -> 手工回归”的过程，收敛为一套受确定性工作流控制的 EvalOps 系统：加载版本化测试集，在统一 Runtime 中执行 Skill，采集标准 Trace 和产物，通过 Grader 评分，只用 dev 失败证据生成候选，并经过 validation 与可选 holdout 门禁后输出候选补丁和报告。
+Skill Doctor 把“人工运行 Skill -> 搬运会话日志 -> 请 Agent 分析 -> 修改 Skill -> 手工回归”的过程，收敛为一套受确定性工作流控制的 EvalOps 系统：加载冻结测试契约，在统一 Runtime 中执行 Skill，采集标准 Trace、产物和 usage；baseline 有硬失败时进入 `repair`，baseline 已可用时按明确 Objective 进入 `tune`，再经过 validation 与可选 holdout 门禁输出候选和证据报告。
 
 ## 项目背景
 
@@ -60,24 +60,35 @@ validation promotion -> optional one-shot holdout -> report
 
 Kernel 负责 Pack 完整性校验、Subject 快照、Runtime capability 检查、工作区生命周期、预算、评分聚合、候选 lineage 和回归门禁。领域知识位于 EvalPack 的 Scenario、fixture、Oracle、Grader 配置和 Optimizer policy 中，Orchestrator 不包含安全审查或 CSV 的条件分支。
 
-当前内置 Optimizer 只修改 UTF-8 `SKILL.md`，不会覆盖原 Skill。候选受允许路径、最大新增行数、最大候选数、父版本 hash 和测试字面量泄漏检查约束。Optimizer 只能接收 dev 的确定性失败证据；validation 只决定晋级，holdout 仅对最终候选运行一次。
+当前内置 Optimizer 只修改 UTF-8 `SKILL.md`，不会覆盖原 Skill。候选受允许路径、最大新增行数、最大候选数、父版本 hash 和测试字面量泄漏检查约束。`repair` 只能接收 dev 的确定性硬失败证据；`tune` 只能接收 dev 的目标与测量值。validation/holdout 从不反馈给 Optimizer。Tune 在 dev、validation 和 holdout 上都保持 hard Grader 非劣，并对 baseline/candidate 做成对 Objective 比较。
 
-每个 Optimizer 除组件 `id` 外还必须声明 `proposal_contract`。MVP 接受 `aceval.optimizer/candidate-patch-v1`，由实现直接返回 `CandidatePatch`；也接受内置兼容契约 `aceval.optimizer/skill-markdown-generator-v1`，由 Kernel 通过 `SkillOptimizerBridge` 转为前一种契约。缺失或未知契约会在生成候选前 fail closed。
+每个 Optimizer 除组件 `id` 外还必须声明 `proposal_contract`。Kernel 接受 `aceval.optimizer/candidate-patch-v1`，也接受内置 `aceval.optimizer/skill-markdown-improver-v2`，由 `SkillOptimizerBridge` 转为前一种契约；旧 `skill-markdown-generator-v1` 保留为 repair 兼容面。缺失、未知或与 improvement mode 不匹配的契约会在生成候选前 fail closed。
 
 当前 `candidate-patch-v1` 的可验证格式仍是刻意收窄的：候选目录提供完整文件快照，`content` 必须是 UTF-8 文本，diff 只能修改单个声明的 entrypoint，Kernel 会从冻结 parent/candidate 重新计算 unified diff 并逐项核对。无效 base/path/hash/diff 会计入 rejected proposal 和 usage 后以结构化协议错误停止。多文件或二进制优化不能只注册一个新 Subject Adapter；D40 需要同时定义显式的候选验证扩展契约（例如 `verify_candidate_patch`）及对应安全测试。
 
-Manifest 中三类自由参数有固定传递边界：`subject_contract.params` 进入 Subject Adapter 的 `snapshot/materialize` 以及候选重验；`driver.params` 只通过 Driver `RunContext.metadata.driver_params` 进入 `prepare`，不会转发给 Runtime；`optimizer_policy.params` 通过 `PatchConstraints.metadata.optimizer_params` 交给 `candidate-patch-v1` Optimizer。当前内置 Adapter/Driver 和 `skill-markdown-generator-v1` 生成器不消费这些自定义参数。
+Manifest 中三类自由参数有固定传递边界：`subject_contract.params` 进入 Subject Adapter 的 `snapshot/materialize` 以及候选重验；`driver.params` 只通过 Driver `RunContext.metadata.driver_params` 进入 `prepare`，不会转发给 Runtime；`optimizer_policy.params` 通过 `PatchConstraints.metadata.optimizer_params` 交给 `candidate-patch-v1` Optimizer。当前内置 Adapter/Driver 不消费这些自定义参数。
 
 ### EvalPack
 
-`EvalPack v1alpha1` 描述被测对象契约、Driver、分层 Case、fixture、Oracle、Grader 和优化策略。仓库内置两个 Pack：
+`EvalPack v1alpha1` 保持 legacy repair 兼容；`v1alpha2` 新增 `auto | repair | tune`、自然语言 Goal 和单一 Primary Objective。Objective 第一版支持 Grader score/metric、Token/成本、场景耗时和工具调用数；所有 hard Grader 始终是正确性与安全 guardrail。仓库内置两个 Pack：
 
 | Pack | 输入与输出 | Case | 主要 Grader |
 |---|---|---:|---|
 | `security-review` | Python 文件 -> JSON findings | 6 dev + 2 validation + 2 holdout | JSON Schema、记录匹配、源码行引用、Trace 工具断言 |
 | `csv-summary-smoke` | CSV 文件 -> `summary.json` | 2 dev + 1 validation | 产物存在、JSON Schema、JSON Path、workspace diff |
 
-接入新任务时，若 UTF-8 `SKILL.md`、固定文件工具和现有 Driver/Grader 已足够，优先只新增 Pack 数据。出现新的 Subject 文件形态、工具能力、输入输出模态、评分语义或修改表面时，需要实现并显式注册相应受信组件；目标是保持 Kernel 状态机不随领域变化，而不是宣称扩展永远零代码。
+接入新任务时，若 UTF-8 `SKILL.md`、固定文件工具和现有 Driver/Grader 已足够，优先用 Pack Builder 从少量 Case 和 Goal 生成 Pack。已支持 `generic`、`csv-summary`、`security-review` 模板；未知类型会安全降级到 `generic` 草稿。出现新的 Subject 文件形态、工具能力、输入输出模态、评分语义或修改表面时，需要实现并显式注册相应受信组件；目标是保持 Kernel 状态机不随领域变化，而不是宣称扩展永远零代码。
+
+生成的 EvalPack 采用独立生命周期：
+
+```text
+draft -> calibrating（可反复改 Case/Oracle/Grader） -> frozen
+                                                        |
+                                                        v
+                                              repair/tune Skill
+```
+
+草稿可以 `lint`、`test` 和人工校准，但不能进入 Skill 优化。显式冻结时会生成 `.aceval-pack-lock.json`；冻结后任何 Case、Oracle、Grader、fixture 或 Objective 变化都会使加载失败。需要调整评测器时，应创建新 Pack 版本并重新跑 baseline，不能让模型在同一实验里同时改 EvalPack 和 Skill。
 
 ### FakeRuntime 的定位
 
@@ -129,6 +140,66 @@ aceval pack test evalpacks/security-review --runtime fake
 aceval pack lint evalpacks/csv-summary-smoke
 aceval pack test evalpacks/csv-summary-smoke --runtime fake
 ```
+
+## 从少量 Case 生成 EvalPack
+
+已支持类型只需提供 Case JSON 和 Goal；若 Goal 明确包含 Token、成本、工具调用或延迟，Builder 会生成一个可测量的单一效率 Objective，并保留 hard Grader 作为正确性约束。示例输入见 `examples/cases/generic-cases.example.json`。
+
+```bash
+aceval pack generate \
+  --type generic \
+  --cases examples/cases/generic-cases.example.json \
+  --goal '保持答案正确并减少 token' \
+  --output .aceval/packs/generic-answer
+
+aceval pack calibrate .aceval/packs/generic-answer
+aceval pack lint .aceval/packs/generic-answer
+aceval pack freeze .aceval/packs/generic-answer --approve
+```
+
+`--type` 可以传尚未支持的领域名；此时系统会一键生成 `generic` draft，并记录请求类型，但不会允许 `doctor --approve-pack` 直接用它优化 Skill。用户需要先补齐/确认语义 Oracle 和 Grader，再单独冻结。主观“更好”不会被悄悄翻译成模型自己定义、自己打分的标准。
+
+## 傻瓜式 repair/tune 入口
+
+`doctor` 把 Pack 生成、生命周期检查、baseline、自动模式选择和候选门禁串在一起。已支持模板可通过一次显式确认直接启动；baseline 有硬失败时选择 repair，全部 hard gate 已通过时选择 tune。
+
+```bash
+aceval doctor \
+  --subject ./my-skill \
+  --cases ./cases.json \
+  --type csv-summary \
+  --goal '结果必须准确，并尽量减少工具调用' \
+  --pack-output .aceval/packs/my-csv-pack \
+  --approve-pack \
+  --runtime reference \
+  --model-command 'python path/to/model_bridge.py' \
+  --model-env MODEL_API_KEY
+```
+
+若生成的 Pack 仍需校准，命令会停在 `calibration_required`，不会同时修改评测器和 Skill。
+
+## 公司 Agent API 与 Session 日志
+
+配置示例见 `examples/company-api-profile.example.json`。Profile 只保存密钥所在的环境变量名，不保存 token 值；Execute 和 Session Log 的字段位置通过受限 JSONPath 映射。
+
+```bash
+export COMPANY_AGENT_TOKEN='...'
+
+aceval profile validate examples/company-api-profile.example.json
+
+aceval session fetch \
+  --profile examples/company-api-profile.example.json \
+  --session-id SESSION_ID \
+  --output .aceval/imported/session.json
+
+aceval session import \
+  --profile examples/company-api-profile.example.json \
+  --session-id SESSION_ID \
+  --input downloaded-session.json \
+  --output .aceval/imported/session.json
+```
+
+导入结果统一为 `RunObservation` 语义：`output + canonical trace + usage + completeness`。当前连接层已经预留 Execute endpoint 和 Session 获取能力；把导入 Observation 直接接入完整 EvalRun/Replay 是后续扩展面。
 
 ## 双 Pack 可复制演示
 
@@ -308,7 +379,7 @@ Optimizer 使用同一 JSON envelope，但 `tools` 为空；其最终 `content` 
 - 每个 EvalRun 在 `<run-dir>/frozen-pack/` 保存逐文件 hash 校验后的 Pack 副本；本次 Driver、fixture 和 `schema_ref`/`rubric_ref` 评分都基于这个冻结版本；
 - 原始 Subject 不会被覆盖。
 
-`run/compare` 的质量失败退出码为 `1`，输入、配置、执行错误或不可比较结果通常为 `2`，便于接入 CI。Gate 状态区分 `pass | fail | error | not_evaluable | not_run`；baseline 或 candidate 出现基础设施错误时，compare 不计算 paired uplift，也不会把错误恢复记成 improvement。报告明确记录 Runtime profile 与内容 hash、configured budget、Pack/Subject hash、分层结果、硬回归、usage 的 `measured | partial | not_measured` 状态以及限制项。优化报告还记录所有 validation attempts、proposal/rejected/duplicate 数量、全实验累计 usage 和 holdout 批次 `0/1`；因为 baseline 不执行 holdout，`hidden_regression_rate` 会诚实标记为 `null/not_measured`。Reference Runtime 生成的 Canonical Trace 当前用于 `RunObservation` 和 Trace Grader；CLI 摘要报告尚不持久化完整原始会话日志。
+`run/compare` 的质量失败退出码为 `1`，输入、配置、执行错误或不可比较结果通常为 `2`，便于接入 CI。Gate 状态区分 `pass | fail | error | not_evaluable | not_run`；baseline 或 candidate 出现基础设施错误时，compare 不计算 paired uplift，也不会把错误恢复记成 improvement。报告明确记录 Runtime profile 与内容 hash、configured budget、Pack/Subject hash、分层结果、硬回归、usage 的 `measured | partial | not_measured` 状态以及限制项。优化报告还记录 mode、Goal、Objective baseline/candidate 值、signed improvement、逐 Case 回退、所有 validation attempts、proposal/rejected/duplicate 数量和全实验累计 usage。Repair 的 holdout 仍只运行最终候选；Tune 的 validation/holdout 都成对运行 baseline/candidate，并记录 `holdout_pair_count`。单次测量不宣称统计显著。
 
 ## 安全与有效性边界
 
@@ -320,6 +391,8 @@ Optimizer 使用同一 JSON envelope，但 `tools` 为空；其最终 `content` 
 - 墙钟预算是 soft deadline：超时后系统会等待受控 bridge worker 完成，或等待模型命令自身的 timeout，以避免后台线程继续修改已进入清理阶段的 workspace；因此进程实际返回时间可能超过墙钟预算。
 - Token 字段必须是非负整数；存在 `total_tokens`/输入输出别名或费用别名时按可观测最大值保守计费，并在报告中标记冲突。
 - Oracle 和 validation/holdout 内容不会进入 Optimizer 请求；本地仓库中的测试文件对有主机文件权限的恶意进程并不构成密码学隐藏。
+- 生成的 Pack 在 draft/calibrating 阶段不能优化 Skill；frozen Pack 受逐文件内容锁保护。修改 Pack 后必须创建新版本并重新跑 baseline，历史 uplift 不可沿用。
+- 自然语言 Goal 只有在能映射到确定性效率指标时才会自动生成 Objective；主观质量需要经人工确认/校准的 Rubric 或 Judge，当前不会让同一模型自定标准并自证成功。
 - Driver 只接收不含 Oracle/Grader 配置的 Scenario view 和 Case 专属 fixture 副本；`PreparedScenario`、Runtime result、Observation 和 Grade 数据在边界处深冻结，避免后序组件修改已采集证据。自定义 Python Driver/Grader 仍是同进程可信计算基（TCB），这不是对恶意组件的隔离承诺。
 - Scenario ID、fixture/artifact 路径都必须是受控相对标识；内存 artifact 与 workspace artifact 统一受文件数、单文件大小和总字节上限约束。
 - 单次运行不能测量模型波动；真实结论需要固定模型参数并重复运行。
@@ -330,7 +403,7 @@ Optimizer 使用同一 JSON envelope，但 `tools` 为空；其最终 `content` 
 
 - 减少人工中转：统一执行、Trace、评分、候选和回归门禁；
 - 让失败可复现：冻结 Pack、Subject、Case 和 Oracle，并显式记录 Runtime 与 usage；
-- 控制错误优化：只有 dev 的硬失败证据可以驱动修改，validation/holdout 保持隔离；
+- 控制错误优化：repair 只看 dev 硬失败；tune 只看 dev Objective，且 hard gate 不得回退；validation/holdout 保持隔离；
 - 控制成本与风险：限制步骤、时间、Token、费用、工具调用、候选数和补丁范围；
 - 降低受支持范围内的扩展成本：新领域优先通过 EvalPack 接入，超出内置能力时增加显式受信组件；
 - 迁移到完整 Agent：未来可为 system prompt、工具配置、Workflow 或 Agent snapshot 实现新的 `SubjectAdapter`，复用 Driver、Runtime、Trace、Grader、门禁和报告。
@@ -339,7 +412,7 @@ Optimizer 使用同一 JSON envelope，但 `tools` 为空；其最终 `content` 
 
 ## 20 天黑客松路线
 
-当前代码已经提供 Reference Runtime、通用 Kernel/EvalPack、双 Pack、确定性 Grader、FakeRuntime conformance、受控优化门禁和 JSON/Markdown 报告。D20 的重点是把它打磨成可信演示：
+当前代码已经提供 Reference Runtime、repair/tune Kernel、Pack Builder/冻结锁、双 Pack、公司 Session 连接层、确定性 Grader、FakeRuntime conformance、受控优化门禁和 JSON/Markdown 报告。D20 剩余重点是把它打磨成可信演示：
 
 1. 接入一个真实模型桥接并冻结模型参数，完成双 Pack 的重复实验；
 2. 补充真实失败 Trace、非 Skill 故障样例和清晰的证据归因；
@@ -351,13 +424,13 @@ Optimizer 使用同一 JSON envelope，但 `tools` 为空；其最终 `content` 
 
 ## 40 天求职作品路线
 
-1. 持久化完整 Canonical Trace、运行环境信息和可重放 Observation；
+1. 将公司 Session 的 ImportedRunBundle 接入完整 EvalRun、Replay 和 Case 反生成；
 2. 增加更完整的故障分类、证据等级和经人工标注校准的结构化 Judge；
 3. 将两个 Pack 扩展为分层 Benchmark，重复运行并报告置信区间、flake、成本和延迟；
 4. 增加 capability-gated `AgentSubject` 或 `FixedAgentTarget`，验证 Kernel 对完整 Agent 的迁移；
 5. 为多文件/二进制 Subject 与 shell/network/browser/multimodal 工具增加显式受信组件和 capability；
 6. 建设 Evaluator Replay CI Gate、受限 Worker、作品文档和消融实验；
-7. 将真实平台日志导入作为可选 Adapter，而不是让核心依赖任一公司 API。
+7. 增加 Profile 驱动的公司 Agent Runtime Adapter，同时保持核心不依赖任一公司 API。
 
 ## 开发与测试
 
@@ -377,6 +450,8 @@ git diff --check
 - [research/skill-ranking](./research/skill-ranking)：公开 Skill 榜单快照和可复算分类脚本；
 - [src/aceval/agent_runtime.py](./src/aceval/agent_runtime.py)：Reference Agent Runtime 与模型桥接协议；
 - [src/aceval/orchestrator.py](./src/aceval/orchestrator.py)：通用执行、比较与优化门禁；
+- [src/aceval/pack_builder.py](./src/aceval/pack_builder.py)：EvalPack 草稿生成、校准和冻结；
+- [src/aceval/connections.py](./src/aceval/connections.py)：公司 API Profile 与 Session 日志归一化；
 - [evalpacks](./evalpacks)：内置双 Pack 与 fixture/Oracle。
 
 ## 项目边界

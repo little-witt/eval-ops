@@ -1,9 +1,9 @@
-# EvalPack `v1alpha1` 扩展规范
+# EvalPack `v1alpha1/v1alpha2` 扩展规范
 
 > 项目：Skill Doctor / Agent Capability EvalOps
-> API version：`aceval.dev/v1alpha1`
+> API version：`aceval.dev/v1alpha1`（legacy repair）/ `aceval.dev/v1alpha2`
 > 状态：MVP 已实现规范
-> 基线日期：2026-08-16
+> 基线日期：2026-08-18
 
 ## 1. 目标
 
@@ -44,6 +44,11 @@ MVP 的声明式通用性只覆盖已注册组件的能力交集。当前内置�
 - 两个 workspace Driver；
 - 七个确定性 Grader；
 - dev/validation/holdout split；
+- `auto | repair | tune` improvement policy 与单一 Primary Objective；
+- Objective 来源：Grader score/metric、usage、duration、tool-call count；
+- Pack Builder：`generic`、`csv-summary`、`security-review` 以及未知类型的 generic fallback；
+- `draft -> calibrating -> frozen` 生命周期、显式冻结和内容锁；
+- 公司 Agent Profile 与 Session Log 的独立导入契约；
 - `pack lint` 与 FakeRuntime `pack test`；
 - `security-review` 和 `csv-summary-smoke` 两个内置示例 Pack。
 
@@ -57,7 +62,7 @@ MVP 的声明式通用性只覆盖已注册组件的能力交集。当前内置�
 - 不可信插件隔离、签名或 Marketplace；
 - 远程 Pack 安装和依赖解析。
 
-当前没有 `pack init` 或 `--extension` CLI，也没有公司 Runtime Adapter。Runtime 由宿主/CLI 选择，不写入 Pack。
+当前已有 `pack generate/calibrate/freeze` 和公司 Session 导入，但还没有 `--extension`、公司 Runtime Adapter、经人工标注校准的 LLM Judge。Runtime 由宿主/CLI 选择，不写入 Pack。
 
 ## 3. 三层边界
 
@@ -103,18 +108,41 @@ Loader 会把 Manifest 中的本地 `schema_ref` 解析为结构化资源、把 
 
 Subject 必须位于 Pack 外部。示例仓库可以同时提供 baseline/candidate Subject，但它们不是 EvalPack 内容。
 
+### 4.1 生成、校准与冻结
+
+Pack Builder 生成的 Pack 必须在 `metadata.calibration_status` 中声明生命周期：
+
+| 状态 | 允许 | 禁止 |
+|---|---|---|
+| `draft` | lint、查看/编辑 Case、Oracle、Grader、Objective | Skill optimize |
+| `calibrating` | 运行校准、补充正反例、修订评测器 | Skill optimize |
+| `frozen` | run、compare、repair/tune | 原地修改评测语义 |
+
+`pack freeze --approve` 只改变生命周期元数据并生成 `.aceval-pack-lock.json`，不会自动补 Oracle、改 Grader、推断新 Objective 或删除失败 Case。内容锁覆盖除自身外的全部 Pack 文件；冻结后任一文件变化都会使 Loader fail closed。
+
+内置 legacy `v1alpha1` Pack 没有生命周期字段，为兼容已有资产按 grandfathered frozen 处理。新生成 Pack 不得利用该兼容路径。若需要改 frozen Pack，应创建新版本、重新冻结并从 baseline 重跑；不同 Pack hash 下的 uplift 不可直接续算。
+
+EvalPack 可以迭代，但它是 Skill 实验外层的独立校准循环。单次实验禁止同时优化 Pack 与 Skill：
+
+```text
+Pack calibration loop -> frozen Pack hash -> Skill repair/tune loop
+        ^                                      |
+        +-------- new Pack version ------------+
+```
+
 ## 5. Manifest
 
 ### 5.1 完整示例
 
 ```yaml
-api_version: aceval.dev/v1alpha1
+api_version: aceval.dev/v1alpha2
 kind: EvalPack
 
 metadata:
   name: security-review
   version: 0.1.0
   description: Evaluate JSON security-review Skills.
+  calibration_status: draft
 
 subject_contract:
   kinds: [skill]
@@ -152,6 +180,26 @@ graders:
 
 optimizer_policy:
   adapter: skill_markdown_v1
+  mode: auto
+  goal: Keep correctness while reducing tokens.
+  objective:
+    id: token-efficiency
+    source: {type: usage, key: total_tokens}
+    direction: minimize
+    aggregation: mean
+    min_delta: 0
+    max_case_regression: 0
+  mode: auto
+  goal: Keep findings correct while reducing tool calls.
+  objective:
+    id: tool-efficiency
+    source:
+      type: trace_count
+      key: tool_call
+    direction: minimize
+    aggregation: mean
+    min_delta: 0
+    max_case_regression: 0
   patchable_components: [skill_instruction]
   allowed_paths: [SKILL.md]
   visible_splits: [dev]
@@ -169,12 +217,13 @@ JSON 与 YAML 示例表达同一数据结构。Manifest 和 Scenario 的结构�
 
 | 字段 | 当前约束 |
 |---|---|
-| `api_version` | 必须等于 `aceval.dev/v1alpha1` |
+| `api_version` | `v1alpha1` 为 legacy repair；`v1alpha2` 支持 improvement fields |
 | `kind` | 必须等于 `EvalPack` |
 | `metadata.name` | 非空字符串 |
 | `metadata.version` | 非空字符串 |
 | `metadata.description` | 可选字符串 |
 | `metadata.labels` | 可选 string-to-string mapping |
+| `metadata.calibration_status` | Builder Pack 为 `draft | calibrating | frozen`；frozen 需要内容锁 |
 | `subject_contract.kinds` | 当前 Registry 只支持 `skill` |
 | `subject_contract.adapter` | 当前为 `skill_markdown_v1` |
 | `subject_contract.entrypoint` | 当前示例为 `SKILL.md` |
@@ -185,6 +234,9 @@ JSON 与 YAML 示例表达同一数据结构。Manifest 和 Scenario 的结构�
 | `suite` | 声明 dev/validation/holdout 文件或 ref |
 | `graders` | Manifest 级 Grader ID、类型、hard 和默认参数 |
 | `optimizer_policy` | 可选；缺失时 Pack 为 eval-only |
+| `optimizer_policy.mode` | `v1alpha2`：`auto | repair | tune`；`v1alpha1` 不允许 |
+| `optimizer_policy.goal` | 用户自然语言目标，只用于候选语义上下文，不单独构成验收标准 |
+| `optimizer_policy.objective` | Tune 的可测量主目标；显式 tune 必填，repair 禁止 |
 | `optimizer_policy.params` | 通过 `PatchConstraints.metadata.optimizer_params` 传给 `candidate-patch-v1` Optimizer |
 
 Manifest 不保存模型名、API key、凭证或价格。Runtime 和绝对实验预算由 CLI/宿主提供，Pack 只声明所需 capability 和更严格的优化约束。
@@ -209,9 +261,49 @@ optimizer_policy.params
   -> aceval.optimizer/candidate-patch-v1 Optimizer
 ```
 
-当前 `skill_markdown_v1` Subject Adapter 和两个内置 workspace Driver 接受相应传递路径，但不消费自定义值；内置 `skill-markdown-generator-v1` 生成器也不读取 `optimizer_policy.params`。自定义受信组件必须自行 fail closed 校验所支持的键和值。
+当前 `skill_markdown_v1` Subject Adapter 和两个内置 workspace Driver 接受相应传递路径，但不消费自定义值；内置 Markdown improver 也不读取 `optimizer_policy.params`。自定义受信组件必须自行 fail closed 校验所支持的键和值。
 
-### 5.4 Suite 引用
+### 5.4 Improvement mode 与 Objective
+
+`auto` 先运行 baseline：存在确定性 hard FAIL 时进入 repair；全部 hard gate 通过时进入 tune。Repair 不接受自定义 Objective，只允许 hard pass rate 正向提升且无 hard regression。Tune 要求 baseline hard pass，并使用一个 Primary Objective：
+
+```yaml
+optimizer_policy:
+  mode: tune
+  goal: Keep output correct and reduce total tokens.
+  objective:
+    id: token-efficiency
+    source:
+      type: usage
+      key: total_tokens
+    direction: minimize
+    aggregation: mean
+    min_delta: 10
+    target: 100
+    max_case_regression: 0
+```
+
+MVP 支持的 `source.type`：
+
+| type | 必需字段 | 示例 |
+|---|---|---|
+| `grader_score` | `grader_id` | 经校准的质量分 |
+| `grader_metric` | `grader_id`, `key` | precision/coverage 等数值 metric |
+| `usage` | `key` | `total_tokens`、`input_tokens`、`output_tokens`、`cost_usd` |
+| `scenario` | `key=duration_seconds` | Case 耗时 |
+| `trace_count` | `key=tool_call` | 工具调用数 |
+
+任一 Case 缺值、值非有限、usage 为负数或 Grader 为 `ERROR/NOT_EVALUABLE` 时，Objective 不可评估；缺失值绝不按零处理。`min_delta=0` 表示“任意严格正向改善”，不允许 unchanged candidate 通过。Tune 候选必须同时满足：
+
+1. 所有 hard gate 继续通过；
+2. 相对 parent 真正改善，防止多轮搜索倒退；
+3. 相对原 baseline 达到 `min_delta` 和可选 `target`；
+4. 单 Case 回退不超过 `max_case_regression`；
+5. validation 和 holdout 上继续成对通过同一 Objective gate。
+
+自然语言 Goal 不是 Judge。Builder 只会为 Token、成本、工具调用和延迟等直接可测目标做保守推断；主观质量必须绑定经用户确认/校准的 Grader 或 Judge。
+
+### 5.5 Suite 引用
 
 `suite` 支持：
 
@@ -374,9 +466,10 @@ class Optimizer(Protocol):
 Optimizer 的 `id` 用于匹配 `optimizer_policy.adapter`，`proposal_contract` 用于声明 `propose` 的输入输出形态。当前只接受：
 
 - `aceval.optimizer/candidate-patch-v1`：公共 Optimizer Protocol，直接返回 `CandidatePatch` 序列；
-- `aceval.optimizer/skill-markdown-generator-v1`：内置兼容契约，生成完整 UTF-8 `SKILL.md`，由 `SkillOptimizerBridge` 转为 `candidate-patch-v1`。
+- `aceval.optimizer/skill-markdown-improver-v2`：内置 repair/tune 契约，生成完整 UTF-8 `SKILL.md`，由 `SkillOptimizerBridge` 转为 `candidate-patch-v1`；
+- `aceval.optimizer/skill-markdown-generator-v1`：legacy repair 兼容契约。
 
-缺失或未知 `proposal_contract` 必须在生成候选前 fail closed。`skill-markdown-generator-v1` 是受限便利接口，不是多文件 Subject 的通用补丁协议。
+缺失、未知或不支持当前 improvement mode 的 `proposal_contract` 必须在生成候选前 fail closed。Markdown improver 是受限便利接口，不是多文件 Subject 的通用补丁协议。
 
 MVP 的 `candidate-patch-v1` 不是任意文件补丁格式。Kernel 当前要求 parent/candidate 都提供完整文件快照和 UTF-8 文本 `content`，只允许 diff 触碰声明的单一 entrypoint，并从两份冻结内容重新计算 unified diff。base hash、patch hash、候选目录、真实 Subject hash、changed-files 集合或 diff 任一不一致，均作为可审计的 optimizer protocol error：记入 proposal/rejected/usage 后立即停止，不产生 trial。多文件或二进制 Candidate 需要 D40 新增显式候选验证扩展契约；仅注册 Subject Adapter 不会绕过这组检查。
 
@@ -477,36 +570,36 @@ optimizer_policy:
 4. beam、round、snapshot 数必须为正数；
 5. candidate 必须携带匹配的 base hash 和 patch hash；
 6. 候选目录、真实内容 hash、allowed paths 和新增行数会再次校验；
-7. Optimizer 只接收 dev hard `FAIL`；
+7. repair 只接收 dev hard `FAIL`；tune 只接收 dev Goal/Objective 测量；
 8. validation 结果不反馈给 Optimizer；
-9. holdout 只对最终候选执行，失败后不继续迭代；
+9. repair holdout 只执行最终候选；tune holdout 成对执行 baseline/candidate；失败后都不继续迭代；
 10. Optimizer 必须声明受支持的 `proposal_contract`；
 11. `optimizer_policy.params` 只经 `PatchConstraints.metadata.optimizer_params` 交给 `candidate-patch-v1` Optimizer；
 12. 原 Subject 不会被覆盖。
 
 通过全部门禁后，Kernel 将冻结候选再次独立物化到 `selected-candidate`，重验 Subject hash，并在报告中记录交付路径和 hash。内置 Skill Adapter 写入不参与 Subject hash 的受控 candidate provenance marker，使交付副本可独立重跑；原 trial 目录后续变化不会改变交付副本。
 
-内置模型 Optimizer 声明 `aceval.optimizer/skill-markdown-generator-v1`，通过 `CommandModelClient` 返回完整替换版 `SKILL.md` 和 rationale；`FrozenCandidateOptimizer` 使用同一兼容契约加载预注册候选。`SkillOptimizerBridge` 再生成受 Kernel 校验的 `CandidatePatch`。自动修改 scripts、templates、assets、二进制、多文件 Subject 或 Agent 配置不属于当前内置实现。
+内置模型 Optimizer 声明 `aceval.optimizer/skill-markdown-improver-v2`，通过 `CommandModelClient` 返回完整替换版 `SKILL.md` 和 rationale；`FrozenCandidateOptimizer` 可加载预注册候选。`SkillOptimizerBridge` 再生成受 Kernel 校验的 `CandidatePatch`。自动修改 scripts、templates、assets、二进制、多文件 Subject 或 Agent 配置不属于当前内置实现。
 
 ## 11. Split 与信息边界
 
 ### 11.1 dev
 
 - baseline 与所有候选可多次运行；
-- hard `FAIL` 可形成 Optimizer evidence；
+- repair 的 hard `FAIL` 或 tune 的目标测量可形成 Optimizer evidence；
 - 允许决定下一轮候选。
 
 ### 11.2 validation
 
-- 在 `optimize` 中只运行从 dev 晋级的候选；普通 `run/compare` 也可显式评测 validation；
-- 可以与 baseline 做 hard regression 对照；
+- 在 `optimize` 中运行 baseline 与从 dev 晋级的候选；普通 `run/compare` 也可显式评测 validation；
+- repair 做 hard regression 对照；tune 还做 Objective paired gate；
 - 结果只用于晋级，不生成新候选。
 
 ### 11.3 holdout
 
 - 普通 `run/compare` CLI 不提供该 split；
 - 仅 `optimize` 的最终候选进入；
-- 当前实现每个优化实验最多执行一个最终 holdout 批次；
+- repair 最多一个 candidate holdout 批次；tune 最多一对 baseline/candidate holdout；
 - 失败即停止，不反馈给 Optimizer。
 
 `pack test` 为了 conformance 只使用 FakeRuntime 运行已解析的 dev/validation；holdout 会被加载、校验并纳入 Pack hash，但不会在该命令中执行。当前所有 Pack/Runtime 位于同一 OS 用户环境，split 边界是 Orchestrator 协议边界，不是对恶意宿主进程的访问控制。
@@ -545,7 +638,7 @@ aceval pack lint evalpacks/security-review
 aceval pack test evalpacks/security-review --runtime fake
 ```
 
-当前没有 `aceval pack init`。
+当前提供 `aceval pack generate/calibrate/freeze`，不再需要手写最小目录骨架。
 
 ### 13.2 `pack lint`
 
@@ -557,6 +650,7 @@ aceval pack test evalpacks/security-review --runtime fake
 - duplicate/unknown Subject、Driver、Grader、Optimizer；
 - Scenario 的 Grader 引用和参数；
 - optimizer split 约束；
+- lifecycle 状态与 frozen 内容锁；
 - suite 是否已解析；
 - Pack/Suite hash。
 
@@ -594,11 +688,13 @@ Pack Case 出现预期的 hard `FAIL` 不一定代表 conformance 失败；出�
 
 | 情况 | 当前所需工作 |
 |---|---|
-| 现有 Subject + Driver + Grader 足够 | 只新增 Manifest、Scenario、fixture、Oracle/schema |
+| 已支持模板 | 用户给少量 Case + Goal；Builder 生成 draft，用户校准/冻结 |
+| 未支持但 generic JSON 契约足够 | 一键 generic fallback，再补/确认语义 Oracle 与 Grader |
+| 现有 Subject + Driver + Grader 足够但无模板 | 新增/生成 Manifest、Scenario、fixture、Oracle/schema |
 | 需要新确定性断言 | 编写并注册新 Grader，补单元与 conformance 测试 |
 | 需要新输入/状态生命周期 | 编写并注册新 Driver，补清理、路径和大小限制测试 |
 | 需要新 Agent 平台 | 实现 RuntimeAdapter，并在宿主/CLI 显式接线 |
-| 需要新的候选生成方式 | 实现并声明 `candidate-patch-v1`；只有完整 `SKILL.md` 生成器才使用 `skill-markdown-generator-v1` |
+| 需要新的候选生成方式 | 实现并声明 `candidate-patch-v1`；完整 `SKILL.md` improver 可使用 v2 bridge 契约 |
 | 需要多文件/二进制 Subject | 实现新的 Subject Adapter、Runtime 工具和受约束 Optimizer/candidate 校验 |
 | 需要 shell/network/browser/multimodal | 实现新的受信 Runtime/工具与 capability，并在宿主显式接线 |
 
@@ -610,11 +706,11 @@ MVP 已证明第一种路径可以跨安全审查和 CSV artifact 两类任务�
 
 ## 16. D40 规划（Planned）
 
-1. 冻结 `v1alpha1` 行为测试并定义兼容性策略；
+1. 扩大 `v1alpha1` legacy repair 与 `v1alpha2` repair/tune 的兼容性测试；
 2. 增加显式可信 Extension Loader，但 Manifest 仍不得自动 import 代码；
 3. 为多文件 Skill bundle、二进制 artifact 和 shell/network/browser/multimodal 工具定义受信组件与 capability，并为非单 entrypoint 文本 Candidate 定义显式 `verify_candidate_patch` 类扩展契约；
 4. 增加外部 suite resolver 和 evaluator-only 数据读取边界；
-5. 为导入 Session 日志定义 Observation completeness；
+5. 将已定义的 Session `ObservationCompleteness` 接入 EvalRun、Replay 与 Case 生成；
 6. 增加 AgentSubject/FixedAgentTarget capability contract；
 7. 增加 Run manifest、Trace/artifact store 和 Replay；
 8. 经人工校准后增加结构化 LLM Judge；

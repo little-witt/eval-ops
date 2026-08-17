@@ -4,7 +4,14 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 import unittest
 
-from aceval.contracts import GradeResult, GradeStatus, RunObservation
+from aceval.contracts import (
+    GradeResult,
+    GradeStatus,
+    MetricSourceSpec,
+    ObjectiveSpec,
+    RunObservation,
+)
+from aceval.objectives import compare_objective
 from aceval.orchestrator import (
     CandidateTrial,
     ComparisonResult,
@@ -331,6 +338,92 @@ class ReportingTests(unittest.TestCase):
             self.assertIn("candidate passed dev and validation", markdown)
             self.assertIn("| Hidden regression rate | not measured |", markdown)
             self.assertIn("Optimizer only received dev evidence.", markdown)
+
+    def test_tune_report_exposes_objective_and_paired_holdout(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            baseline = make_run(
+                root,
+                "baseline",
+                GradeStatus.PASS,
+                usage={"total_tokens": 100},
+            )
+            candidate = make_run(
+                root,
+                "candidate",
+                GradeStatus.PASS,
+                usage={"total_tokens": 50},
+            )
+            objective = ObjectiveSpec(
+                id="token-efficiency",
+                source=MetricSourceSpec(type="usage", key="total_tokens"),
+                direction="minimize",
+                min_delta=10,
+            )
+            objective_comparison = compare_objective(
+                baseline, candidate, objective
+            )
+            trial = CandidateTrial(
+                round_index=1,
+                candidate_id="candidate-1",
+                candidate_path=root / "candidate-1",
+                candidate_hash="candidate-hash",
+                parent_hash="baseline-hash",
+                patch="--- a/SKILL.md\n+++ b/SKILL.md\n",
+                rationale="Reduce redundant steps.",
+                dev_run=candidate,
+                promoted_from_dev=True,
+                objective_comparison=objective_comparison,
+            )
+            optimization = OptimizationResult(
+                optimization_id="tune-1",
+                pack_name="csv-summary-smoke",
+                baseline_dev=baseline,
+                trials=(trial,),
+                baseline_validation=baseline,
+                candidate_validation=candidate,
+                baseline_holdout=baseline,
+                candidate_holdout=candidate,
+                holdout_batch_count=1,
+                holdout_pair_count=1,
+                selected_candidate_id="candidate-1",
+                selected_candidate_path=root / "candidate-1",
+                selected_candidate_hash="candidate-hash",
+                accepted=True,
+                stop_reason="candidate passed paired tune gates",
+                mode="tune",
+                goal="Reduce tokens without changing correctness.",
+                objective=objective,
+                dev_objective=objective_comparison,
+                validation_objective=objective_comparison,
+                holdout_objective=objective_comparison,
+            )
+
+            report = to_report_dict(optimization)
+            _, markdown_path = write_report(
+                optimization, root / "tune-report"
+            )
+            summary = report["summary"]
+            markdown = markdown_path.read_text(encoding="utf-8")
+
+            self.assertEqual("tune", summary["mode"])
+            self.assertEqual("token-efficiency", summary["objective"]["id"])
+            self.assertTrue(summary["dev_objective"]["passed"])
+            self.assertEqual(50.0, summary["holdout_objective"]["improvement"])
+            self.assertEqual(1, summary["holdout_pair_count"])
+            self.assertEqual(
+                "measured",
+                summary["measurement_status"]["baseline_holdout"],
+            )
+            holdout_gate = next(
+                gate for gate in summary["gates"] if gate["gate"] == "holdout"
+            )
+            self.assertEqual("pass", holdout_gate["status"])
+            self.assertTrue(holdout_gate["objective"]["passed"])
+            self.assertIn("| Mode | tune |", markdown)
+            self.assertIn("| Objective | token-efficiency |", markdown)
+            self.assertIn("| Holdout pairs | 1 |", markdown)
+            self.assertIn("| holdout | pass |", markdown)
 
     def test_write_report_rejects_path_like_basename(self):
         with TemporaryDirectory() as directory:

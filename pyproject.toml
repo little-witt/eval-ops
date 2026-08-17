@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "aceval"
-version = "0.1.0"
-description = "A reference-runtime EvalOps kernel for evaluating and iterating Agent Skills."
+version = "0.2.0"
+description = "Reference-runtime EvalOps for repairing, tuning, and evaluating Agent Skills."
 readme = "README.md"
 requires-python = ">=3.9"
 license = "MIT"

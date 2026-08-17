@@ -6,6 +6,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+from aceval.contracts import ImprovementMode, MetricDirection
 from aceval.pack import (
     ComponentRegistry,
     DuplicateComponentError,
@@ -17,6 +18,7 @@ from aceval.pack import (
     UnknownComponentError,
     UnsupportedApiVersionError,
 )
+from aceval.pack_lifecycle import write_pack_lock
 
 
 class DummyComponent:
@@ -146,6 +148,91 @@ class PackTestCase(unittest.TestCase):
         self.assertNotEqual(
             first.scenario_by_id("dev-1").content_hash,
             second.scenario_by_id("dev-1").content_hash,
+        )
+
+    def test_v1alpha1_optimizer_remains_legacy_repair(self):
+        pack = EvalPackLoader(self.registry()).load(self.root)
+
+        self.assertEqual("aceval.dev/v1alpha1", pack.manifest.api_version)
+        self.assertEqual(
+            ImprovementMode.REPAIR, pack.manifest.optimizer_policy.mode
+        )
+        self.assertIsNone(pack.manifest.optimizer_policy.objective)
+
+    def test_v1alpha1_rejects_improvement_fields(self):
+        manifest = manifest_document()
+        manifest["optimizer_policy"]["mode"] = "tune"
+        self.write_json("pack.yaml", manifest)
+
+        with self.assertRaisesRegex(
+            PackFormatError, "improvement fields require api_version"
+        ):
+            EvalPackLoader(self.registry()).load(self.root)
+
+    def test_v1alpha2_tune_objective_is_parsed_and_frozen(self):
+        manifest = manifest_document()
+        manifest["api_version"] = "aceval.dev/v1alpha2"
+        manifest["metadata"]["calibration_status"] = "frozen"
+        manifest["optimizer_policy"].update(
+            {
+                "mode": "tune",
+                "goal": "Keep output correct while reducing tokens.",
+                "objective": {
+                    "id": "token-efficiency",
+                    "source": {"type": "usage", "key": "total_tokens"},
+                    "direction": "minimize",
+                    "aggregation": "mean",
+                    "min_delta": 10,
+                    "target": 80,
+                    "max_case_regression": 5,
+                },
+            }
+        )
+        self.write_json("pack.yaml", manifest)
+        write_pack_lock(self.root, manifest["metadata"]["version"])
+
+        pack = EvalPackLoader(self.registry()).load(self.root)
+        policy = pack.manifest.optimizer_policy
+
+        self.assertEqual(ImprovementMode.TUNE, policy.mode)
+        self.assertEqual(
+            "Keep output correct while reducing tokens.", policy.goal
+        )
+        self.assertEqual("token-efficiency", policy.objective.id)
+        self.assertEqual("usage", policy.objective.source.type)
+        self.assertEqual("total_tokens", policy.objective.source.key)
+        self.assertEqual(MetricDirection.MINIMIZE, policy.objective.direction)
+        self.assertEqual(10.0, policy.objective.min_delta)
+        self.assertEqual("frozen", pack.manifest.metadata.extra["calibration_status"])
+        with self.assertRaises(TypeError):
+            pack.manifest.metadata.extra["calibration_status"] = "draft"
+
+    def test_v1alpha2_tune_requires_a_valid_objective(self):
+        missing = manifest_document()
+        missing["api_version"] = "aceval.dev/v1alpha2"
+        missing["optimizer_policy"]["mode"] = "tune"
+        self.write_json("pack.yaml", missing)
+        with self.assertRaisesRegex(PackFormatError, "requires an objective"):
+            EvalPackLoader(self.registry()).load(self.root)
+
+        invalid = manifest_document()
+        invalid["api_version"] = "aceval.dev/v1alpha2"
+        invalid["optimizer_policy"].update(
+            {
+                "mode": "tune",
+                "objective": {
+                    "id": "token-efficiency",
+                    "source": {"type": "usage", "key": "unknown"},
+                    "direction": "minimize",
+                },
+            }
+        )
+        self.write_json("pack.yaml", invalid)
+        with self.assertRaises(PackValidationError) as caught:
+            EvalPackLoader(self.registry()).load(self.root)
+        self.assertIn(
+            "unknown_objective_key",
+            {issue.code for issue in caught.exception.report.errors},
         )
 
     def test_unknown_component_fails_closed(self):

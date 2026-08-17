@@ -50,6 +50,17 @@ class CandidateStatus(str, Enum):
     ACCEPTED = "accepted"
 
 
+class ImprovementMode(str, Enum):
+    AUTO = "auto"
+    REPAIR = "repair"
+    TUNE = "tune"
+
+
+class MetricDirection(str, Enum):
+    MAXIMIZE = "maximize"
+    MINIMIZE = "minimize"
+
+
 class IssueSeverity(str, Enum):
     ERROR = "error"
     WARNING = "warning"
@@ -175,6 +186,64 @@ class GraderSpec:
 
 
 @dataclass(frozen=True)
+class MetricSourceSpec:
+    type: str
+    grader_id: Optional[str] = None
+    key: Optional[str] = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.type, str) or not self.type.strip():
+            raise ValueError("metric source type must be a non-empty string")
+        object.__setattr__(self, "type", self.type.strip())
+        if self.grader_id is not None:
+            object.__setattr__(self, "grader_id", str(self.grader_id).strip())
+        if self.key is not None:
+            object.__setattr__(self, "key", str(self.key).strip())
+
+
+@dataclass(frozen=True)
+class ObjectiveSpec:
+    id: str
+    source: MetricSourceSpec
+    direction: MetricDirection = MetricDirection.MAXIMIZE
+    aggregation: str = "mean"
+    min_delta: float = 0.0
+    target: Optional[float] = None
+    max_case_regression: float = 0.0
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.id, str) or not self.id.strip():
+            raise ValueError("objective id must be a non-empty string")
+        object.__setattr__(self, "id", self.id.strip())
+        if not isinstance(self.source, MetricSourceSpec):
+            object.__setattr__(self, "source", MetricSourceSpec(**self.source))
+        if not isinstance(self.direction, MetricDirection):
+            object.__setattr__(self, "direction", MetricDirection(self.direction))
+        aggregation = str(self.aggregation).strip()
+        if aggregation not in ("mean", "sum"):
+            raise ValueError("objective aggregation must be mean or sum")
+        object.__setattr__(self, "aggregation", aggregation)
+        for name in ("min_delta", "max_case_regression"):
+            value = getattr(self, name)
+            if (
+                not isinstance(value, (int, float))
+                or isinstance(value, bool)
+                or not math.isfinite(float(value))
+                or value < 0
+            ):
+                raise ValueError("objective %s must be a non-negative finite number" % name)
+            object.__setattr__(self, name, float(value))
+        if self.target is not None:
+            if (
+                not isinstance(self.target, (int, float))
+                or isinstance(self.target, bool)
+                or not math.isfinite(float(self.target))
+            ):
+                raise ValueError("objective target must be a finite number")
+            object.__setattr__(self, "target", float(self.target))
+
+
+@dataclass(frozen=True)
 class OptimizerPolicySpec:
     adapter: str
     patchable_components: Tuple[str, ...] = ()
@@ -185,11 +254,27 @@ class OptimizerPolicySpec:
     max_candidate_snapshots: int = 1
     max_added_lines: Optional[int] = None
     forbid_case_literals: bool = True
+    mode: ImprovementMode = ImprovementMode.REPAIR
+    goal: str = ""
+    objective: Optional[ObjectiveSpec] = None
     params: Mapping[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         for name in ("patchable_components", "allowed_paths", "visible_splits"):
             object.__setattr__(self, name, tuple(getattr(self, name)))
+        if not isinstance(self.mode, ImprovementMode):
+            object.__setattr__(self, "mode", ImprovementMode(self.mode))
+        object.__setattr__(self, "goal", str(self.goal or "").strip())
+        if self.objective is not None and not isinstance(
+            self.objective, ObjectiveSpec
+        ):
+            object.__setattr__(
+                self, "objective", ObjectiveSpec(**self.objective)
+            )
+        if self.mode == ImprovementMode.REPAIR and self.objective is not None:
+            raise ValueError("repair mode cannot declare an objective")
+        if self.mode == ImprovementMode.TUNE and self.objective is None:
+            raise ValueError("tune mode requires an objective")
         object.__setattr__(self, "params", _deep_freeze(self.params))
 
 

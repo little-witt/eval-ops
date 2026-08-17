@@ -17,6 +17,10 @@ from .contracts import (
     FrozenOracle,
     FrozenScenario,
     GraderSpec,
+    ImprovementMode,
+    MetricDirection,
+    MetricSourceSpec,
+    ObjectiveSpec,
     OptimizerPolicySpec,
     PackIssue,
     PackMetadata,
@@ -28,9 +32,12 @@ from .contracts import (
     SuiteSpec,
     as_primitive,
 )
+from .pack_lifecycle import PackLifecycleError, verify_pack_lifecycle
 
 
 SUPPORTED_API_VERSION = "aceval.dev/v1alpha1"
+LATEST_API_VERSION = "aceval.dev/v1alpha2"
+SUPPORTED_API_VERSIONS = frozenset((SUPPORTED_API_VERSION, LATEST_API_VERSION))
 PACK_KIND = "EvalPack"
 _COMPONENT_ID = re.compile(r"^[a-z][a-z0-9_.-]*$")
 _SPLITS = frozenset(split.value for split in ScenarioSplit)
@@ -120,6 +127,20 @@ def _integer(value: Any, path: str, default: Optional[int] = None) -> int:
     if isinstance(value, bool) or not isinstance(value, int):
         raise PackFormatError("{0} must be an integer".format(path))
     return value
+
+
+def _number(
+    value: Any, path: str, default: Optional[float] = None
+) -> float:
+    if value is None and default is not None:
+        return float(default)
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not math.isfinite(float(value))
+    ):
+        raise PackFormatError("{0} must be a finite number".format(path))
+    return float(value)
 
 
 def _boolean(value: Any, path: str, default: bool = False) -> bool:
@@ -353,10 +374,10 @@ def _parse_manifest(document: Any) -> EvalPackManifest:
         "manifest",
     )
     api_version = _string(value.get("api_version"), "manifest.api_version") or ""
-    if api_version != SUPPORTED_API_VERSION:
+    if api_version not in SUPPORTED_API_VERSIONS:
         raise UnsupportedApiVersionError(
-            "unsupported api_version {0!r}; expected {1}".format(
-                api_version, SUPPORTED_API_VERSION
+            "unsupported api_version {0!r}; expected one of {1}".format(
+                api_version, ", ".join(sorted(SUPPORTED_API_VERSIONS))
             )
         )
     kind = _string(value.get("kind"), "manifest.kind") or ""
@@ -516,10 +537,20 @@ def _parse_manifest(document: Any) -> EvalPackManifest:
                 "max_candidate_snapshots",
                 "max_added_lines",
                 "forbid_case_literals",
+                "mode",
+                "goal",
+                "objective",
                 "params",
             },
             "manifest.optimizer_policy",
         )
+        if api_version == SUPPORTED_API_VERSION and any(
+            key in optimizer_value for key in ("mode", "goal", "objective")
+        ):
+            raise PackFormatError(
+                "optimizer improvement fields require api_version %s"
+                % LATEST_API_VERSION
+            )
         beam_width = _integer(
             optimizer_value.get("beam_width"), "manifest.optimizer_policy.beam_width", 1
         )
@@ -538,6 +569,102 @@ def _parse_manifest(document: Any) -> EvalPackManifest:
             raise PackFormatError("optimizer budgets must be positive")
         if max_added is not None and max_added < 0:
             raise PackFormatError("manifest.optimizer_policy.max_added_lines cannot be negative")
+        mode_value = optimizer_value.get("mode", ImprovementMode.REPAIR.value)
+        try:
+            mode = ImprovementMode(mode_value)
+        except ValueError as exc:
+            raise PackFormatError(
+                "manifest.optimizer_policy.mode must be auto, repair, or tune"
+            ) from exc
+        goal = _string(
+            optimizer_value.get("goal", ""),
+            "manifest.optimizer_policy.goal",
+            False,
+        ) or ""
+        objective = None
+        objective_value = optimizer_value.get("objective")
+        if objective_value is not None:
+            objective_path = "manifest.optimizer_policy.objective"
+            objective_mapping = _mapping(objective_value, objective_path)
+            _check_keys(
+                objective_mapping,
+                {
+                    "id",
+                    "source",
+                    "direction",
+                    "aggregation",
+                    "min_delta",
+                    "target",
+                    "max_case_regression",
+                },
+                objective_path,
+            )
+            source_path = objective_path + ".source"
+            source_value = _mapping(objective_mapping.get("source"), source_path)
+            _check_keys(source_value, {"type", "grader_id", "key"}, source_path)
+            direction_value = objective_mapping.get(
+                "direction", MetricDirection.MAXIMIZE.value
+            )
+            try:
+                direction = MetricDirection(direction_value)
+            except ValueError as exc:
+                raise PackFormatError(
+                    objective_path + ".direction must be maximize or minimize"
+                ) from exc
+            try:
+                objective = ObjectiveSpec(
+                    id=_component_id(
+                        objective_mapping.get("id"), objective_path + ".id"
+                    ),
+                    source=MetricSourceSpec(
+                        type=_component_id(
+                            source_value.get("type"), source_path + ".type"
+                        ),
+                        grader_id=(
+                            _component_id(
+                                source_value.get("grader_id"),
+                                source_path + ".grader_id",
+                            )
+                            if source_value.get("grader_id") is not None
+                            else None
+                        ),
+                        key=(
+                            _component_id(source_value.get("key"), source_path + ".key")
+                            if source_value.get("key") is not None
+                            else None
+                        ),
+                    ),
+                    direction=direction,
+                    aggregation=_string(
+                        objective_mapping.get("aggregation", "mean"),
+                        objective_path + ".aggregation",
+                    )
+                    or "mean",
+                    min_delta=_number(
+                        objective_mapping.get("min_delta"),
+                        objective_path + ".min_delta",
+                        0.0,
+                    ),
+                    target=(
+                        _number(
+                            objective_mapping.get("target"),
+                            objective_path + ".target",
+                        )
+                        if objective_mapping.get("target") is not None
+                        else None
+                    ),
+                    max_case_regression=_number(
+                        objective_mapping.get("max_case_regression"),
+                        objective_path + ".max_case_regression",
+                        0.0,
+                    ),
+                )
+            except ValueError as exc:
+                raise PackFormatError(str(exc)) from exc
+        if mode == ImprovementMode.REPAIR and objective is not None:
+            raise PackFormatError("repair mode cannot declare an objective")
+        if mode == ImprovementMode.TUNE and objective is None:
+            raise PackFormatError("tune mode requires an objective")
         optimizer = OptimizerPolicySpec(
             adapter=_component_id(
                 optimizer_value.get("adapter"), "manifest.optimizer_policy.adapter"
@@ -563,6 +690,9 @@ def _parse_manifest(document: Any) -> EvalPackManifest:
                 "manifest.optimizer_policy.forbid_case_literals",
                 True,
             ),
+            mode=mode,
+            goal=goal,
+            objective=objective,
             params=_mapping(
                 optimizer_value.get("params", {}), "manifest.optimizer_policy.params"
             ),
@@ -830,6 +960,10 @@ class EvalPackLoader:
             raise PackFormatError("Pack is missing pack.yaml: {0}".format(root))
         _assert_safe_tree(root)
         manifest = _parse_manifest(_read_document(manifest_path))
+        try:
+            verify_pack_lifecycle(root, manifest.metadata)
+        except PackLifecycleError as exc:
+            raise PackFormatError(str(exc)) from exc
         _validate_manifest_local_refs(root, manifest)
         resources = _load_manifest_resources(root, manifest)
         scenarios, oracles = self._load_scenarios(root, manifest)
@@ -1004,6 +1138,104 @@ class EvalPackLoader:
                         "manifest.optimizer_policy.visible_splits",
                     )
                 )
+            objective = policy.objective
+            if policy.mode == ImprovementMode.REPAIR and objective is not None:
+                issues.append(
+                    PackIssue(
+                        "repair_objective",
+                        "repair mode cannot declare an objective",
+                        "manifest.optimizer_policy.objective",
+                    )
+                )
+            if policy.mode == ImprovementMode.TUNE and objective is None:
+                issues.append(
+                    PackIssue(
+                        "missing_tune_objective",
+                        "tune mode requires an objective",
+                        "manifest.optimizer_policy.objective",
+                    )
+                )
+            if objective is not None:
+                source = objective.source
+                allowed_sources = {
+                    "grader_score",
+                    "grader_metric",
+                    "usage",
+                    "scenario",
+                    "trace_count",
+                }
+                if source.type not in allowed_sources:
+                    issues.append(
+                        PackIssue(
+                            "unknown_objective_source",
+                            "unsupported objective source: {0}".format(source.type),
+                            "manifest.optimizer_policy.objective.source.type",
+                        )
+                    )
+                if source.type in ("grader_score", "grader_metric"):
+                    if not source.grader_id or source.grader_id not in manifest_grader_ids:
+                        issues.append(
+                            PackIssue(
+                                "unknown_objective_grader",
+                                "objective grader is not declared: {0}".format(
+                                    source.grader_id or ""
+                                ),
+                                "manifest.optimizer_policy.objective.source.grader_id",
+                            )
+                        )
+                    else:
+                        missing_cases = [
+                            scenario.id
+                            for scenario in pack.scenarios
+                            if source.grader_id not in scenario.grader_ids
+                        ]
+                        if missing_cases:
+                            issues.append(
+                                PackIssue(
+                                    "objective_grader_coverage",
+                                    "objective grader is missing from scenarios: {0}".format(
+                                        ", ".join(missing_cases)
+                                    ),
+                                    "manifest.optimizer_policy.objective.source.grader_id",
+                                )
+                            )
+                    if source.type == "grader_metric" and not source.key:
+                        issues.append(
+                            PackIssue(
+                                "missing_objective_key",
+                                "grader_metric objective requires source.key",
+                                "manifest.optimizer_policy.objective.source.key",
+                            )
+                        )
+                elif source.type == "usage" and source.key not in {
+                    "total_tokens",
+                    "input_tokens",
+                    "output_tokens",
+                    "cost_usd",
+                }:
+                    issues.append(
+                        PackIssue(
+                            "unknown_objective_key",
+                            "usage objective key must be total_tokens, input_tokens, output_tokens, or cost_usd",
+                            "manifest.optimizer_policy.objective.source.key",
+                        )
+                    )
+                elif source.type == "scenario" and source.key != "duration_seconds":
+                    issues.append(
+                        PackIssue(
+                            "unknown_objective_key",
+                            "scenario objective key must be duration_seconds",
+                            "manifest.optimizer_policy.objective.source.key",
+                        )
+                    )
+                elif source.type == "trace_count" and source.key != "tool_call":
+                    issues.append(
+                        PackIssue(
+                            "unknown_objective_key",
+                            "trace_count objective key must be tool_call",
+                            "manifest.optimizer_policy.objective.source.key",
+                        )
+                    )
         return PackReport(issues=tuple(issues), pack_hash=pack.pack_hash)
 
     def validate_or_raise(
@@ -1019,6 +1251,8 @@ class EvalPackLoader:
 
 __all__ = [
     "SUPPORTED_API_VERSION",
+    "LATEST_API_VERSION",
+    "SUPPORTED_API_VERSIONS",
     "PACK_KIND",
     "PackError",
     "PackFormatError",

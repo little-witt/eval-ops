@@ -1,0 +1,23 @@
+{
+  "name": "generic-answer-demo",
+  "version": "0.1.0",
+  "description": "Small JSON-answer cases for Pack Builder demonstration.",
+  "cases": [
+    {
+      "id": "answer-dev",
+      "split": "dev",
+      "prompt": "Return only a JSON object containing the answer to 6 multiplied by 7.",
+      "expected_output": {
+        "answer": 42
+      }
+    },
+    {
+      "id": "answer-validation",
+      "split": "validation",
+      "prompt": "Return only a JSON object containing the answer to 8 plus 5.",
+      "expected_output": {
+        "answer": 13
+      }
+    }
+  ]
+}

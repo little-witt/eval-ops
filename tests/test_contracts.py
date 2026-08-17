@@ -7,6 +7,11 @@ from aceval.contracts import (
     CandidatePatch,
     GradeResult,
     GradeStatus,
+    ImprovementMode,
+    MetricDirection,
+    MetricSourceSpec,
+    ObjectiveSpec,
+    OptimizerPolicySpec,
     PackIssue,
     PackReport,
     PreparedScenario,
@@ -150,6 +155,56 @@ class ContractTests(unittest.TestCase):
         for values in invalid:
             with self.subTest(values=values), self.assertRaises(ValueError):
                 RunBudget(**values)
+
+    def test_improvement_policy_and_objective_are_normalized_and_frozen(self):
+        policy = OptimizerPolicySpec(
+            adapter="skill_markdown_v1",
+            mode="tune",
+            goal="  reduce tokens  ",
+            objective={
+                "id": "token-efficiency",
+                "source": {"type": "usage", "key": "total_tokens"},
+                "direction": "minimize",
+                "min_delta": 10,
+            },
+            params={"nested": {"enabled": True}},
+        )
+
+        self.assertEqual(ImprovementMode.TUNE, policy.mode)
+        self.assertEqual("reduce tokens", policy.goal)
+        self.assertEqual(MetricDirection.MINIMIZE, policy.objective.direction)
+        self.assertEqual(10.0, policy.objective.min_delta)
+        with self.assertRaises(TypeError):
+            policy.params["nested"]["enabled"] = False
+
+    def test_objective_rejects_invalid_numeric_and_aggregation_contracts(self):
+        source = MetricSourceSpec(type="usage", key="total_tokens")
+        invalid = (
+            {"min_delta": -1},
+            {"min_delta": float("nan")},
+            {"max_case_regression": float("inf")},
+            {"target": float("nan")},
+            {"aggregation": "median"},
+        )
+        for values in invalid:
+            with self.subTest(values=values), self.assertRaises(ValueError):
+                ObjectiveSpec(id="tokens", source=source, **values)
+
+    def test_improvement_policy_rejects_mode_objective_mismatches(self):
+        objective = ObjectiveSpec(
+            id="tokens",
+            source=MetricSourceSpec(type="usage", key="total_tokens"),
+            direction="minimize",
+        )
+
+        with self.assertRaisesRegex(ValueError, "repair mode"):
+            OptimizerPolicySpec(
+                adapter="skill_markdown_v1",
+                mode="repair",
+                objective=objective,
+            )
+        with self.assertRaisesRegex(ValueError, "tune mode"):
+            OptimizerPolicySpec(adapter="skill_markdown_v1", mode="tune")
 
 
 if __name__ == "__main__":

@@ -12,12 +12,13 @@ from enum import Enum
 from pathlib import Path, PurePath
 from typing import Any, Dict, Iterable, List, Mapping, MutableSet, Optional, Sequence, Tuple
 
-from .contracts import GradeStatus
+from .contracts import GradeStatus, is_tool_call_event
 from .orchestrator import (
     CandidateTrial,
     ComparisonResult,
     EvalRun,
     OptimizationResult,
+    ValidationAttempt,
 )
 
 
@@ -238,6 +239,8 @@ def _measurement_summary(run: EvalRun) -> Dict[str, Any]:
     costs = []  # type: List[float]
     token_scenarios = 0
     cost_scenarios = 0
+    tool_calls = 0
+    trace_scenarios = 0
     alias_conflicts = {}
     for _, usage in usages:
         input_value = _max_number(usage, ("input_tokens", "prompt_tokens"))
@@ -268,6 +271,12 @@ def _measurement_summary(run: EvalRun) -> Dict[str, Any]:
         if cost_value is not None:
             costs.append(cost_value)
             cost_scenarios += 1
+    for scenario in run.scenarios:
+        if scenario.observation is not None:
+            trace_scenarios += 1
+            tool_calls += sum(
+                is_tool_call_event(event) for event in scenario.observation.trace
+            )
     for scenario_id, usage in usages:
         conflicts = _usage_alias_conflicts(usage)
         if conflicts:
@@ -295,6 +304,7 @@ def _measurement_summary(run: EvalRun) -> Dict[str, Any]:
         "output_tokens": _sum_or_none(output_tokens),
         "total_tokens": _sum_or_none(total_tokens),
         "cost_usd": _sum_or_none(costs),
+        "tool_calls": tool_calls if trace_scenarios else None,
         "usage_alias_conflicts": alias_conflicts or None,
         "flake_rate": None,
         "measured_scenarios": {
@@ -307,6 +317,7 @@ def _measurement_summary(run: EvalRun) -> Dict[str, Any]:
             "usage": measurement_status(len(usages)),
             "tokens": measurement_status(token_scenarios),
             "cost": measurement_status(cost_scenarios),
+            "tool_calls": measurement_status(trace_scenarios),
             "flake_rate": "not_measured",
         },
     }
@@ -386,6 +397,7 @@ def _run_summary(run: EvalRun) -> Dict[str, Any]:
         "total_count": run.total_count,
         "pass_rate": run.pass_rate,
         "hard_pass_rate": run.hard_pass_rate,
+        "duration_seconds": run.duration_seconds,
         "splits": [_split_summary(run, split) for split in _ordered_splits(run)],
     }
     summary.update(_measurement_summary(run))
@@ -471,7 +483,7 @@ def _gate_summary(
                     "candidate_status": "not_run",
                 }
             )
-            if baseline_status in ("error", "not_evaluable"):
+            if baseline_status in ("error", "not_evaluable", "fail"):
                 gate["status"] = baseline_status
         return gate
     status = _gate_run_status(candidate)
@@ -501,20 +513,106 @@ def _gate_run_status(run: EvalRun) -> str:
     return "pass" if run.passed else "fail"
 
 
+def _objective_summary(value: Any) -> Optional[Dict[str, Any]]:
+    if value is None:
+        return None
+    return {
+        "objective_id": value.objective_id,
+        "evaluable": value.evaluable,
+        "passed": value.passed,
+        "baseline": {
+            "value": value.baseline.value,
+            "coverage": value.baseline.coverage,
+            "status": value.baseline.status,
+            "scenario_values": dict(value.baseline.scenario_values),
+        },
+        "candidate": {
+            "value": value.candidate.value,
+            "coverage": value.candidate.coverage,
+            "status": value.candidate.status,
+            "scenario_values": dict(value.candidate.scenario_values),
+        },
+        "raw_delta": value.raw_delta,
+        "improvement": value.improvement,
+        "case_regressions": list(value.case_regressions),
+        "meets_min_delta": value.meets_min_delta,
+        "meets_target": value.meets_target,
+    }
+
+
+def _validation_attempt_summary(
+    value: OptimizationResult, attempt: ValidationAttempt
+) -> Dict[str, Any]:
+    gate = _gate_summary("validation", value.baseline_validation, attempt.run)
+    objective = _objective_summary(attempt.objective_comparison)
+    status = gate["status"]
+    if objective is not None and not objective["passed"] and status == "pass":
+        status = "fail"
+    return {
+        "candidate_id": attempt.candidate_id,
+        "candidate_hash": attempt.candidate_hash,
+        "status": status,
+        "passed_gate": attempt.passed_gate,
+        "hard_regressions": list(attempt.hard_regressions),
+        "run_id": attempt.run.run_id,
+        "objective": objective,
+    }
+
+
 def _optimization_summary(value: OptimizationResult) -> Dict[str, Any]:
     selected = _selected_trial(value)
     selected_dev = selected.dev_run if selected is not None else None
-    holdout_gate = _gate_summary("holdout", None, value.candidate_holdout)
-    holdout_gate.update(
-        {
-            "baseline_status": "not_measured",
-            "paired_metrics_status": "not_measured",
-        }
+    displayed_validation_objective = value.validation_objective
+    if displayed_validation_objective is None and value.candidate_validation is not None:
+        displayed_validation_objective = next(
+            (
+                attempt.objective_comparison
+                for attempt in value.validation_attempts
+                if attempt.run.run_id == value.candidate_validation.run_id
+            ),
+            None,
+        )
+    holdout_gate = _gate_summary(
+        "holdout", value.baseline_holdout, value.candidate_holdout
     )
+    if value.baseline_holdout is None:
+        holdout_gate.update(
+            {
+                "baseline_status": "not_measured",
+                "paired_metrics_status": "not_measured",
+            }
+        )
+    if value.holdout_objective is not None:
+        holdout_gate["objective"] = _objective_summary(value.holdout_objective)
+        if not value.holdout_objective.passed and holdout_gate["status"] == "pass":
+            holdout_gate["status"] = "fail"
+    dev_gate = _gate_summary("dev", value.baseline_dev, selected_dev)
+    validation_gate = _gate_summary(
+        "validation", value.baseline_validation, value.candidate_validation
+    )
+    if value.dev_objective is not None:
+        dev_gate["objective"] = _objective_summary(value.dev_objective)
+        if not value.dev_objective.passed and dev_gate["status"] == "pass":
+            dev_gate["status"] = "fail"
+    if displayed_validation_objective is not None:
+        validation_gate["objective"] = _objective_summary(
+            displayed_validation_objective
+        )
+        if (
+            not displayed_validation_objective.passed
+            and validation_gate["status"] == "pass"
+        ):
+            validation_gate["status"] = "fail"
     return {
         "simulated": _is_simulated(value),
         "accepted": value.accepted,
         "stop_reason": value.stop_reason,
+        "mode": value.mode,
+        "goal": value.goal,
+        "objective": _json_safe(value.objective),
+        "dev_objective": _objective_summary(value.dev_objective),
+        "validation_objective": _objective_summary(displayed_validation_objective),
+        "holdout_objective": _objective_summary(value.holdout_objective),
         "selected_candidate_id": value.selected_candidate_id,
         "selected_candidate_path": (
             str(value.selected_candidate_path)
@@ -530,22 +628,23 @@ def _optimization_summary(value: OptimizationResult) -> Dict[str, Any]:
         "duplicate_proposal_count": value.duplicate_proposal_count,
         "experiment_usage": _json_safe(value.experiment_usage),
         "validation_attempts": [
-            {
-                "candidate_id": attempt.candidate_id,
-                "candidate_hash": attempt.candidate_hash,
-                "status": _gate_summary(
-                    "validation", value.baseline_validation, attempt.run
-                )["status"],
-                "passed_gate": attempt.passed_gate,
-                "hard_regressions": list(attempt.hard_regressions),
-                "run_id": attempt.run.run_id,
-            }
+            _validation_attempt_summary(value, attempt)
             for attempt in value.validation_attempts
         ],
         "holdout_batch_count": value.holdout_batch_count,
+        "holdout_pair_count": value.holdout_pair_count,
         "hidden_regression_rate": None,
         "measurement_status": {
-            "baseline_holdout": "not_measured",
+            "baseline_holdout": (
+                (
+                    "attempted_not_evaluable"
+                    if _gate_run_status(value.baseline_holdout)
+                    in ("error", "not_evaluable")
+                    else "measured"
+                )
+                if value.baseline_holdout is not None
+                else "not_measured"
+            ),
             "candidate_holdout": (
                 (
                     "attempted_not_evaluable"
@@ -560,10 +659,8 @@ def _optimization_summary(value: OptimizationResult) -> Dict[str, Any]:
         },
         "baseline": _run_summary(value.baseline_dev),
         "gates": [
-            _gate_summary("dev", value.baseline_dev, selected_dev),
-            _gate_summary(
-                "validation", value.baseline_validation, value.candidate_validation
-            ),
+            dev_gate,
+            validation_gate,
             holdout_gate,
         ],
     }
@@ -586,6 +683,7 @@ def _limitations(value: Any) -> Tuple[str, ...]:
         add(value.baseline_dev)
         add(value.baseline_validation)
         add(value.candidate_validation)
+        add(value.baseline_holdout)
         add(value.candidate_holdout)
         for trial in value.trials:
             add(trial.dev_run)
@@ -604,6 +702,7 @@ def _is_simulated(value: Any) -> bool:
             value.baseline_dev,
             value.baseline_validation,
             value.candidate_validation,
+            value.baseline_holdout,
             value.candidate_holdout,
         ]
         runs.extend(trial.dev_run for trial in value.trials)
@@ -766,6 +865,7 @@ def _render_optimization(value: OptimizationResult) -> str:
     gates = summary["gates"]
     gate_rows = []
     for gate in gates:
+        objective = gate.get("objective") or {}
         gate_rows.append(
             (
                 gate["gate"],
@@ -773,6 +873,7 @@ def _render_optimization(value: OptimizationResult) -> str:
                 _percent_or_dash(gate.get("baseline_hard_pass_rate")),
                 _percent_or_dash(gate.get("candidate_hard_pass_rate")),
                 _pp_or_dash(gate.get("paired_uplift")),
+                _delta_or_dash(objective.get("improvement")),
                 _joined(gate.get("hard_regressions", ())),
             )
         )
@@ -785,6 +886,11 @@ def _render_optimization(value: OptimizationResult) -> str:
                 trial.candidate_id,
                 _percent(trial.dev_run.hard_pass_rate),
                 _pp_or_dash(paired["paired_uplift"]),
+                _delta_or_dash(
+                    trial.objective_comparison.improvement
+                    if trial.objective_comparison is not None
+                    else None
+                ),
                 _joined(paired["hard_regressions"]),
                 _pass_label(trial.promoted_from_dev),
                 trial.rejection_reason or "—",
@@ -801,11 +907,18 @@ def _render_optimization(value: OptimizationResult) -> str:
                 ("Pack", value.pack_name),
                 ("Runtime", baseline.runtime_id),
                 ("Subject", baseline.subject_uri),
+                ("Mode", value.mode),
+                ("Goal", value.goal or "—"),
+                (
+                    "Objective",
+                    value.objective.id if value.objective is not None else "—",
+                ),
                 ("Accepted", _pass_label(value.accepted)),
                 ("Selected candidate", value.selected_candidate_id or "—"),
                 ("Candidate path", value.selected_candidate_path or "—"),
                 ("Candidate hash", value.selected_candidate_hash or "—"),
                 ("Holdout batches", value.holdout_batch_count),
+                ("Holdout pairs", value.holdout_pair_count),
                 ("Proposal attempts", value.proposal_attempt_count),
                 ("Rejected proposals", value.rejected_proposal_count),
                 ("Duplicate proposals", value.duplicate_proposal_count),
@@ -825,14 +938,31 @@ def _render_optimization(value: OptimizationResult) -> str:
         "## Candidate Gates",
         "",
         _table(
-            ("Gate", "Status", "Baseline", "Candidate", "Paired uplift", "Regressions"),
+            (
+                "Gate",
+                "Status",
+                "Baseline",
+                "Candidate",
+                "Paired uplift",
+                "Objective improvement",
+                "Regressions",
+            ),
             tuple(gate_rows),
         ),
         "",
         "## Candidate Trials",
         "",
         _table(
-            ("Round", "Candidate", "Dev hard pass", "Uplift", "Regressions", "Promoted", "Reason"),
+            (
+                "Round",
+                "Candidate",
+                "Dev hard pass",
+                "Uplift",
+                "Objective improvement",
+                "Regressions",
+                "Promoted",
+                "Reason",
+            ),
             tuple(trial_rows),
         ),
         "",
@@ -895,6 +1025,13 @@ def _measurement_table(summary: Mapping[str, Any]) -> str:
                 _value_status(summary.get("cost_usd"), statuses["cost"]),
             ),
             (
+                "Tool calls",
+                _number_or_null(summary.get("tool_calls")),
+                _value_status(
+                    summary.get("tool_calls"), statuses["tool_calls"]
+                ),
+            ),
+            (
                 "Flake rate",
                 _percent_or_null(summary.get("flake_rate")),
                 statuses["flake_rate"],
@@ -912,6 +1049,7 @@ def _comparison_measurement_table(
         ("Output tokens", "output_tokens", _number_or_null),
         ("Total tokens", "total_tokens", _number_or_null),
         ("Cost (USD)", "cost_usd", _cost_or_null),
+        ("Tool calls", "tool_calls", _number_or_null),
         ("Flake rate", "flake_rate", _percent_or_null),
     ):
         rows.append(
@@ -998,6 +1136,15 @@ def _percent_or_dash(value: Any) -> str:
 
 def _pp_or_dash(value: Any) -> str:
     return _percentage_points(value) if value is not None else "—"
+
+
+def _delta_or_dash(value: Any) -> str:
+    if value is None:
+        return "—"
+    number = float(value)
+    if number.is_integer():
+        return "%+d" % int(number)
+    return "%+.6g" % number
 
 
 def _joined(values: Iterable[Any]) -> str:
