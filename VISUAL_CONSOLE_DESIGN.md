@@ -16,6 +16,9 @@
 - Case 级 Grader evidence；
 - 工具调用 Trace；
 - Token、成本、耗时和工具调用变化；
+- Capability、Test Requirement、Case 与 Oracle 的覆盖关系；
+- Runtime 不支持或不可观察的测试路径；
+- Skill、Agent、CLI、Runtime 和 evaluator 的 Failure Card；
 - 公司 Session 的 observation completeness。
 
 Console 的核心价值是降低操作门槛、提高评测契约审批质量，并让“为什么接受/拒绝候选”可解释。
@@ -74,12 +77,12 @@ Skill Doctor Console / EvalOps Studio
 步骤：
 
 1. 选择或上传 Skill；
-2. 选择已有 Pack，或上传 Cases；
-3. 选择任务类型；
-4. 输入 Goal；
-5. 选择 Runtime/Profile；
-6. 设置预算；
-7. 预览实验契约；
+2. 选择已有 Pack，或上传少量种子 Cases；
+3. 输入 Goal；
+4. 选择 Runtime/Profile；
+5. 自动生成或加载 Capability/Test Plan；
+6. 确认高风险未决问题、Runtime gap 和 Oracle blocker；
+7. 设置预算并预览实验契约；
 8. 启动。
 
 页面必须提前展示：
@@ -91,7 +94,32 @@ Skill Doctor Console / EvalOps Studio
 - Runtime capability 风险；
 - simulation/real execution 区分。
 
-### 4.3 EvalPack 校准页
+### 4.3 Test Design 与 Coverage 页（Planned）
+
+页面以 `Capability -> Requirement -> Case -> Oracle/Grader` 为主线：
+
+```text
+Declared capabilities    8 / 9 covered
+Critical requirements    6 / 7 oracle-ready
+Runtime executable      12 / 16
+Observed paths            9 / 10
+Freeze blockers               2
+```
+
+必须支持：
+
+- Capability Graph 摘要和 Skill source refs；
+- requirement-to-case 矩阵；
+- happy/boundary/negative/recovery 等维度过滤；
+- Case origin、family、Oracle trust level 和建议 split；
+- unsupported/unobservable/unconfigured Runtime gap；
+- critical gap、待确认 Oracle 和 waiver；
+- planned、executable、oracle-ready、calibrated、observed 五层覆盖；
+- mutation score 和 known-good/known-bad 区分结果。
+
+Console 不显示单一“全路径覆盖率”。每个覆盖数字必须显示范围、分子、分母和未覆盖原因。
+
+### 4.4 EvalPack 校准页
 
 顶部摘要：
 
@@ -113,7 +141,7 @@ Case 表格：
 
 用户可进入 Case 详情检查 Prompt、fixture、expected output/records、Grader 参数和 split。只有 blocker 清零并显式确认后，才能冻结 Pack。
 
-### 4.4 实验实时进度页
+### 4.5 实验实时进度页
 
 ```text
 ✓ Verify Pack lock
@@ -135,7 +163,7 @@ Case 表格：
 - cancel 状态；
 - 基础设施错误与质量失败的区别。
 
-### 4.5 结果总览
+### 4.6 结果总览
 
 第一屏只回答：
 
@@ -155,7 +183,7 @@ Case 表格：
 - 限制和可信度提示；
 - selected candidate 下载/打开按钮。
 
-### 4.6 Case 与 Trace 详情
+### 4.7 Case 与 Trace 详情
 
 左右对照：
 
@@ -177,7 +205,30 @@ Model call
 Final answer
 ```
 
-### 4.7 Skill Diff 与候选谱系
+### 4.8 Failure Diagnosis 页（Planned）
+
+每个失败展示：
+
+- symptom 和发生阶段；
+- observed component；
+- root-cause hypothesis 与 alternative hypotheses；
+- evidence strength；
+- Trace/Grade/Observation evidence refs；
+- remediation surface；
+- `skill_patch_authorized`；
+- 推荐动作和最小追加探针。
+
+页面需要把三类结果明显区分：
+
+```text
+PATCHABLE       可用 Skill 干预，进入 dev Optimizer evidence
+EXTERNAL/BLOCK  先修 CLI、Runtime、环境或 evaluator
+UNKNOWN         证据不足，不允许修改
+```
+
+模型生成的解释与确定性门控结果必须视觉分离，不能让自然语言解释覆盖 Patch Authorization。
+
+### 4.9 Skill Diff 与候选谱系
 
 展示：
 
@@ -191,7 +242,7 @@ Final answer
 
 候选树是 P1。MVP 可先使用按 round 分组的表格。
 
-### 4.8 Session Import / Replay
+### 4.10 Session Import / Replay
 
 展示：
 
@@ -201,6 +252,7 @@ Final answer
 - Trace；
 - usage；
 - completeness；
+- execution-only Failure Cards；
 - 哪些 Grader 可以 Replay；
 - 哪些因缺失 artifact/workspace 无法重评分。
 
@@ -226,12 +278,17 @@ CLI 和 Web 都是 Application Service 的客户端。前端不得直接实现 G
 
 ```python
 class EvalOpsApplicationService:
+    def analyze_skill(...): ...
+    def create_test_plan(...): ...
+    def get_coverage_report(...): ...
     def generate_pack(...): ...
+    def get_pack_quality(...): ...
     def begin_pack_calibration(...): ...
     def freeze_pack(...): ...
     def start_experiment(...): ...
     def get_experiment(...): ...
     def cancel_experiment(...): ...
+    def diagnose_run(...): ...
     def import_session(...): ...
     def replay_session(...): ...
 ```
@@ -280,6 +337,10 @@ CLI handler 只负责参数解析、调用 Service 和打印结果。
 
 - `experiment.started/completed/failed/cancelled`；
 - `pack.generated/calibrating/frozen`；
+- `analysis.started/completed/failed`；
+- `test_plan.generated/review_required/approved`；
+- `coverage.updated/blocker_detected`；
+- `diagnosis.completed/failure_card_created`；
 - `baseline.started/completed`；
 - `mode.selected`；
 - `candidate.proposed/evaluated/rejected/promoted`；
@@ -292,7 +353,13 @@ CLI handler 只负责参数解析、调用 Service 和打印结果。
 ### 5.5 API 草案
 
 ```text
+POST /api/analyses
+GET  /api/analyses/{analysis_id}
+POST /api/test-plans
+GET  /api/test-plans/{plan_id}/coverage
+
 POST /api/packs/generate
+GET  /api/packs/{pack_id}/quality
 POST /api/packs/{pack_id}/calibrate
 POST /api/packs/{pack_id}/freeze
 GET  /api/packs/{pack_id}
@@ -302,10 +369,12 @@ GET  /api/experiments
 GET  /api/experiments/{experiment_id}
 GET  /api/experiments/{experiment_id}/events
 POST /api/experiments/{experiment_id}/cancel
+GET  /api/experiments/{experiment_id}/diagnostics
 
 POST /api/sessions/import
 POST /api/sessions/fetch
 GET  /api/sessions/{session_id}
+POST /api/sessions/{session_id}/diagnose
 POST /api/sessions/{session_id}/replay
 ```
 
@@ -363,6 +432,8 @@ aceval report html RUN_DIR
 - [ ] Gate 流程；
 - [ ] KPI；
 - [ ] Case matrix；
+- [ ] Capability/Test Requirement/Coverage 摘要；
+- [ ] Failure Card 与 Patch Authorization；
 - [ ] Skill diff；
 - [ ] simulation 与 limitations 提示。
 
@@ -372,6 +443,8 @@ aceval report html RUN_DIR
 - [ ] 历史实验列表；
 - [ ] 实验详情；
 - [ ] Trace 时间线；
+- [ ] Test Plan 与 Coverage 页面；
+- [ ] Failure Diagnosis 页面；
 - [ ] Candidate 列表；
 - [ ] Session viewer。
 
@@ -379,6 +452,7 @@ aceval report html RUN_DIR
 
 - [ ] 新建实验；
 - [ ] Pack 生成/校准/冻结；
+- [ ] Skill analysis、Test Plan 确认和 coverage waiver；
 - [ ] 实时 SSE；
 - [ ] cancel；
 - [ ] Runtime/Profile 选择；
@@ -390,6 +464,8 @@ aceval report html RUN_DIR
 - [ ] flake；
 - [ ] p50/p95 与置信区间；
 - [ ] Pack Quality Report；
+- [ ] mutation calibration 与 dynamic coverage；
+- [ ] failure fingerprint 与归因稳定性；
 - [ ] Judge agreement；
 - [ ] output-only vs trace-aware 消融。
 
@@ -402,15 +478,18 @@ aceval report html RUN_DIR
 - [ ] 缺失指标显示为 `not_measured`，不显示为零；
 - [ ] FakeRuntime 显著标记；
 - [ ] 用户能在 30 秒内回答候选为何接受/拒绝。
+- [ ] 用户能区分可修 Skill 失败、外部阻塞和证据不足。
 
 ### Local Console
 
 - [ ] 新用户不手写 CLI 即可创建一个受支持模板实验；
 - [ ] Pack 未冻结时不能启动 optimize；
+- [ ] critical coverage gap 或未确认 hard Oracle 能阻止冻结；
 - [ ] 未知类型必须停在 calibration；
 - [ ] 页面刷新后实验状态不丢失；
 - [ ] 可查看 Case evidence、Trace、diff 和 Objective；
 - [ ] 公司 Session 缺失 telemetry 时正确显示 completeness；
+- [ ] `unknown`/external Failure Card 不提供“优化 Skill”操作；
 - [ ] UI 与 CLI 对同一实验产生相同 Kernel 结果。
 
 ## 10. 风险与控制
@@ -432,11 +511,12 @@ aceval report html RUN_DIR
 
 ```text
 真实实验证据
+  -> Test Plan / Coverage / Failure Card 契约
   -> 静态 HTML
   -> Application Service
   -> Read-only Console
+  -> Session Replay / Pack Quality / Statistics
   -> Operational Console
-  -> Replay / Statistics / Pack Quality
 ```
 
 完整在线平台、多用户能力和远程调度继续延后。

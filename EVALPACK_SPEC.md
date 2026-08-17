@@ -54,6 +54,11 @@ MVP 的声明式通用性只覆盖已注册组件的能力交集。当前内置�
 
 ### 2.2 Planned（D40）
 
+- Skill Analyzer、Capability Graph 和风险加权 Test Requirement；
+- Case/Oracle 草稿生成、来源追踪和 Runtime feasibility routing；
+- requirement-to-case、Oracle-ready、Runtime-executable 和 observed coverage；
+- Pack Quality Gate、已知好坏样本区分能力和 mutation calibration；
+- Failure Card、Patch Authorization 和 Imported Session Replay；
 - 操作者显式加载的可信 Python Extension；
 - 外部 validation/holdout suite resolver；
 - AgentSubject/FixedAgentTarget；
@@ -129,6 +134,37 @@ Pack calibration loop -> frozen Pack hash -> Skill repair/tune loop
         ^                                      |
         +-------- new Pack version ------------+
 ```
+
+### 4.2 复杂 Skill 测试设计 Sidecar（Planned）
+
+D20 计划先保持 `v1alpha2` 顶层契约不变，把测试设计作为 Pack 内受内容锁保护的 sidecar：
+
+```text
+evalpacks/<pack-name>/
+  design/
+    capability-graph.json
+    test-plan.json
+    coverage-target.json
+    generation-provenance.json
+```
+
+Manifest `metadata.test_design` 保存这些文件的版本、相对引用、源 Subject hash、Planner Profile hash 和审批状态；Scenario `metadata.aceval_test` 保存 requirement IDs、Case family、origin、verification path，以及故障注入 Case 的 `expected_signals/expected_recovery`。正式实现必须对这些引用执行与 `schema_ref` 同等级别的路径、Schema、hash 和 cross-reference 校验；不能因为 `metadata` 当前允许扩展字段，就假设 Loader 已经验证它们。
+
+设计 Sidecar 的职责是解释 Case 从哪里来、覆盖什么以及有哪些缺口。Kernel 仍只按冻结 Scenario、fixture、Oracle 和 Grader 执行；Planner 不能在运行时改变 Gate。
+
+冻结前计划增加以下质量 blocker：
+
+- critical Test Requirement 有 Case，或存在带原因的显式 waiver；
+- active Case 所需 Runtime/Driver/Grader 能力可满足；
+- hard Oracle 不是未确认的 `model_proposed`；
+- Case family 不跨 split 泄漏；
+- Capability -> Requirement -> Case -> Oracle/Grader 双向引用一致；
+- 不可观察和不可执行路径没有被计为已覆盖；
+- 已知好样本/坏样本与可选 mutant 能证明基本区分能力。
+
+Coverage 分为 planned、executable、oracle-ready、calibrated 和 observed。自然语言 Agent 路径不可穷举，因此不得把该报告描述为数学意义的“全路径覆盖”。自动生成且与 dev 同源的 Case 默认只能作为 dev/validation 草稿，不能作为独立 sealed holdout。
+
+完整技术方案见 [COMPLEX_SKILL_EVAL_AND_DIAGNOSIS_DESIGN.md](./COMPLEX_SKILL_EVAL_AND_DIAGNOSIS_DESIGN.md)。
 
 ## 5. Manifest
 
@@ -706,18 +742,19 @@ MVP 已证明第一种路径可以跨安全审查和 CSV artifact 两类任务�
 
 ## 16. D40 规划（Planned）
 
-本节只保留 EvalPack 相关 backlog；跨模块的最新路线图、优先级和完成定义见 [ROADMAP.md](./ROADMAP.md)，可视化 Pack 校准方案见 [VISUAL_CONSOLE_DESIGN.md](./VISUAL_CONSOLE_DESIGN.md)。
+本节只保留 EvalPack 相关 backlog；跨模块的最新路线图、优先级和完成定义见 [ROADMAP.md](./ROADMAP.md)，复杂 Skill 规划与归因见 [COMPLEX_SKILL_EVAL_AND_DIAGNOSIS_DESIGN.md](./COMPLEX_SKILL_EVAL_AND_DIAGNOSIS_DESIGN.md)，可视化 Pack 校准方案见 [VISUAL_CONSOLE_DESIGN.md](./VISUAL_CONSOLE_DESIGN.md)。
 
 1. 扩大 `v1alpha1` legacy repair 与 `v1alpha2` repair/tune 的兼容性测试；
-2. 增加显式可信 Extension Loader，但 Manifest 仍不得自动 import 代码；
-3. 为多文件 Skill bundle、二进制 artifact 和 shell/network/browser/multimodal 工具定义受信组件与 capability，并为非单 entrypoint 文本 Candidate 定义显式 `verify_candidate_patch` 类扩展契约；
-4. 增加外部 suite resolver 和 evaluator-only 数据读取边界；
-5. 将已定义的 Session `ObservationCompleteness` 接入 EvalRun、Replay 与 Case 生成；
-6. 增加 AgentSubject/FixedAgentTarget capability contract；
-7. 增加 Run manifest、Trace/artifact store 和 Replay；
-8. 经人工校准后增加结构化 LLM Judge；
-9. 增加受限 Worker 和更强的 holdout 隔离；
-10. 建立 12–20 Case 的真实 Reference Runtime Benchmark。
+2. 验证 `design/` Sidecar、Capability/TestPlan/Coverage Schema 和 cross-reference freeze gate；
+3. 增加 Case provenance、family leakage、Oracle trust、Runtime feasibility 和 mutation calibration；
+4. 将已定义的 Session `ObservationCompleteness` 接入 EvalRun、Replay、Failure Card 与 Case 草稿；
+5. 增加 Run manifest、Trace/artifact store 和 Replay；
+6. 增加显式可信 Extension Loader，但 Manifest 仍不得自动 import 代码；
+7. 为多文件 Skill bundle、二进制 artifact 和受控 process/network/browser 工具定义受信组件与 capability，并为非单 entrypoint 文本 Candidate 定义显式 `verify_candidate_patch` 类扩展契约；
+8. 增加外部 suite resolver 和 evaluator-only 数据读取边界；
+9. 增加 AgentSubject/FixedAgentTarget capability contract；
+10. 经人工校准后增加结构化 LLM Judge、受限 Worker 和更强 holdout 隔离；
+11. 建立 12–20 Case 的真实 Reference Runtime Benchmark。
 
 在这些能力落地前，不应声称 EvalPack 已支持任意 Python 插件、外部隐藏集解析、Agent 配置优化、HTML 报告或跨平台等价评测。
 
@@ -725,6 +762,9 @@ MVP 已证明第一种路径可以跨安全审查和 CSV artifact 两类任务�
 
 - Manifest 自动加载任意 Python 或 shell；
 - 通用 DAG、插件市场和远程 Pack 安装；
+- 数学意义的任意自然语言全路径覆盖；
+- 自动递归修改并直接冻结生成它自己的 EvalPack；
+- 把同源模型生成 Case 作为独立 sealed holdout；
 - 自动从自然语言生成并直接信任 Oracle；
 - 自动修改脚本、测试、Case、Oracle 或 Grader；
 - 使用内置组件自动修改 `scripts/`、`templates/`、`assets/`、二进制或多文件 Subject；

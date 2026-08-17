@@ -18,6 +18,8 @@ MVP 已经不是只针对安全代码审查的单一工作流：在“UTF-8 `SKI
 
 本方案刻意内置一个稳定 Runtime，而不是在 MVP 适配所有 Agent 平台。当前分数只代表该 Reference Runtime 和对应模型桥接配置下的结果；它可以验证 Skill 的相对改进，但不假设不同 Agent 平台必然得到相同绝对效果。
 
+下一阶段将在 Kernel 外增加“复杂 Skill 测试规划”和“证据化故障归因”两个能力面：前者把 Skill 转成 Capability Graph、Test Plan 和 Coverage Matrix，后者把当前布尔式非 Skill 失败门控升级为 Failure Card 与 Patch Authorization。它们属于 Planned 能力，详细方案见 [COMPLEX_SKILL_EVAL_AND_DIAGNOSIS_DESIGN.md](./COMPLEX_SKILL_EVAL_AND_DIAGNOSIS_DESIGN.md)。
+
 ## 2. 状态标识
 
 本文用以下两个状态区分实现与规划：
@@ -49,6 +51,10 @@ MVP 已经不是只针对安全代码审查的单一工作流：在“UTF-8 `SKI
 ### 3.1 当前明确未实现
 
 - 公司 Agent API 到完整 RuntimeAdapter 的直接执行接线；
+- 从 `SKILL.md` 自动提取 Capability Graph、规划测试义务和补充 Case；
+- requirement-to-case、Runtime 可执行性和动态路径覆盖；
+- Pack mutation calibration、已知好坏样本区分能力和覆盖冻结门禁；
+- 结构化 Failure Card、CLI/Agent/Runtime/evaluator 根因分类和 Skill Patch Authorization；
 - Codex、Claude Code 或其他第三方 Agent 平台 Adapter；
 - `AgentSubject`、`FixedAgentTarget` 和 Agent 配置自动优化；
 - Imported Session 到 EvalRun 的 Replay/重评分接线；
@@ -66,6 +72,10 @@ MVP 已经不是只针对安全代码审查的单一工作流：在“UTF-8 `SKI
 ## 4. 总体架构
 
 ```text
+ Skill + Seed Cases + Goal -> Analyzer / Test Planner (planned)
+                                      |
+                       Capability / Coverage / Gaps
+                                      |
         Case + Goal -> Pack Builder -> draft/calibrating/frozen
                                       |
                       aceval CLI / doctor
@@ -84,6 +94,10 @@ MVP 已经不是只针对安全代码审查的单一工作流：在“UTF-8 `SKI
              Component IDs / Patch Policy
                           |
              Observation -> Grade -> Gate
+                          |
+              Failure Attribution (planned)
+                          |
+          Failure Card -> Patch Authorization
                           |
                dev -> validation -> holdout
                           |
@@ -260,6 +274,61 @@ generate -> draft -> calibrating -> freeze + content lock
 
 生成 Pack 缺语义 Oracle 时仍可加载以便编辑，但 freeze fail closed。冻结锁覆盖 Case、Oracle、Grader、fixture、Schema、Objective 等全部文件；Pack 改动后必须新建版本并从 baseline 开始。这样即使 EvalPack 本身需要持续迭代，也不会和 Skill 在同一优化实验里共同漂移。
 
+### 6.7 复杂 Skill 测试规划（Planned）
+
+现有 Builder 继续作为 EvalPack 编译器，不直接承担开放式 Skill 理解。新增规划面：
+
+```text
+Frozen Subject Snapshot
+  -> deterministic inventory
+  -> model-assisted semantic extraction
+  -> source-grounded Capability Graph
+  -> risk-weighted Test Requirements
+  -> Case/fixture/Oracle drafts
+  -> Runtime/Driver/Grader feasibility
+  -> Coverage + Pack Quality Report
+  -> Pack Builder
+```
+
+关键契约包括：
+
+- `CapabilityGraph`：能力、步骤、分支、依赖、工具、状态、副作用、风险和 source refs；
+- `TestRequirement`：路径类型、风险、预期观察、Oracle 策略和 Runtime capability；
+- `CoverageReport`：planned、executable、oracle-ready、calibrated 和 observed coverage；
+- `PackChangeProposal`：冻结后发现覆盖缺口时创建新 Pack revision，不原地移动评测标准。
+
+Planner 对模型输出执行 Schema、引用、source span、capability 和 cross-reference 校验。无法从 Skill 或种子事实得到的结论必须标为 `inferred`；模型生成的语义 Oracle 默认停在 calibration，不能自动成为 hard gate。同源生成 Case 只能作为 dev/validation 草稿，不能伪装成独立 sealed holdout。
+
+“覆盖”限定为声明能力、关键风险、工具依赖和状态转换的可追踪覆盖。报告必须展示分子、分母、不可执行/不可观察项和 waiver，不宣称穷举任意自然语言路径。
+
+### 6.8 故障归因与修改授权（Planned）
+
+当前 `_has_non_skill_failure()` 的 fail-closed 语义保留，但由结构化诊断替代布尔提示：
+
+```text
+Observation / Trace / Grade / Imported Session
+  -> completeness and integrity
+  -> deterministic diagnostic signals
+  -> failure classification
+  -> optional repeat/probe
+  -> Failure Card
+  -> Skill Patch Authorization
+```
+
+Failure Card 分开表达：
+
+- `observed_component`：故障在哪个阶段被观察到；
+- `root_cause_hypothesis`：基于证据的可证伪解释；
+- `remediation_surface`：建议修改 Skill、Agent、Runtime、CLI、环境还是 evaluator；
+- `patch_decision`：允许、拒绝、需要更多证据或无干预；
+- `skill_patch_authorized`：只有允许 Skill intervention 时才为 true 的派生字段。
+
+Runtime、Driver、fixture、Grader、Oracle、missing evidence、CLI binary/version、permission、authentication 和 network 故障默认禁止修改 Skill。Agent planning/reasoning 失败只有在 Observation 完整、基础设施正常，并能定位到 Skill 缺失/歧义或重复稳定失败时，才允许把修改 Skill 作为 intervention。证据不足一律为 `unknown` 并 fail closed。
+
+模型可以解释 Failure Card 和提出下一步探针，但不能提升证据等级、覆盖确定性分类或独立授权 Patch。Optimizer 只接收 dev 中经过授权和脱敏的 Failure Card；validation/holdout 诊断仍不得反馈给 Optimizer。
+
+完整 Schema、CLI、受控 Process Tool、Session Replay 和 D20/D40 验收见 [COMPLEX_SKILL_EVAL_AND_DIAGNOSIS_DESIGN.md](./COMPLEX_SKILL_EVAL_AND_DIAGNOSIS_DESIGN.md)。
+
 ## 7. 技术选型（Implemented）
 
 | 层次 | 当前选择 |
@@ -296,6 +365,20 @@ generate -> draft -> calibrating -> freeze + content lock
 | `src/aceval/orchestrator.py` | evaluate/compare/optimize、预算和门禁 |
 | `src/aceval/reporting.py` | 确定性 JSON/Markdown 报告 |
 | `src/aceval/cli.py` | argparse CLI |
+
+### 8.1 计划新增模块
+
+| 文件 | 职责 |
+|---|---|
+| `src/aceval/skill_analysis.py` | Subject inventory、Capability Graph 和 source-ref 校验 |
+| `src/aceval/test_planning.py` | 风险加权 Test Requirement、Case budget 和 split family |
+| `src/aceval/case_generation.py` | seed/boundary/metamorphic Case 与 Oracle 草稿 |
+| `src/aceval/coverage.py` | planned/executable/oracle-ready/observed Coverage Matrix |
+| `src/aceval/pack_quality.py` | freeze blocker、已知好坏样本和 mutation calibration |
+| `src/aceval/failure_attribution.py` | Diagnostic Signal、Failure Card 和 Patch Authorization |
+| `src/aceval/diagnostic_probes.py` | 重复执行、health check、Mock/replay 探针 |
+| `src/aceval/replay.py` | Imported Session 到 EvalRun/Grader replay |
+| `src/aceval/process_tool.py` | D40 argv-only、allowlisted CLI 工具 |
 
 ## 9. 报告与运行目录（Implemented）
 
@@ -424,36 +507,39 @@ MVP 的工程验收是：
 
 ## 14. D40 规划（Planned）
 
-D20 已前置完成 repair/tune、Pack Builder/冻结锁、Doctor、公司 Profile/Session Import 和 paired gates。D40 的目标因此调整为：用真实证据、现实 Agent 接入、EvalPack 校准质量和本地可视化操作台，把 Kernel 变成可用于求职展示的 Agent EvalOps 产品，同时保持 D20 契约兼容。
+D20 已前置完成 repair/tune、Pack Builder/冻结锁、Doctor、公司 Profile/Session Import 和 paired gates。D40 的目标因此调整为：补齐复杂 Skill 测试空间建模、证据化故障归因、现实 Agent 接入、EvalPack 质量和本地可视化操作台，把 Kernel 变成可用于求职展示的 Agent EvalOps 产品，同时保持 D20 契约兼容。
 
-跨模块的详细排期、待办和完成定义以 [ROADMAP.md](./ROADMAP.md) 为准；Console 设计以 [VISUAL_CONSOLE_DESIGN.md](./VISUAL_CONSOLE_DESIGN.md) 为准。
+跨模块的详细排期、待办和完成定义以 [ROADMAP.md](./ROADMAP.md) 为准；复杂 Skill 与归因设计见 [COMPLEX_SKILL_EVAL_AND_DIAGNOSIS_DESIGN.md](./COMPLEX_SKILL_EVAL_AND_DIAGNOSIS_DESIGN.md)；Console 设计以 [VISUAL_CONSOLE_DESIGN.md](./VISUAL_CONSOLE_DESIGN.md) 为准。
 
 ### 14.1 优先能力
 
 1. **真实实验基线**：冻结模型、参数、环境和预算，完成真实 repair/tune、多次采样和消融。
-2. **Application Service**：从 argparse handler 抽取 CLI/Web/API 共用的应用服务与实验事件协议。
-3. **可视化 Console**：先静态 HTML，再实现本地 Read-only/Operational Console；UI 只调用 Service，不复制 Kernel 语义。
-4. **公司 Agent 闭环**：CompanyRuntimeAdapter、Imported Session -> EvalRun、Grader Replay 与 Case 草稿。
-5. **EvalPack Quality Gate**：Oracle 完整度、覆盖率、区分能力、split 泄漏、evaluator flake 和冻结 blocker。
-6. **统计与 Judge Pilot**：p50/p95、方差、置信区间、flake，以及经人工确认 Rubric 的结构化 Judge。
-7. **Agent 迁移证据**：优先实现 `FixedAgentTarget`，不在 Runtime 无法回报实际配置 hash 时声称 AgentSubject 优化。
-8. **持久化与 CI**：Run index、detailed report、Trace/artifact 引用、Replay 和 CI Gate。
+2. **Complex Skill Planner**：Capability Graph、风险加权 Test Requirement、Case/Oracle 草稿、Runtime gap 和 Coverage Matrix。
+3. **Failure Attribution**：结构化 Diagnostic Signal、Failure Card、证据等级和 Skill Patch Authorization。
+4. **EvalPack Quality Gate**：Oracle 可信级别、覆盖率、区分能力、mutation score、split 泄漏、evaluator flake 和冻结 blocker。
+5. **公司 Agent 闭环**：CompanyRuntimeAdapter、Imported Session -> EvalRun、Grader Replay、Diagnosis 与 Case 草稿。
+6. **受控 CLI 与诊断探针**：argv-only Process Tool、allowlist、结构化错误、重复和只读健康检查。
+7. **Application Service 与 Console**：先静态 HTML，再实现本地 Read-only/Operational Console；UI 只调用 Service，不复制 Kernel 语义。
+8. **统计、迁移与 CI**：p50/p95、方差、flake、FixedAgentTarget、Run index、Replay 和 CI Gate。
 
 ### 14.2 D21–D40 建议节奏
 
 | 阶段 | 交付 |
 |---|---|
-| D21–D24 | 真实 repair/tune Benchmark、detailed report、静态 HTML |
-| D25–D28 | Application Service、Run index、事件协议、Console 骨架 |
-| D29–D32 | CompanyRuntimeAdapter、Session EvalRun/Replay、Trace 页面 |
-| D33–D35 | EvalPack Quality Gate 和 Pack 校准/冻结页面 |
-| D36–D38 | 重复执行统计、flake、主观 Judge Pilot |
+| D21–D24 | 真实 Benchmark；Capability/TestPlan/Coverage/FailureCard 契约与标注集 |
+| D25–D28 | Case 生成、Pack Quality、Application Service、静态 HTML/Read-only Console |
+| D29–D32 | CompanyRuntimeAdapter、Session EvalRun/Replay/Diagnosis 与 Case 草稿 |
+| D33–D35 | 受控 Process Tool、CLI 分类和诊断探针 |
+| D36–D38 | 重复执行统计、动态覆盖、Operational Console、主观 Judge Pilot |
 | D39–D40 | FixedAgentTarget、CI、教程、视频、消融和版本化 Release |
 
 ### 14.3 D40 仍不承诺
 
 - 覆盖所有 Agent 平台；
+- 数学意义的任意自然语言全路径覆盖；
 - 任意 JSON 日志都能完整重评分；
+- 从单次日志证明唯一强因果根因；
+- 允许 Pack 自带自由 shell 或任意命令；
 - 对恶意第三方插件提供完善沙箱；
 - 自动生成并直接信任 Oracle；
 - 无人工审批自动发布 Skill/Agent；
@@ -466,7 +552,10 @@ D20 已前置完成 repair/tune、Pack Builder/冻结锁、Doctor、公司 Profi
 - 版本化 Subject 与运行配置；
 - Case/Oracle/Observation 分离；
 - Runtime capability contract；
+- Capability Graph、风险驱动 Test Requirement 和 requirement-to-case traceability；
+- Oracle 可信级别、Pack Quality 和动态覆盖；
 - Canonical Trace 与完整度检查；
+- evidence-backed Failure Card、补救面和修改授权；
 - 确定性 Grader 和结构化 Judge 校准；
 - dev/validation/holdout 信息边界；
 - 候选 lineage、回归门禁和预算控制；
@@ -496,8 +585,8 @@ git diff --check
 
 20 天黑客松版本负责证明：
 
-> 一个项目内置的 Reference Agent Runtime，可以驱动通用 EvalPack 生命周期，对两类 UTF-8 文件任务执行评测、`SKILL.md` 候选生成、回归门禁和报告；扩展边界与未支持工具面均有明确声明。
+> 一个项目内置的 Reference Agent Runtime，可以驱动通用 EvalPack 生命周期；系统能从当前支持面内的复杂 Skill 和少量种子 Case 生成可审计测试计划，明确覆盖/Runtime 缺口，并将可用 Skill 干预的行为失败与 CLI、Runtime、Grader 等外部故障分开，再执行受控候选生成和回归门禁。
 
 40 天求职版本负责进一步证明：
 
-> 同一核心可以接收真实 Runtime 运行和外部 Session 日志，并通过显式受信组件、proposal contract、capability、完整度和安全边界扩展到 Agent 评测，而不是把当前 `SKILL.md` Runtime 夸大为任意平台适配层。
+> 同一核心可以把 Skill、Agent 或 Workflow 转换为有来源和覆盖声明的测试契约，接收真实 Runtime 运行和外部 Session 日志，通过证据化归因选择正确干预面，并在不可变评测 revision 下持续优化，而不是把当前 `SKILL.md` Runtime 夸大为任意平台适配层。

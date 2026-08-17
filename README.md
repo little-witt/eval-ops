@@ -101,6 +101,29 @@ FakeRuntime 读取 Scenario 中预注册的 baseline/candidate 输出，用于�
 
 它不执行模型，也不证明示例候选能在真实模型上获得同样结果。所有 FakeRuntime 报告都会包含 `simulated: true`。
 
+## 下一阶段：复杂 Skill 规划与故障归因（Planned）
+
+当前 Pack Builder 是“Case 编译器”：它不会读取复杂 Skill、自动推导分支或证明路径覆盖。下一阶段将在 Kernel 外增加两个正式产品能力：
+
+```text
+Skill + 少量种子 Case + Goal
+  -> Capability Graph
+  -> Test Plan + Case/Oracle drafts
+  -> Coverage Matrix + Runtime gaps
+  -> Pack Quality Gate -> frozen EvalPack
+
+Observation + Trace + Grade
+  -> Failure Cards
+  -> Skill / Agent / CLI / Runtime / evaluator 分类
+  -> Patch Authorization
+```
+
+Planner 的目标是覆盖 Skill 明确声明的能力、关键风险、工具和状态转换，并列出未覆盖/不可执行路径，不宣称穷举任意自然语言路径。模型只提出结构化能力、Case、Oracle 和归因假设；代码校验 source refs、Runtime capability、Oracle 可信级别、覆盖分母、冻结 blocker 和是否允许修改 Skill。
+
+故障归因会把“在哪里观察到故障”“最可能原因”和“应该修改哪个组件”分开。CLI 未安装、权限/认证、网络、Runtime、Driver、Grader、Oracle 或证据缺失默认不会触发 Skill 修改；证据不足保持 `unknown`。公司 Session 在只有 Trace 时可做局部执行诊断，只有 Pack/Scenario/Oracle/artifact/state 足够完整时才允许完整 Replay。
+
+完整方案和 D20/D40 范围见 [COMPLEX_SKILL_EVAL_AND_DIAGNOSIS_DESIGN.md](./COMPLEX_SKILL_EVAL_AND_DIAGNOSIS_DESIGN.md)。
+
 ## 安装
 
 要求 Python 3.9 或更高版本。核心包没有必需的第三方运行时依赖，仓库自带 Pack 使用 JSON-compatible YAML，因此仅用 Python 标准库即可运行。
@@ -415,10 +438,12 @@ Optimizer 使用同一 JSON envelope，但 `tools` 为空；其最终 `content` 
 当前代码已经提供 Reference Runtime、repair/tune Kernel、Pack Builder/冻结锁、双 Pack、公司 Session 连接层、确定性 Grader、FakeRuntime conformance、受控优化门禁和 JSON/Markdown 报告。D20 剩余重点是把它打磨成可信演示：
 
 1. 接入一个真实模型桥接并冻结模型参数，完成双 Pack 的重复实验；
-2. 补充真实失败 Trace、非 Skill 故障样例和清晰的证据归因；
-3. 校验候选在 dev、validation、holdout 上的实际表现，不预填提升数字；
-4. 固化 6 分钟演示、失败降级方案、录屏和可复现实验说明；
-5. 展示第二 Pack 的实际接入改动与工时，证明扩展边界而非口头宣称通用。
+2. 从一个复杂文件型 Skill 和少量种子 Case 生成 Capability Graph、Test Plan、Case 草稿和 Coverage Matrix；
+3. 展示一个 critical gap/未确认 Oracle 阻止冻结，并在确认后进入 Pack Quality Gate；
+4. 生成可修 Skill 与不可修 CLI/Runtime/Grader 两类 Failure Card，证明不会误改；
+5. 校验候选在 dev、validation、holdout 上的实际表现，不预填提升数字；
+6. 固化 6 分钟演示、失败降级方案、录屏和可复现实验说明；
+7. 展示第二 Pack 的实际接入改动与工时，证明扩展边界而非口头宣称通用。
 
 黑客松提交应把 FakeRuntime 演示标记为 simulation，并将任何实际提升数字绑定到可复现的真实模型报告。
 
@@ -427,12 +452,13 @@ Optimizer 使用同一 JSON envelope，但 `tools` 为空；其最终 `content` 
 D20 已经前置实现 repair/tune、Pack Builder/冻结锁、Doctor、公司 Profile、Session Import 和 paired gates。D40 不再以继续堆底层功能为主，而改为：
 
 1. 完成真实模型 repair/tune Benchmark 和重复执行统计；
-2. 抽取 CLI/Web 共用的 Application Service；
-3. 建设本地 Skill Doctor Console 和静态 HTML 报告；
-4. 将公司 Execute/Session 接成 `CompanyRuntimeAdapter`、EvalRun 和 Replay；
-5. 建设 EvalPack Quality Gate，衡量 Oracle 完整度、覆盖率、区分能力、泄漏和 flake；
-6. 完成一个经人工确认 Rubric 的主观 Judge Pilot；
-7. 用 `FixedAgentTarget`、CI、教程、演示视频和真实消融实验完成求职作品化。
+2. 完成 Capability Graph、Test Plan、Case 草稿和 Coverage Matrix；
+3. 完成 Failure Card、Skill Patch Authorization 和 canonical failure fixtures；
+4. 建设 EvalPack Quality Gate，衡量 Oracle 可信级别、覆盖率、区分能力、mutation、泄漏和 flake；
+5. 将公司 Execute/Session 接成 `CompanyRuntimeAdapter`、EvalRun、Replay 和 Diagnosis；
+6. 增加受控 argv-only Process Tool、CLI 分类和诊断探针；
+7. 抽取 CLI/Web 共用的 Application Service，建设静态 HTML 和本地 Skill Doctor Console；
+8. 用重复统计、主观 Judge Pilot、`FixedAgentTarget`、CI、教程、视频和消融完成求职作品化。
 
 完整排期、完成定义和优先级见 [ROADMAP.md](./ROADMAP.md)。可视化产品与技术方案见 [VISUAL_CONSOLE_DESIGN.md](./VISUAL_CONSOLE_DESIGN.md)。
 
@@ -440,13 +466,14 @@ D20 已经前置实现 repair/tune、Pack Builder/冻结锁、Doctor、公司 Pr
 
 项目将建设本地单用户 `Skill Doctor Console`，而不是当前阶段的多租户 SaaS。Console 重点覆盖：
 
-- EvalPack 生成、校准和冻结确认；
+- Capability Graph、Test Plan、Coverage Matrix 和 Runtime gap；
+- EvalPack 生成、质量、校准和冻结确认；
 - baseline -> repair/tune -> validation -> holdout 实时进度；
-- Case、Grader evidence 和 Trace 时间线；
+- Case、Grader evidence、Trace 时间线和 Failure Card；
 - baseline/candidate 指标、Skill diff 和候选谱系；
-- 公司 Session 导入、completeness 和 Replay。
+- 公司 Session 导入、completeness、Diagnosis 和 Replay。
 
-实施顺序为：真实实验数据 -> 静态 HTML -> Application Service -> Read-only Console -> Operational Console。UI 不重新实现 Gate、Objective 或 Pack 生命周期语义。
+实施顺序为：真实实验数据 -> Test Plan/Coverage/Failure Card 契约 -> 静态 HTML -> Application Service -> Read-only Console -> Session Replay/Pack Quality/统计 -> Operational Console。UI 不重新实现 Gate、Objective、归因授权或 Pack 生命周期语义。
 
 ## 开发与测试
 
@@ -461,6 +488,7 @@ git diff --check
 ## 仓库文档
 
 - [ROADMAP.md](./ROADMAP.md)：更新后的 D20/D40 路线图、已前置能力、待办与完成定义；
+- [COMPLEX_SKILL_EVAL_AND_DIAGNOSIS_DESIGN.md](./COMPLEX_SKILL_EVAL_AND_DIAGNOSIS_DESIGN.md)：复杂 Skill 测试规划、覆盖、Pack Quality、故障归因和 CLI/Session 方案；
 - [VISUAL_CONSOLE_DESIGN.md](./VISUAL_CONSOLE_DESIGN.md)：本地可视化操作台的产品、架构、API、安全和分阶段方案；
 - [EVALPACK_SPEC.md](./EVALPACK_SPEC.md)：EvalPack 边界、Manifest 和公共 Protocol；
 - [TECHNICAL_DESIGN.md](./TECHNICAL_DESIGN.md)：完整技术方案、状态机和验收标准；
@@ -476,6 +504,9 @@ git diff --check
 
 - 不采集或依赖模型隐藏思维链；
 - 不将合成 Case 自动视为真实质量标准；
+- 不把声明能力/风险覆盖描述为任意自然语言的数学全路径覆盖；
+- 不把同源模型生成 Case 伪装为独立 sealed holdout；
+- 不从单次日志宣称 Skill、Agent 或 CLI 的唯一强因果根因；
 - 不允许 Optimizer 修改 Case、Grader、validation、holdout 或 Runner；
 - 不自动覆盖、合并或发布生产 Skill；
 - 不把单 Runtime 的最优结果宣称为所有 Agent 平台上的最优结果；
