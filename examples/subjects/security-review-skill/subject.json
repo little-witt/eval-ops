@@ -1,0 +1,8 @@
+{
+  "kind": "skill",
+  "id": "security-review-skill-baseline",
+  "version": "baseline",
+  "metadata": {
+    "variant": "baseline"
+  }
+}

@@ -247,7 +247,7 @@ D20 稳定的公共面只有四项：
 - `Grader`：读取冻结的 `RunObservation` 和 Scenario/Oracle，返回 `pass | fail | not_evaluable | error`、score、metrics 和 evidence reference；
 - `OptimizerPolicy`：`allowed_paths`、`patchable_components`、`visible_splits`、`beam_width`、`max_rounds`、`max_candidate_snapshots` 和 Patch 大小限制。
 
-实现采用 Python `Protocol`、Pydantic Manifest 和显式内置注册表。D20 不做 setuptools entry point、动态 import、依赖注入容器或通用 DAG 引擎。Pack 只能按 ID 选择内置 Driver/Grader；新增 Pack 不应要求修改 Kernel 源码。
+实现采用 Python `Protocol`、标准库 frozen dataclass Manifest 和显式内置注册表。D20 不做 setuptools entry point、动态 import、依赖注入容器或通用 DAG 引擎。Pack 只能按 ID 选择内置 Driver/Grader；新增 Pack 不应要求修改 Kernel 源码。
 
 `security-review` 是完整自动优化闭环；`csv-summary-smoke` 是跨 Pack 硬验收。后者必须仅增加 Pack 目录、Subject、Scenario、fixture、Oracle 和候选快照，在零 Kernel 改动下完成 baseline -> candidate -> dev + validation。
 

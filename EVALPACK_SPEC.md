@@ -1,82 +1,111 @@
-# EvalPack v1 扩展规范
+# EvalPack `v1alpha1` 扩展规范
 
 > 项目：Skill Doctor / Agent Capability EvalOps
-> 目标版本：D20 `v1alpha1`
-> 状态：Draft
+> API version：`aceval.dev/v1alpha1`
+> 状态：MVP 已实现规范
+> 基线日期：2026-08-16
 
 ## 1. 目标
 
-`EvalPack` 是 EvalOps Kernel 的领域扩展单元。它回答“如何准备这类任务、观察什么、什么算正确、允许优化什么”，但不重新实现执行、状态机、预算、数据隔离或报告。
+`EvalPack` 是 EvalOps Kernel 的声明式领域扩展单元。它定义：
 
-D20 必须交付：
+- 被测 Subject 的类型和入口；
+- Case prompt、fixture、split 和 timeout；
+- 私有 Oracle；
+- 使用哪个已注册 Driver 和 Grader；
+- Skill 自动优化时允许的修改面和候选预算。
 
-- 一个不包含安全审查领域分支的 EvalOps Kernel v1；
-- 一个完成完整自迭代闭环的 `security-review` EvalPack；
-- 一个不修改 Kernel 即可接入的 `csv-summary-smoke` EvalPack；
-- Pack 脚手架、静态校验和 conformance test。
+EvalPack 不重新实现 Runtime、状态机、预算、门禁或报告，也不能从 Manifest 自动执行 Python/shell 代码。
 
-这里的“可扩展”不是声称无需领域知识评测任意任务。一个任务至少要满足：
+这里的“通用”有明确前提：
 
-1. 输入能够被 Driver 放入隔离场景；
-2. 输出、Trace、artifact 或 state 至少有一种可观测；
-3. 用户能够提供或批准 Case、Oracle、断言或 rubric；
-4. 若要自动优化，被测对象存在明确的可修改表面和 Patch policy。
+1. 输入可由 Driver 准备；
+2. final output、Trace、artifact 或 workspace state 至少有一种可观察；
+3. 用户能提供或确认 Case 和成功标准；
+4. 自动优化时存在可约束的修改表面。
 
-缺少这些条件时，Kernel 返回 `not_evaluable`，不能让模型自行发明成功标准。
+不满足观察条件时，Grader 返回 `not_evaluable`；Kernel 不允许模型自行发明 Oracle。
 
-## 2. 三层边界
+MVP 的声明式通用性只覆盖已注册组件的能力交集。当前内置执行链路是 UTF-8 `SKILL.md`、可选 UTF-8 JSON `subject.json`、UTF-8 workspace 文件工具和现有 Grader；它不等价于任意 Skill 文件树、任意工具或任意输出模态。
+
+## 2. 实现状态
+
+### 2.1 Implemented（MVP）
+
+- 本地声明式 Pack；
+- JSON 文档，以及安装 `PyYAML` 后的 YAML 文档；
+- 严格 Manifest/Scenario 字段校验；
+- 相对路径、symlink 和 traversal 校验；
+- Pack 全树 hash、Suite hash、Scenario/fixture/Oracle hash；
+- 执行前 Pack 完整性重验；
+- `schema_ref`/`rubric_ref` 资源在加载时解析并深冻结；每个 EvalRun 物化经逐文件 hash 校验的 `frozen-pack`；
+- 显式进程内 Component Registry；
+- `skill` Subject 与 `skill_markdown_v1` Adapter/Optimizer，仅处理 UTF-8 `SKILL.md` 和可选 UTF-8 JSON `subject.json`；
+- 两个 workspace Driver；
+- 七个确定性 Grader；
+- dev/validation/holdout split；
+- `pack lint` 与 FakeRuntime `pack test`；
+- `security-review` 和 `csv-summary-smoke` 两个内置示例 Pack。
+
+### 2.2 Planned（D40）
+
+- 操作者显式加载的可信 Python Extension；
+- 外部 validation/holdout suite resolver；
+- AgentSubject/FixedAgentTarget；
+- 多文件 Skill bundle、二进制 Subject/artifact 工具和 shell/network/browser/multimodal Runtime capability；
+- LLM Judge 与人工校准；
+- 不可信插件隔离、签名或 Marketplace；
+- 远程 Pack 安装和依赖解析。
+
+当前没有 `pack init` 或 `--extension` CLI，也没有公司 Runtime Adapter。Runtime 由宿主/CLI 选择，不写入 Pack。
+
+## 3. 三层边界
 
 | 层 | 负责 | 不负责 |
 |---|---|---|
-| EvalOps Kernel | 状态机、预算、运行、Trace、CAS、Grader 调度、候选 lineage、Gate、Replay、报告 | 漏洞规则、CSV 字段、业务金标、任意领域分支 |
-| EvalPack | Case、fixture、Oracle、Driver/Grader ID、rubric、Optimizer policy、报告标签 | 新状态机、模型供应商、数据库表、任意命令执行、报告实现 |
-| Adapter/Extension | 新 Subject、Runtime、Driver 或 Grader 的代码实现 | 绕过 Kernel 预算、数据分层和 Gate 语义 |
+| EvalOps Kernel | 执行生命周期、预算、Grader 调度、候选门禁、报告 | 漏洞规则、CSV 字段、业务金标 |
+| EvalPack | Case、fixture、Oracle、组件 ID、参数、优化 policy | 模型供应商、凭证、任意代码执行、报告模板 |
+| 受信组件 | Subject/Runtime/Driver/Grader/Optimizer 的 Python 实现 | 绕过 Kernel 的预算、split 和 Gate 语义 |
 
-依赖方向必须是：
+依赖方向：
 
 ```text
 EvalPack -> public contracts <- Kernel
-Trusted Extension -> public contracts
+                         ^
+                explicitly built Registry
 
-Kernel -X-> security-review
-Kernel -X-> csv-summary-smoke
+Kernel -X-> security-review domain logic
+Kernel -X-> csv-summary domain logic
 ```
 
-Kernel 不能 import 具体 Pack，也不能出现 `if pack == "security-review"`、`if vulnerability` 或 `if csv` 之类领域分支。
-
-## 3. D20 支持层级
-
-### 3.1 声明式 Pack
-
-D20 正式支持只组合内置 Subject、Driver、Grader 和 Optimizer 的本地声明式 Pack。这是 20 天内承诺的低成本接入路径。
-
-### 3.2 可信代码扩展
-
-公共 Protocol 和 Registry 从 D1 定义，但 D20 不从 Pack Manifest 自动 import Python，不执行 Pack 自带 shell grader，也不建设插件市场。D21 起可由操作者通过显式 `--extension package.module:register` 加载可信扩展；该代码拥有宿主进程权限，必须单独审计。
-
-### 3.3 不可信远程插件
-
-插件签名、依赖隔离、远程执行和沙箱化 Marketplace 属于长期 Roadmap，不是 D20/D40 Core。
-
 ## 4. 目录结构
+
+最小 Pack：
 
 ```text
 evalpacks/<pack-name>/
   pack.yaml
   scenarios/
     dev.yaml
-    validation.ref
-    holdout.ref
-  fixtures/
-  oracles/
-  schemas/
-  rubrics/
-  README.md
+    validation.yaml       # 可选
+    holdout.yaml          # 可选
+  fixtures/               # 按 Case 需要提供
+  oracles/                # 按 Case 需要提供
+  schemas/                # 按 Grader 需要提供
+  README.md               # 可选
 ```
 
-真实用户的 Subject 与 EvalPack 分离。示例仓库可以在 Pack 外额外保存一个缺陷 Subject，便于重现 Demo。
+`pack.yaml` 文件名固定。文件内容可以是 JSON；若使用 YAML 语法，运行环境必须安装可选依赖 `PyYAML`。当前仓库的两个内置 Pack 使用 JSON 语法，因此核心路径保持零第三方依赖。
 
-## 5. Pack Manifest
+Pack 根目录及其任意子项都不能是 symlink。Loader 会 hash Pack 内全部文件，而不只 hash Manifest 引用到的文件；加载后修改、增加或删除任何文件都会导致执行前完整性校验失败。
+
+Loader 会把 Manifest 中的本地 `schema_ref` 解析为结构化资源、把 `rubric_ref` 读取为 UTF-8 文本，并注入不可变的 `FrozenEvalPack.resources`。每次 EvalRun 还会把加载时记录的全部 Pack 文件复制到 `<run-dir>/frozen-pack/`，复制前后逐文件校验 hash；Driver 只从该副本读取 fixture，Grader 只使用冻结资源或该副本中的受控路径。Runtime context 不获得 Pack 根路径。
+
+Subject 必须位于 Pack 外部。示例仓库可以同时提供 baseline/candidate Subject，但它们不是 EvalPack 内容。
+
+## 5. Manifest
+
+### 5.1 完整示例
 
 ```yaml
 api_version: aceval.dev/v1alpha1
@@ -85,12 +114,13 @@ kind: EvalPack
 metadata:
   name: security-review
   version: 0.1.0
-  description: Evaluate JSON-native repository security review skills.
+  description: Evaluate JSON security-review Skills.
 
 subject_contract:
   kinds: [skill]
   adapter: skill_markdown_v1
   entrypoint: SKILL.md
+  params: {}
 
 driver:
   type: repository_workspace
@@ -98,11 +128,12 @@ driver:
     - fresh_session
     - workspace_fixture
     - canonical_trace
+  params: {}
 
 suite:
   dev: scenarios/dev.yaml
-  validation_ref: security-review-validation-v1
-  holdout_ref: security-review-holdout-v1
+  validation_ref: scenarios/validation.yaml
+  holdout_ref: scenarios/holdout.yaml
 
 graders:
   - id: output-schema
@@ -114,18 +145,10 @@ graders:
     type: record_match
     hard: true
     params:
-      collection_path: $.findings[*]
-  - id: source-grounding
-    type: source_reference
-    hard: true
-    params:
-      file_path: $.findings[*].file
-      line_path: $.findings[*].line
-  - id: explanation
-    type: llm_rubric
-    hard: false
-    params:
-      rubric_ref: rubrics/explanation.yaml
+      collection_path: $.findings
+      expected_key: expected_records
+      forbidden_key: forbidden_records
+      match_fields: [rule_id, file, line]
 
 optimizer_policy:
   adapter: skill_markdown_v1
@@ -137,56 +160,189 @@ optimizer_policy:
   max_candidate_snapshots: 4
   max_added_lines: 30
   forbid_case_literals: true
+  params: {}
 ```
 
-Manifest 不保存模型、API key、凭证和价格。Runtime profile 和绝对预算由项目配置或命令行提供；Pack policy 只能收紧全局限制，不能放宽它。
+JSON 与 YAML 示例表达同一数据结构。Manifest 和 Scenario 的结构字段 fail closed；`metadata`、`params`、Oracle 等明确声明为自由 mapping 的位置允许领域数据。重复 Grader ID 会 fail closed。
+
+### 5.2 字段
+
+| 字段 | 当前约束 |
+|---|---|
+| `api_version` | 必须等于 `aceval.dev/v1alpha1` |
+| `kind` | 必须等于 `EvalPack` |
+| `metadata.name` | 非空字符串 |
+| `metadata.version` | 非空字符串 |
+| `metadata.description` | 可选字符串 |
+| `metadata.labels` | 可选 string-to-string mapping |
+| `subject_contract.kinds` | 当前 Registry 只支持 `skill` |
+| `subject_contract.adapter` | 当前为 `skill_markdown_v1` |
+| `subject_contract.entrypoint` | 当前示例为 `SKILL.md` |
+| `subject_contract.params` | 传给 Subject Adapter 的 `snapshot/materialize`，包括候选与执行前后重验 |
+| `driver.type` | 必须是已注册 Driver ID |
+| `driver.required_runtime_capabilities` | Runtime 必须全部满足 |
+| `driver.params` | 通过 Driver 专用 `RunContext.metadata.driver_params` 传给 `prepare`；不进入 Runtime context |
+| `suite` | 声明 dev/validation/holdout 文件或 ref |
+| `graders` | Manifest 级 Grader ID、类型、hard 和默认参数 |
+| `optimizer_policy` | 可选；缺失时 Pack 为 eval-only |
+| `optimizer_policy.params` | 通过 `PatchConstraints.metadata.optimizer_params` 传给 `candidate-patch-v1` Optimizer |
+
+Manifest 不保存模型名、API key、凭证或价格。Runtime 和绝对实验预算由 CLI/宿主提供，Pack 只声明所需 capability 和更严格的优化约束。
+
+### 5.3 参数传递边界
+
+`params` 是 Pack 到受信组件的声明式配置，不是任意代码入口：
+
+```text
+subject_contract.params
+  -> SubjectAdapter.snapshot(..., params)
+  -> SubjectAdapter.materialize(..., params)
+  -> 候选 snapshot、Gate 间重验、执行前后完整性重验
+
+driver.params
+  -> driver-only RunContext.metadata.driver_params
+  -> ScenarioDriver.prepare(..., context)
+  -X-> Runtime RunContext
+
+optimizer_policy.params
+  -> PatchConstraints.metadata.optimizer_params
+  -> aceval.optimizer/candidate-patch-v1 Optimizer
+```
+
+当前 `skill_markdown_v1` Subject Adapter 和两个内置 workspace Driver 接受相应传递路径，但不消费自定义值；内置 `skill-markdown-generator-v1` 生成器也不读取 `optimizer_policy.params`。自定义受信组件必须自行 fail closed 校验所支持的键和值。
+
+### 5.4 Suite 引用
+
+`suite` 支持：
+
+```yaml
+suite:
+  dev: scenarios/dev.yaml
+  validation: scenarios/validation.yaml
+  holdout: scenarios/holdout.yaml
+```
+
+也支持 `validation_ref`、`holdout_ref`。当前解析语义是：
+
+- ref 指向 Pack 内存在的相对文件时，作为本地 suite 加载并纳入 hash；
+- ref 是不对应本地文件的 opaque ID 时，会保留声明，但当前没有外部 resolver；
+- CLI `pack lint` 和执行会将未解析 suite 报错，而不是跳过；
+- 同一 split 不能同时声明本地字段和 `*_ref`。
+
+内置 Pack 的 `validation_ref`/`holdout_ref` 都指向本地文件。这提供编排层面的可见性边界，但不是 OS 权限意义上的隐藏集。
 
 ## 6. Scenario 与 Oracle
 
+Scenario 文件可以是单个 mapping、Scenario list，或包含 `scenarios` list 的 mapping。
+
 ```yaml
-id: path-traversal-01
-split: dev
-prompt: Review HEAD against main and return the declared JSON schema.
-fixtures:
-  - fixtures/repo-01
-oracle_ref: oracles/path-traversal-01.json
-grader_ids:
-  - output-schema
-  - expected-records
-  - source-grounding
-timeout_seconds: 120
-tags: [repository, security, path-traversal]
+scenarios:
+  - id: path-traversal-dev
+    split: dev
+    prompt: Review the provided Python file and return JSON.
+    fixtures:
+      - fixtures/dev/path_traversal.py
+    oracle_ref: oracles/dev/path-traversal.json
+    grader_ids:
+      - output-schema
+      - expected-records
+      - source-grounding
+      - file-inspection-trace
+    grader_params: {}
+    timeout_seconds: 30
+    tags: [python, path-traversal]
+    metadata: {}
 ```
+
+支持的 Scenario 字段只有：
+
+- `id`；
+- `split`；
+- `prompt`；
+- `fixtures`；
+- `oracle_ref`；
+- `grader_ids`；
+- `grader_params`；
+- `timeout_seconds`；
+- `tags`；
+- `metadata`。
 
 规则：
 
-- Runtime 只能看到 prompt、允许的 fixture 和工具配置；
-- Oracle、grader 参数、validation 和 holdout 不进入被测工作区；
-- Optimizer 只接收 dev 的 Observation、Grade 和 Failure Card；
-- validation 只返回晋级结果和聚合指标；
-- holdout 只执行一次预注册批次，结果不能生成新候选；
-- 所有路径必须相对 Pack 根目录、通过 traversal/symlink 校验并冻结 hash。
+1. Scenario 的 `split` 必须与其 suite 文件所属 split 相同；
+2. `fixtures` 当前是 Pack 根目录下的相对路径字符串列表；
+3. `oracle_ref` 必须是 Pack 内普通文件；
+4. `grader_ids` 必须引用 Manifest 中声明的逻辑 Grader ID；
+5. `grader_params` 只能覆盖当前 Scenario 已选择的 Grader；
+6. timeout 必须为正整数；
+7. 路径不能为绝对路径、包含 NUL 或 `..`；
+8. Scenario、Oracle 和 fixture 内容都会冻结 hash。
+9. 每个 Scenario 必须至少选择一个 `hard: true` Grader；全软评分不能成为通过门禁。
 
-## 7. 公共 Protocol
+Oracle 内容是领域数据，由 Grader 解释。例如安全审查 Pack 的 Oracle 包含 `expected_records`/`forbidden_records`，CSV Pack 的 Oracle 包含预期汇总值。Kernel 不认识这些领域字段。
+
+### 6.1 FakeRuntime metadata
+
+内置示例 Scenario 在 `metadata.fake_runtime` 中保存 baseline/candidate 的预注册行为。该字段只服务 FakeRuntime conformance 和模拟演示：
+
+```yaml
+metadata:
+  fake_runtime:
+    variants:
+      baseline:
+        final_output: {findings: []}
+        trace:
+          - kind: tool_call
+            name: read_file
+            payload: {path: sample.py}
+      candidate:
+        final_output: {findings: []}
+        trace:
+          - kind: tool_call
+            name: read_file
+            payload: {path: sample.py}
+```
+
+Reference Runtime 不使用这些预注册输出。报告只要使用 FakeRuntime 就必须标记 `simulated=true`。
+
+## 7. 公共契约
+
+当前核心 Protocol 的等价形态为：
 
 ```python
-class EvalPackLoader(Protocol):
-    def load(self, ref: PackRef) -> FrozenEvalPack: ...
-    def validate(self, pack: FrozenEvalPack, registry: ComponentRegistry) -> PackReport: ...
+class SubjectAdapter(Protocol):
+    id: str
+    def snapshot(
+        self,
+        subject_ref: str,
+        params: Optional[Mapping[str, Any]] = None,
+    ) -> SubjectSnapshot: ...
+    def materialize(
+        self,
+        snapshot: SubjectSnapshot,
+        destination: Path,
+        params: Optional[Mapping[str, Any]] = None,
+    ) -> Path: ...
 
 
-class ComponentRegistry(Protocol):
-    def subject_adapter(self, component_id: str) -> "SubjectAdapter": ...
-    def driver(self, component_id: str) -> "ScenarioDriver": ...
-    def grader(self, component_id: str) -> "Grader": ...
-    def optimizer(self, component_id: str) -> "Optimizer": ...
+class RuntimeAdapter(Protocol):
+    id: str
+    @property
+    def capabilities(self) -> RuntimeCapabilities: ...
+    async def execute(
+        self,
+        prepared: PreparedScenario,
+        subject: SubjectSnapshot,
+        context: RunContext,
+    ) -> RuntimeResult: ...
 
 
 class ScenarioDriver(Protocol):
     id: str
-
-    def required_capabilities(self, scenario: FrozenScenario) -> set[str]: ...
-    async def prepare(self, scenario: FrozenScenario, context: RunContext) -> PreparedScenario: ...
+    def required_capabilities(self, scenario: FrozenScenario) -> FrozenSet[str]: ...
+    async def prepare(
+        self, scenario: FrozenScenario, context: RunContext
+    ) -> PreparedScenario: ...
     async def collect(
         self, prepared: PreparedScenario, result: RuntimeResult
     ) -> RunObservation: ...
@@ -196,185 +352,288 @@ class ScenarioDriver(Protocol):
 class Grader(Protocol):
     id: str
     version: str
-
     async def evaluate(
         self,
         observation: RunObservation,
         oracle: FrozenOracle,
-        params: dict,
+        params: Mapping[str, Any],
     ) -> GradeResult: ...
 
 
-class OptimizerPolicy(Protocol):
-    def constrain(
-        self, pack: FrozenEvalPack, global_budget: Budget
-    ) -> PatchConstraints: ...
-
-
-class Extension(Protocol):
-    def register(self, registry: ComponentRegistry) -> None: ...
+class Optimizer(Protocol):
+    id: str
+    proposal_contract: str
+    async def propose(
+        self,
+        base: SubjectSnapshot,
+        diagnoses: Sequence[Any],
+        constraints: PatchConstraints,
+    ) -> Sequence[CandidatePatch]: ...
 ```
 
-`ScenarioDriver` 只管理 fixture 生命周期和 Observation 收集：
+Optimizer 的 `id` 用于匹配 `optimizer_policy.adapter`，`proposal_contract` 用于声明 `propose` 的输入输出形态。当前只接受：
 
-- `prepare` 只复制声明过的输入；
-- `collect` 必须在 `cleanup` 前把 Trace、artifact、pre/post state 写入 CAS；
-- `cleanup` 必须幂等；
-- Driver 不评分、不调用 Judge、不生成 Patch。
+- `aceval.optimizer/candidate-patch-v1`：公共 Optimizer Protocol，直接返回 `CandidatePatch` 序列；
+- `aceval.optimizer/skill-markdown-generator-v1`：内置兼容契约，生成完整 UTF-8 `SKILL.md`，由 `SkillOptimizerBridge` 转为 `candidate-patch-v1`。
 
-Kernel 固定调用顺序为 `SubjectAdapter.snapshot/materialize -> ScenarioDriver.prepare -> RuntimeAdapter.execute -> ScenarioDriver.collect -> ScenarioDriver.cleanup`。Runtime 内部可以管理 Session，但不能再实现一套 fixture/artifact prepare/collect 生命周期。
+缺失或未知 `proposal_contract` 必须在生成候选前 fail closed。`skill-markdown-generator-v1` 是受限便利接口，不是多文件 Subject 的通用补丁协议。
+
+MVP 的 `candidate-patch-v1` 不是任意文件补丁格式。Kernel 当前要求 parent/candidate 都提供完整文件快照和 UTF-8 文本 `content`，只允许 diff 触碰声明的单一 entrypoint，并从两份冻结内容重新计算 unified diff。base hash、patch hash、候选目录、真实 Subject hash、changed-files 集合或 diff 任一不一致，均作为可审计的 optimizer protocol error：记入 proposal/rejected/usage 后立即停止，不产生 trial。多文件或二进制 Candidate 需要 D40 新增显式候选验证扩展契约；仅注册 Subject Adapter 不会绕过这组检查。
+
+唯一固定生命周期：
+
+```text
+SubjectAdapter.snapshot/materialize
+  -> ScenarioDriver.prepare
+  -> RuntimeAdapter.execute
+  -> ScenarioDriver.collect
+  -> ScenarioDriver.cleanup
+  -> Grader.evaluate
+```
+
+Driver 管理 fixture、临时 workspace、artifact 和 pre/post state；Runtime 管理 Agent Session/loop；Grader 只读取 Observation 与 Oracle。三者不能互相复制职责。
 
 ## 8. Registry 与内置组件
 
-D20 使用显式 Registry，不使用 setuptools entry point、依赖注入容器或通用 DAG：
+MVP 使用 `build_builtin_registry()` 创建显式 Registry。Registry 不读取 entry point，也不根据 Manifest import 模块。
 
-```python
-registry.register_driver("repository_workspace", RepositoryWorkspaceDriver())
-registry.register_driver("artifact_workspace", ArtifactWorkspaceDriver())
-registry.register_grader("json_schema", JsonSchemaGrader())
-registry.register_optimizer("skill_markdown_v1", SkillMarkdownOptimizer())
-```
+### 8.1 Subject Adapter
 
-D20 内置两个 Driver：
-
-- `repository_workspace`：准备仓库 fixture，收集文件变化与 Trace；
-- `artifact_workspace`：准备普通文件输入，收集声明的输出 artifact。
-
-D20 内置 Grader 控制在以下集合：
-
-| Grader | 能力 |
+| ID | 能力 |
 |---|---|
-| `json_schema` | JSON 可解析性、字段、类型和 Schema |
-| `json_path` | 指定路径的存在、相等、范围和禁止值 |
-| `record_match` | 对 JSON 数组做声明式 expected/forbidden record 匹配 |
-| `artifact_exists` | 相对路径、MIME、大小和 hash 存在性 |
-| `source_reference` | JSON 中引用的仓库文件和行号真实存在 |
-| `trace_assert` | 工具包含、次数和有序子序列，不提供任意表达式 DSL |
-| `workspace_diff` | 检查允许/禁止的文件变化 |
-| `llm_rubric` | 结构化软评分，不能单独通过硬门禁 |
+| `skill_markdown_v1` | 读取 UTF-8 `SKILL.md` 和可选 UTF-8 JSON `subject.json`，生成组合 hash，物化冻结副本 |
 
-任意 Grader 的 `error` 都不能聚合成 pass。观察数据不足时返回：
+该 Adapter 会拒绝其冻结快照中的其他文件；`scripts/`、`templates/`、`assets/` 和其他多文件/二进制 Subject 需要新的受信 Subject Adapter，不能依靠修改 `entrypoint` 绕过。
+
+### 8.2 Driver
+
+| ID | 能力 |
+|---|---|
+| `repository_workspace` | 复制 repository/file fixture，收集完整 pre/post workspace 和 Trace |
+| `artifact_workspace` | 在相同生命周期上额外要求并收集声明 artifact |
+
+Driver 创建临时 workspace，复制声明的 fixture，拒绝 symlink 和越界路径，并对 workspace 与合并后的内存/runtime artifact 设置文件数、单文件大小和总字节限制。每个 Case 使用由安全 hash 命名的独立 fixture 目录；Scenario ID 本身也必须满足安全组件 ID 语法。`collect` 完成后 `cleanup` 删除 workspace；Observation 不依赖已删除路径。Pack 的 `driver.params` 只在 Driver 专用 `RunContext.metadata.driver_params` 中可见；两个内置 Driver 当前不读取这些自定义参数。
+
+Driver 只得到不含 Oracle、grader IDs/params 的 `DriverScenarioView` 和 Case 专属 fixture root。`PreparedScenario`、`RuntimeResult`、`RunObservation`、Trace payload、Artifact metadata/content 与 `GradeResult` 的容器字段会在契约边界深冻结，防止 Runtime 篡改 baseline 或前序 Grader 改写后序 Grader 的证据。受信 Python Driver/Grader 仍属于同进程 TCB；该约束不能抵御主动绕过 Python 对象模型或直接扫描宿主文件系统的恶意组件。
+
+### 8.3 Grader
+
+| 类型 ID | 当前能力 |
+|---|---|
+| `json_schema` | final output 或 JSON artifact 的受限 JSON Schema 校验 |
+| `json_path` | 有限 JSON path 取值和 equals/range/集合/regex 断言 |
+| `record_match` | expected/forbidden record 匹配 |
+| `artifact_exists` | artifact 路径、大小、MIME 和 hash 断言 |
+| `source_reference` | 输出中的文件与行号引用检查 |
+| `trace_assert` | 工具包含、次数和有序序列检查 |
+| `workspace_diff` | 创建、修改、删除文件的 allow/forbid/require 检查 |
+
+`json_schema` 是项目内置的受限实现，不声称支持 JSON Schema 全部关键字或格式。受支持的 `enum`、`const`、`uniqueItems`、JSONPath equals 和 record matching 使用严格 JSON 相等语义，boolean 不与 number 混同；本地 `$ref` 的 sibling 断言会继续执行。`json_path` 也是受限语法，不是完整 JSONPath 引擎。不支持的 Schema/配置返回 `ERROR`，而不是静默忽略。
+
+MVP 没有 `llm_rubric`。需要语义 Judge 的 Pack 必须等 D40 扩展实现与校准后再声明对应组件。
+
+## 9. 评分语义
+
+每个 Grader 返回：
 
 ```text
-status: not_evaluable
-missing: [artifact_snapshot]
+PASS | FAIL | NOT_EVALUABLE | ERROR
 ```
 
-## 9. 通用 Skill 优化器
+其中：
 
-D20 只内置 `skill_markdown_v1` Optimizer：它可以修改任意 Pack 所引用 Skill 的 `SKILL.md`，但不能修改脚本、资源、Case、Oracle、Grader、Runner 或预算。
+- `PASS`：该断言满足；
+- `FAIL`：观察完整，但行为不满足断言；
+- `NOT_EVALUABLE`：缺少所需 output、artifact、Trace 或 runtime observation；
+- `ERROR`：Grader 配置、实现或生命周期错误。
 
-Kernel 强制：
+只有 hard Grader 全部 `PASS`，Scenario 才 hard pass。`NOT_EVALUABLE` 和 `ERROR` 永远不能聚合为 pass；优化流程也不会把它们当作 Skill 缺陷交给 Optimizer。
 
-- candidate 包含 base hash、lineage id、round 和 Failure Card 引用；
-- Pack policy 只允许收紧全局预算；
-- Patch 通过路径、大小、Schema、关键约束和测试字面量泄漏扫描；
-- old/new 比较只改变 Subject snapshot；
-- validation/holdout 结果不能反馈给 Optimizer；
-- 未声明 `optimizer_policy` 的 Pack 为 eval-only，系统不得擅自生成修改。
+Manifest 的 Grader `params` 是默认参数，Scenario 的同 ID `grader_params` 可以覆盖它。Kernel 会额外注入受控的 `pack_root`、深冻结 `resources` 与 `hard`，而不会把这些内部路径和资源交给 Runtime。
 
-包含可执行脚本、二进制资源或外部 Agent 配置的自动优化需要新的受约束 Optimizer Adapter，不属于 D20。
+## 10. Skill 优化 Policy
 
-## 10. Conformance Test
+MVP 唯一优化器 ID 为 `skill_markdown_v1`。
+
+```yaml
+optimizer_policy:
+  adapter: skill_markdown_v1
+  patchable_components: [skill_instruction]
+  allowed_paths: [SKILL.md]
+  visible_splits: [dev]
+  beam_width: 1
+  max_rounds: 1
+  max_candidate_snapshots: 1
+  max_added_lines: 24
+  forbid_case_literals: true
+  params: {}
+```
+
+规则：
+
+1. 未声明 `optimizer_policy` 的 Pack 是 eval-only；
+2. `visible_splits` 当前必须且只能为 `[dev]`；
+3. 当前安全修改面是 `SKILL.md`；
+4. beam、round、snapshot 数必须为正数；
+5. candidate 必须携带匹配的 base hash 和 patch hash；
+6. 候选目录、真实内容 hash、allowed paths 和新增行数会再次校验；
+7. Optimizer 只接收 dev hard `FAIL`；
+8. validation 结果不反馈给 Optimizer；
+9. holdout 只对最终候选执行，失败后不继续迭代；
+10. Optimizer 必须声明受支持的 `proposal_contract`；
+11. `optimizer_policy.params` 只经 `PatchConstraints.metadata.optimizer_params` 交给 `candidate-patch-v1` Optimizer；
+12. 原 Subject 不会被覆盖。
+
+通过全部门禁后，Kernel 将冻结候选再次独立物化到 `selected-candidate`，重验 Subject hash，并在报告中记录交付路径和 hash。内置 Skill Adapter 写入不参与 Subject hash 的受控 candidate provenance marker，使交付副本可独立重跑；原 trial 目录后续变化不会改变交付副本。
+
+内置模型 Optimizer 声明 `aceval.optimizer/skill-markdown-generator-v1`，通过 `CommandModelClient` 返回完整替换版 `SKILL.md` 和 rationale；`FrozenCandidateOptimizer` 使用同一兼容契约加载预注册候选。`SkillOptimizerBridge` 再生成受 Kernel 校验的 `CandidatePatch`。自动修改 scripts、templates、assets、二进制、多文件 Subject 或 Agent 配置不属于当前内置实现。
+
+## 11. Split 与信息边界
+
+### 11.1 dev
+
+- baseline 与所有候选可多次运行；
+- hard `FAIL` 可形成 Optimizer evidence；
+- 允许决定下一轮候选。
+
+### 11.2 validation
+
+- 在 `optimize` 中只运行从 dev 晋级的候选；普通 `run/compare` 也可显式评测 validation；
+- 可以与 baseline 做 hard regression 对照；
+- 结果只用于晋级，不生成新候选。
+
+### 11.3 holdout
+
+- 普通 `run/compare` CLI 不提供该 split；
+- 仅 `optimize` 的最终候选进入；
+- 当前实现每个优化实验最多执行一个最终 holdout 批次；
+- 失败即停止，不反馈给 Optimizer。
+
+`pack test` 为了 conformance 只使用 FakeRuntime 运行已解析的 dev/validation；holdout 会被加载、校验并纳入 Pack hash，但不会在该命令中执行。当前所有 Pack/Runtime 位于同一 OS 用户环境，split 边界是 Orchestrator 协议边界，不是对恶意宿主进程的访问控制。
+
+## 12. Runtime capability
+
+Pack 只声明所需能力，不选择 Runtime：
+
+```yaml
+driver:
+  type: artifact_workspace
+  required_runtime_capabilities:
+    - fresh_session
+    - workspace_fixture
+    - artifact_output
+    - canonical_trace
+```
+
+Orchestrator 会合并 Manifest 与 Driver 的 capability 要求，并在执行前检查 Runtime。缺少任意 capability 时直接失败。
+
+当前 CLI 支持：
+
+- `reference`：内置 Reference Agent Runtime，使用 JSON stdin/stdout model bridge；
+- `fake`：模拟/conformance Runtime。
+
+EvalPack 不能声明模型命令、环境变量、API key 或任意 Runtime 初始化代码。
+
+内置 `reference` Runtime 只激活 UTF-8 `SKILL.md`，并提供 `list_files`、UTF-8 `read_file`、UTF-8 `write_file`。二进制文件、shell、network、browser 和 multimodal 任务需要新的受信 Runtime/工具实现及对应 capability；仅在 Pack 中声明一个新 capability 不会自动获得该能力。
+
+## 13. Conformance
+
+### 13.1 命令
 
 ```bash
-aceval pack init evalpacks/my-pack
 aceval pack lint evalpacks/security-review
 aceval pack test evalpacks/security-review --runtime fake
 ```
 
-所有 D20 Pack 必须通过：
+当前没有 `aceval pack init`。
 
-1. Manifest、Scenario、Oracle Schema 和引用校验；
-2. 未知 API version、Driver、Grader 或 Subject kind fail closed；
-3. `prepare -> execute -> collect -> cleanup` 可重复且 cleanup 幂等；
-4. Subject 原文件不变，运行目录看不到 Oracle/validation/holdout；
-5. 冻结 Observation Replay 得到一致的确定性 Grade；
-6. `not_evaluable` 和 `error` 不会被聚合为 pass；
-7. 越界路径、错误 base hash、超预算 Patch 被拒绝；
-8. Optimizer 只能读取 dev 证据；
-9. validation/holdout 的调用次数和信息返回符合协议；
-10. FakeRuntime 和 GoldenOptimizer 能验证状态机，不依赖模型恰好生成特定文本。
+### 13.2 `pack lint`
 
-## 11. D20 两个 Pack
+`pack lint` 检查：
 
-### 11.1 `security-review`
+- API version、kind 和字段结构；
+- Pack/Scenario/fixture/Oracle/schema 路径；
+- symlink 和 traversal；
+- duplicate/unknown Subject、Driver、Grader、Optimizer；
+- Scenario 的 Grader 引用和参数；
+- optimizer split 约束；
+- suite 是否已解析；
+- Pack/Suite hash。
 
-| 项 | 范围 |
+### 13.3 `pack test`
+
+`pack test` 使用 FakeRuntime 运行已解析的 dev/validation，并写 JSON/Markdown 报告。其目标是验证 prepare/execute/collect/cleanup、Grader 可执行性和报告链路；holdout 只由 `optimize` 的最终门禁执行。
+
+Pack Case 出现预期的 hard `FAIL` 不一定代表 conformance 失败；出现 `ERROR` 或 `NOT_EVALUABLE` 才说明生命周期或配置不可用。质量基线应通过 `run`、`compare` 或 `optimize` 单独解释。
+
+## 14. 两个 MVP Pack
+
+### 14.1 `security-review`
+
+| 项 | 当前内容 |
 |---|---|
 | Driver | `repository_workspace` |
-| Case | 6 dev + 2 validation + 2 holdout；另有一个不计入优化数据层的 infra sentinel |
-| Grader | Schema、record match、source reference、Trace、软 Judge |
-| Optimizer | 2 lineages、2 dev-only rounds、最多 4 snapshots |
-| 验收 | 过度修复候选被拒绝，精确候选通过一次 holdout，原 Skill 不覆盖 |
+| Case | 6 dev + 2 validation + 2 holdout |
+| 输出 | final-message JSON |
+| Grader | schema、record match、source reference、trace assert |
+| Optimizer | 2 beam、2 dev-only rounds、最多 4 snapshots |
 
-这是黑客松旗舰 Demo 和完整自迭代证据。
+### 14.2 `csv-summary-smoke`
 
-### 11.2 `csv-summary-smoke`
-
-任务：读取销售 CSV，生成 `summary.json`；初版 Skill 会错误处理金额、空地区或分组汇总。
-
-| 项 | 范围 |
+| 项 | 当前内容 |
 |---|---|
 | Driver | `artifact_workspace` |
-| Case | 2 dev + 1 validation，无 holdout |
-| Grader | `artifact_exists`、`json_schema`、`json_path`、`workspace_diff` |
-| Optimizer | 复用 `skill_markdown_v1`，1 lineage、1 round、1 snapshot |
-| 验收 | baseline 失败，候选修复 dev 且 validation 无硬回退 |
+| Case | 2 dev + 1 validation |
+| 输入/输出 | `input.csv` -> `summary.json` |
+| Grader | artifact exists、schema、JSON path、workspace diff |
+| Optimizer | 1 beam、1 round、1 snapshot |
 
-它不是第二个完整 Benchmark，也不进入现场主链。它只证明：在 Kernel API 冻结后，一个不同输入形态和 Driver 的 Skill 可以通过声明式 Pack 接入评测与最小自迭代，且不修改 Kernel。
+两个 Pack 的 FakeRuntime 行为只证明它们能复用公共生命周期和门禁。要形成真实 Benchmark，必须改用 Reference Runtime，并冻结模型 bridge、参数、预算和重复次数。
 
-## 12. 扩展成本验收
+## 15. 新 Pack 的扩展成本
 
-D15 在完整安全闭环通过后冻结 `EvalPack v1alpha1` 公共契约并记录 `kernel_contract_hash`。D16 才接入 CSV Pack，并记录：
+| 情况 | 当前所需工作 |
+|---|---|
+| 现有 Subject + Driver + Grader 足够 | 只新增 Manifest、Scenario、fixture、Oracle/schema |
+| 需要新确定性断言 | 编写并注册新 Grader，补单元与 conformance 测试 |
+| 需要新输入/状态生命周期 | 编写并注册新 Driver，补清理、路径和大小限制测试 |
+| 需要新 Agent 平台 | 实现 RuntimeAdapter，并在宿主/CLI 显式接线 |
+| 需要新的候选生成方式 | 实现并声明 `candidate-patch-v1`；只有完整 `SKILL.md` 生成器才使用 `skill-markdown-generator-v1` |
+| 需要多文件/二进制 Subject | 实现新的 Subject Adapter、Runtime 工具和受约束 Optimizer/candidate 校验 |
+| 需要 shell/network/browser/multimodal | 实现新的受信 Runtime/工具与 capability，并在宿主显式接线 |
 
-```text
-engineering_hours
-pack_loc
-test_data_loc
-kernel_files_touched
-kernel_loc_changed
-new_dependencies
-new_runtime_capabilities
-time_to_first_graded_run
-time_to_first_validated_candidate
-conformance_pass_rate
-```
+MVP 已证明第一种路径可以跨安全审查和 CSV artifact 两类任务复用。其余路径仍然需要代码开发；当前没有插件市场或无需改宿主的动态加载机制。
 
-D20 目标：
+因此，“任意 Skill 可扩展”的准确表述是：
 
-| 指标 | 目标 |
-|---|---:|
-| CSV Pack 接入期间 Kernel 文件改动 | 0 |
-| 自定义 Python | 0 行 |
-| 新 Runtime/依赖 | 0 |
-| 从空 Pack 到首个可评分 Run | <= 4 工时 |
-| 从空 Pack 到一次候选 validation | <= 8 工时 |
-| Pack conformance | 100% |
-| 同一 CLI、RunObservation、聚合和报告 | 100% 复用 |
+> 当 UTF-8 `SKILL.md`、固定文件工具和现有 Driver/Grader 足以表达输入、观察和成功标准时，新任务可以仅用声明式 Pack 接入；超出已有组件能力时，通过公共 Protocol 和明确的 proposal contract 增加受信组件。当前没有无需改宿主的动态加载，也不保证所有扩展都只增加 Pack 文件。
 
-以上是预注册目标，不是尚未测量就写入简历的结果。最终报告必须同时给出实际值和偏差原因。
+## 16. D40 规划（Planned）
 
-预计扩展成本按类型分层：
+1. 冻结 `v1alpha1` 行为测试并定义兼容性策略；
+2. 增加显式可信 Extension Loader，但 Manifest 仍不得自动 import 代码；
+3. 为多文件 Skill bundle、二进制 artifact 和 shell/network/browser/multimodal 工具定义受信组件与 capability，并为非单 entrypoint 文本 Candidate 定义显式 `verify_candidate_patch` 类扩展契约；
+4. 增加外部 suite resolver 和 evaluator-only 数据读取边界；
+5. 为导入 Session 日志定义 Observation completeness；
+6. 增加 AgentSubject/FixedAgentTarget capability contract；
+7. 增加 Run manifest、Trace/artifact store 和 Replay；
+8. 经人工校准后增加结构化 LLM Judge；
+9. 增加受限 Worker 和更强的 holdout 隔离；
+10. 建立 12–20 Case 的真实 Reference Runtime Benchmark。
 
-| 类型 | 所需工作 | 目标成本 |
-|---|---|---:|
-| 内置 Driver + 内置 Grader | Manifest、Case、fixture、Oracle | 2–8 工时，另计领域金标准备 |
-| 已有 Driver + 新 Grader | 可信 Grader 扩展、golden test、校准 | 2–5 天 |
-| 新 fixture/state 生命周期 | 新 Driver、清理、Oracle、隔离测试 | 3–7 天 |
-| 新 Runtime 或视觉/视频模态 | Adapter、环境、稳定性和 Judge 校准 | 1–2 周以上 |
+在这些能力落地前，不应声称 EvalPack 已支持任意 Python 插件、外部隐藏集解析、Agent 配置优化、HTML 报告或跨平台等价评测。
 
-如果接入 CSV Pack 必须修改 Orchestrator、状态机、存储协议或报告器，D20 的通用 Kernel 验收失败，不能用“可扩展架构”代替实际证据。
+## 17. MVP 明确不做
 
-`csv-summary-smoke` 依赖 Runtime 能读取输入 fixture 并收集文件 artifact。D2 必须用真实公司 API 验证该能力；若不支持，应在公共 Schema 冻结前将第二 Pack 改为输出 final-message JSON 的 smoke 任务，并同步改名和验收，不能把缺失 artifact 记为通过。
-
-## 13. D20 明确不做
-
-- 任意 Python Pack 自动加载和不可信插件沙箱；
-- 通用 DAG、插件市场、依赖解析和远程 Pack 安装；
+- Manifest 自动加载任意 Python 或 shell；
+- 通用 DAG、插件市场和远程 Pack 安装；
 - 自动从自然语言生成并直接信任 Oracle；
-- XLSX、视觉渲染、外部 SaaS state Driver；
+- 自动修改脚本、测试、Case、Oracle 或 Grader；
+- 使用内置组件自动修改 `scripts/`、`templates/`、`assets/`、二进制或多文件 Subject；
+- 使用内置 Reference Runtime 执行 shell、network、browser 或 multimodal 工具；
 - Agent 配置自动优化；
-- 一个总分适配所有任务。
+- LLM-only 总分覆盖所有任务；
+- 将 FakeRuntime 通过率描述为真实 Agent 质量；
+- 将同一 OS 用户下的 split 目录描述为安全沙箱。
 
-用户可以提供少量 Case 和诉求，由系统生成 Manifest、断言和 rubric 草稿，但在进入 validation/holdout 前必须由用户确认成功标准。
+用户可以借助模型生成 Manifest、Case 或 rubric 草稿，但进入 validation/holdout 前必须由用户确认成功标准并冻结 Pack。

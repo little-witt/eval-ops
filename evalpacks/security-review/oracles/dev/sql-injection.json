@@ -1,0 +1,6 @@
+{
+  "expected_records": [
+    {"rule_id": "sql-injection", "file": "sql_injection.py", "line": 2}
+  ],
+  "forbidden_records": []
+}

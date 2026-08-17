@@ -1,0 +1,8 @@
+{
+  "kind": "skill",
+  "id": "csv-summary-skill-candidate",
+  "version": "candidate",
+  "metadata": {
+    "variant": "candidate"
+  }
+}

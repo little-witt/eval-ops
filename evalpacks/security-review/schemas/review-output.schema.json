@@ -1,0 +1,25 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://aceval.dev/schemas/security-review-output-v1.json",
+  "type": "object",
+  "required": ["findings"],
+  "additionalProperties": false,
+  "properties": {
+    "findings": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["rule_id", "severity", "file", "line", "evidence", "recommendation"],
+        "additionalProperties": false,
+        "properties": {
+          "rule_id": {"type": "string", "minLength": 1},
+          "severity": {"type": "string", "enum": ["low", "medium", "high", "critical"]},
+          "file": {"type": "string", "minLength": 1},
+          "line": {"type": "integer", "minimum": 1},
+          "evidence": {"type": "string", "minLength": 1},
+          "recommendation": {"type": "string", "minLength": 1}
+        }
+      }
+    }
+  }
+}

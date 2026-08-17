@@ -1,0 +1,81 @@
+{
+  "api_version": "aceval.dev/v1alpha1",
+  "kind": "EvalPack",
+  "metadata": {
+    "name": "security-review",
+    "version": "0.1.0",
+    "description": "Deterministic security-review Skill benchmark with dev, validation, and holdout splits."
+  },
+  "subject_contract": {
+    "kinds": ["skill"],
+    "adapter": "skill_markdown_v1",
+    "entrypoint": "SKILL.md"
+  },
+  "driver": {
+    "type": "repository_workspace",
+    "required_runtime_capabilities": [
+      "fresh_session",
+      "workspace_fixture",
+      "canonical_trace",
+      "skill_activation"
+    ]
+  },
+  "suite": {
+    "dev": "scenarios/dev.yaml",
+    "validation_ref": "scenarios/validation.yaml",
+    "holdout_ref": "scenarios/holdout.yaml"
+  },
+  "graders": [
+    {
+      "id": "output-schema",
+      "type": "json_schema",
+      "hard": true,
+      "params": {
+        "schema_ref": "schemas/review-output.schema.json"
+      }
+    },
+    {
+      "id": "expected-records",
+      "type": "record_match",
+      "hard": true,
+      "params": {
+        "collection_path": "$.findings",
+        "expected_key": "expected_records",
+        "forbidden_key": "forbidden_records",
+        "match_fields": ["rule_id", "file", "line"]
+      }
+    },
+    {
+      "id": "source-grounding",
+      "type": "source_reference",
+      "hard": true,
+      "params": {
+        "collection_path": "$.findings",
+        "file_field": "file",
+        "line_field": "line",
+        "allow_empty": true
+      }
+    },
+    {
+      "id": "file-inspection-trace",
+      "type": "trace_assert",
+      "hard": true,
+      "params": {
+        "required_tools": ["read_file"],
+        "min_calls": 1,
+        "max_calls": 4
+      }
+    }
+  ],
+  "optimizer_policy": {
+    "adapter": "skill_markdown_v1",
+    "patchable_components": ["skill_instruction"],
+    "allowed_paths": ["SKILL.md"],
+    "visible_splits": ["dev"],
+    "beam_width": 2,
+    "max_rounds": 2,
+    "max_candidate_snapshots": 4,
+    "max_added_lines": 30,
+    "forbid_case_literals": true
+  }
+}

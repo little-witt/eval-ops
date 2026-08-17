@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "aceval"
+version = "0.1.0"
+description = "A reference-runtime EvalOps kernel for evaluating and iterating Agent Skills."
+readme = "README.md"
+requires-python = ">=3.9"
+license = "MIT"
+authors = [{name = "little-witt"}]
+dependencies = []
+
+[project.optional-dependencies]
+yaml = ["PyYAML>=6.0"]
+dev = ["pytest>=7.4"]
+
+[project.scripts]
+aceval = "aceval.cli:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]

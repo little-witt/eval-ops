@@ -1,0 +1,37 @@
+{
+  "scenarios": [
+    {
+      "id": "decimal-rounding-validation",
+      "split": "validation",
+      "prompt": "Read input.csv and create summary.json using the Skill contract. Do not modify input.csv.",
+      "fixtures": ["fixtures/validation/decimal_rounding/input.csv"],
+      "oracle_ref": "oracles/validation/decimal-rounding.json",
+      "grader_ids": ["summary-artifact", "output-schema", "currency", "total-revenue", "order-count", "region-totals", "workspace-policy"],
+      "grader_params": {},
+      "timeout_seconds": 30,
+      "tags": ["csv", "artifact", "decimal-rounding", "validation"],
+      "metadata": {
+        "artifact_paths": ["summary.json"],
+        "fake_runtime": {
+          "default": {
+            "final_output": {"currency": "USD", "total_revenue": 10.305, "orders": 3, "by_region": {"East": 0.30000000000000004, "West": 10.005}},
+            "artifacts": {"summary.json": {"currency": "USD", "total_revenue": 10.305, "orders": 3, "by_region": {"East": 0.30000000000000004, "West": 10.005}}},
+            "trace": [{"kind": "tool_call", "name": "read_file", "payload": {"path": "input.csv"}}, {"kind": "tool_call", "name": "write_file", "payload": {"path": "summary.json"}}]
+          },
+          "variants": {
+            "baseline": {
+              "final_output": {"currency": "USD", "total_revenue": 10.305, "orders": 3, "by_region": {"East": 0.30000000000000004, "West": 10.005}},
+              "artifacts": {"summary.json": {"currency": "USD", "total_revenue": 10.305, "orders": 3, "by_region": {"East": 0.30000000000000004, "West": 10.005}}},
+              "trace": [{"kind": "tool_call", "name": "read_file", "payload": {"path": "input.csv"}}, {"kind": "tool_call", "name": "write_file", "payload": {"path": "summary.json"}}]
+            },
+            "candidate": {
+              "final_output": {"currency": "USD", "total_revenue": 10.31, "orders": 3, "by_region": {"East": 0.3, "West": 10.01}},
+              "artifacts": {"summary.json": {"currency": "USD", "total_revenue": 10.31, "orders": 3, "by_region": {"East": 0.3, "West": 10.01}}},
+              "trace": [{"kind": "tool_call", "name": "read_file", "payload": {"path": "input.csv"}}, {"kind": "tool_call", "name": "write_file", "payload": {"path": "summary.json"}}]
+            }
+          }
+        }
+      }
+    }
+  ]
+}

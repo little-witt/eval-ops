@@ -1,0 +1,6 @@
+{
+  "expected_records": [],
+  "forbidden_records": [
+    {"rule_id": "command-injection", "file": "safe_command.py", "line": 9}
+  ]
+}

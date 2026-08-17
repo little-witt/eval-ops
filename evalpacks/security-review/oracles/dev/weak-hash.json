@@ -1,0 +1,6 @@
+{
+  "expected_records": [
+    {"rule_id": "weak-password-hash", "file": "weak_hash.py", "line": 5}
+  ],
+  "forbidden_records": []
+}

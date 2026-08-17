@@ -1,0 +1,160 @@
+{
+  "scenarios": [
+    {
+      "id": "command-injection-dev",
+      "split": "dev",
+      "prompt": "Review the provided Python file for security issues. Return only JSON matching the declared review schema.",
+      "fixtures": ["fixtures/dev/command_injection.py"],
+      "oracle_ref": "oracles/dev/command-injection.json",
+      "grader_ids": ["output-schema", "expected-records", "source-grounding", "file-inspection-trace"],
+      "grader_params": {},
+      "timeout_seconds": 30,
+      "tags": ["python", "command-injection", "positive"],
+      "metadata": {
+        "fake_runtime": {
+          "default": {
+            "final_output": {"findings": []},
+            "trace": [{"kind": "tool_call", "name": "read_file", "payload": {"path": "command_injection.py"}}]
+          },
+          "variants": {
+            "baseline": {
+              "final_output": {"findings": []},
+              "trace": [{"kind": "tool_call", "name": "read_file", "payload": {"path": "command_injection.py"}}]
+            },
+            "candidate": {
+              "final_output": {"findings": [{"rule_id": "command-injection", "severity": "high", "file": "command_injection.py", "line": 5, "evidence": "Untrusted host is interpolated into a command executed with shell=True.", "recommendation": "Pass a validated host as an argument list with shell disabled."}]},
+              "trace": [{"kind": "tool_call", "name": "read_file", "payload": {"path": "command_injection.py"}}]
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "path-traversal-dev",
+      "split": "dev",
+      "prompt": "Review the provided Python file for security issues. Return only JSON matching the declared review schema.",
+      "fixtures": ["fixtures/dev/path_traversal.py"],
+      "oracle_ref": "oracles/dev/path-traversal.json",
+      "grader_ids": ["output-schema", "expected-records", "source-grounding", "file-inspection-trace"],
+      "grader_params": {},
+      "timeout_seconds": 30,
+      "tags": ["python", "path-traversal", "positive"],
+      "metadata": {
+        "fake_runtime": {
+          "default": {"final_output": {"findings": []}, "trace": [{"kind": "tool_call", "name": "read_file", "payload": {"path": "path_traversal.py"}}]},
+          "variants": {
+            "baseline": {"final_output": {"findings": []}, "trace": [{"kind": "tool_call", "name": "read_file", "payload": {"path": "path_traversal.py"}}]},
+            "candidate": {
+              "final_output": {"findings": [{"rule_id": "path-traversal", "severity": "high", "file": "path_traversal.py", "line": 5, "evidence": "A caller-controlled name is joined to the file root without canonicalization or containment checks.", "recommendation": "Resolve the path and reject values outside the intended root."}]},
+              "trace": [{"kind": "tool_call", "name": "read_file", "payload": {"path": "path_traversal.py"}}]
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "sql-injection-dev",
+      "split": "dev",
+      "prompt": "Review the provided Python file for security issues. Return only JSON matching the declared review schema.",
+      "fixtures": ["fixtures/dev/sql_injection.py"],
+      "oracle_ref": "oracles/dev/sql-injection.json",
+      "grader_ids": ["output-schema", "expected-records", "source-grounding", "file-inspection-trace"],
+      "grader_params": {},
+      "timeout_seconds": 30,
+      "tags": ["python", "sql-injection", "positive"],
+      "metadata": {
+        "fake_runtime": {
+          "default": {
+            "final_output": {"findings": [{"rule_id": "sql-injection", "severity": "high", "file": "sql_injection.py", "line": 2, "evidence": "The user id is concatenated directly into a SQL statement.", "recommendation": "Use a parameterized query."}]},
+            "trace": [{"kind": "tool_call", "name": "read_file", "payload": {"path": "sql_injection.py"}}]
+          },
+          "variants": {
+            "baseline": {
+              "final_output": {"findings": [{"rule_id": "sql-injection", "severity": "high", "file": "sql_injection.py", "line": 2, "evidence": "The user id is concatenated directly into a SQL statement.", "recommendation": "Use a parameterized query."}]},
+              "trace": [{"kind": "tool_call", "name": "read_file", "payload": {"path": "sql_injection.py"}}]
+            },
+            "candidate": {
+              "final_output": {"findings": [{"rule_id": "sql-injection", "severity": "high", "file": "sql_injection.py", "line": 2, "evidence": "The user id is concatenated directly into a SQL statement.", "recommendation": "Use a parameterized query."}]},
+              "trace": [{"kind": "tool_call", "name": "read_file", "payload": {"path": "sql_injection.py"}}]
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "weak-password-hash-dev",
+      "split": "dev",
+      "prompt": "Review the provided Python file for security issues. Return only JSON matching the declared review schema.",
+      "fixtures": ["fixtures/dev/weak_hash.py"],
+      "oracle_ref": "oracles/dev/weak-hash.json",
+      "grader_ids": ["output-schema", "expected-records", "source-grounding", "file-inspection-trace"],
+      "grader_params": {},
+      "timeout_seconds": 30,
+      "tags": ["python", "weak-password-hash", "positive"],
+      "metadata": {
+        "fake_runtime": {
+          "default": {"final_output": {"findings": []}, "trace": [{"kind": "tool_call", "name": "read_file", "payload": {"path": "weak_hash.py"}}]},
+          "variants": {
+            "baseline": {"final_output": {"findings": []}, "trace": [{"kind": "tool_call", "name": "read_file", "payload": {"path": "weak_hash.py"}}]},
+            "candidate": {
+              "final_output": {"findings": [{"rule_id": "weak-password-hash", "severity": "high", "file": "weak_hash.py", "line": 5, "evidence": "Passwords are hashed with fast, unsalted MD5.", "recommendation": "Use a password KDF such as Argon2id, scrypt, or bcrypt with per-user salts."}]},
+              "trace": [{"kind": "tool_call", "name": "read_file", "payload": {"path": "weak_hash.py"}}]
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "sensitive-log-dev",
+      "split": "dev",
+      "prompt": "Review the provided Python file for security issues. Return only JSON matching the declared review schema.",
+      "fixtures": ["fixtures/dev/sensitive_log.py"],
+      "oracle_ref": "oracles/dev/sensitive-log.json",
+      "grader_ids": ["output-schema", "expected-records", "source-grounding", "file-inspection-trace"],
+      "grader_params": {},
+      "timeout_seconds": 30,
+      "tags": ["python", "sensitive-data-log", "positive"],
+      "metadata": {
+        "fake_runtime": {
+          "default": {"final_output": {"findings": []}, "trace": [{"kind": "tool_call", "name": "read_file", "payload": {"path": "sensitive_log.py"}}]},
+          "variants": {
+            "baseline": {"final_output": {"findings": []}, "trace": [{"kind": "tool_call", "name": "read_file", "payload": {"path": "sensitive_log.py"}}]},
+            "candidate": {
+              "final_output": {"findings": [{"rule_id": "sensitive-data-log", "severity": "medium", "file": "sensitive_log.py", "line": 5, "evidence": "The authentication token is written verbatim to application logs.", "recommendation": "Do not log credentials; log a non-sensitive request identifier instead."}]},
+              "trace": [{"kind": "tool_call", "name": "read_file", "payload": {"path": "sensitive_log.py"}}]
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "parameterized-sql-dev",
+      "split": "dev",
+      "prompt": "Review the provided Python file for security issues. Return only JSON matching the declared review schema.",
+      "fixtures": ["fixtures/dev/safe_sql.py"],
+      "oracle_ref": "oracles/dev/safe-sql.json",
+      "grader_ids": ["output-schema", "expected-records", "source-grounding", "file-inspection-trace"],
+      "grader_params": {},
+      "timeout_seconds": 30,
+      "tags": ["python", "sql", "negative"],
+      "metadata": {
+        "fake_runtime": {
+          "default": {
+            "final_output": {"findings": [{"rule_id": "sql-injection", "severity": "medium", "file": "safe_sql.py", "line": 2, "evidence": "The function executes SQL using user input.", "recommendation": "Avoid user input in SQL."}]},
+            "trace": [{"kind": "tool_call", "name": "read_file", "payload": {"path": "safe_sql.py"}}]
+          },
+          "variants": {
+            "baseline": {
+              "final_output": {"findings": [{"rule_id": "sql-injection", "severity": "medium", "file": "safe_sql.py", "line": 2, "evidence": "The function executes SQL using user input.", "recommendation": "Avoid user input in SQL."}]},
+              "trace": [{"kind": "tool_call", "name": "read_file", "payload": {"path": "safe_sql.py"}}]
+            },
+            "candidate": {
+              "final_output": {"findings": []},
+              "trace": [{"kind": "tool_call", "name": "read_file", "payload": {"path": "safe_sql.py"}}]
+            }
+          }
+        }
+      }
+    }
+  ]
+}

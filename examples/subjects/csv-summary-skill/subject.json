@@ -1,0 +1,8 @@
+{
+  "kind": "skill",
+  "id": "csv-summary-skill-baseline",
+  "version": "baseline",
+  "metadata": {
+    "variant": "baseline"
+  }
+}

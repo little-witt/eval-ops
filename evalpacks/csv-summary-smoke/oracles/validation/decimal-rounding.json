@@ -1,0 +1,11 @@
+{
+  "checks": {
+    "currency": "USD",
+    "total_revenue": 10.31,
+    "orders": 3,
+    "by_region": {
+      "East": 0.3,
+      "West": 10.01
+    }
+  }
+}

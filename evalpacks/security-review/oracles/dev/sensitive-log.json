@@ -1,0 +1,6 @@
+{
+  "expected_records": [
+    {"rule_id": "sensitive-data-log", "file": "sensitive_log.py", "line": 5}
+  ],
+  "forbidden_records": []
+}

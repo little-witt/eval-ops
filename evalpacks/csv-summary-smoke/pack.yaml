@@ -1,0 +1,111 @@
+{
+  "api_version": "aceval.dev/v1alpha1",
+  "kind": "EvalPack",
+  "metadata": {
+    "name": "csv-summary-smoke",
+    "version": "0.1.0",
+    "description": "Small artifact-producing benchmark for sales CSV summary Skills."
+  },
+  "subject_contract": {
+    "kinds": ["skill"],
+    "adapter": "skill_markdown_v1",
+    "entrypoint": "SKILL.md"
+  },
+  "driver": {
+    "type": "artifact_workspace",
+    "required_runtime_capabilities": [
+      "fresh_session",
+      "workspace_fixture",
+      "artifact_output",
+      "canonical_trace",
+      "skill_activation"
+    ]
+  },
+  "suite": {
+    "dev": "scenarios/dev.yaml",
+    "validation_ref": "scenarios/validation.yaml"
+  },
+  "graders": [
+    {
+      "id": "summary-artifact",
+      "type": "artifact_exists",
+      "hard": true,
+      "params": {
+        "path": "summary.json",
+        "min_bytes": 2,
+        "max_bytes": 4096,
+        "mime": "application/json"
+      }
+    },
+    {
+      "id": "output-schema",
+      "type": "json_schema",
+      "hard": true,
+      "params": {
+        "artifact_path": "summary.json",
+        "schema_ref": "schemas/summary.schema.json"
+      }
+    },
+    {
+      "id": "currency",
+      "type": "json_path",
+      "hard": true,
+      "params": {
+        "artifact_path": "summary.json",
+        "path": "$.currency",
+        "equals_from_oracle": "$.checks.currency"
+      }
+    },
+    {
+      "id": "total-revenue",
+      "type": "json_path",
+      "hard": true,
+      "params": {
+        "artifact_path": "summary.json",
+        "path": "$.total_revenue",
+        "equals_from_oracle": "$.checks.total_revenue"
+      }
+    },
+    {
+      "id": "order-count",
+      "type": "json_path",
+      "hard": true,
+      "params": {
+        "artifact_path": "summary.json",
+        "path": "$.orders",
+        "equals_from_oracle": "$.checks.orders"
+      }
+    },
+    {
+      "id": "region-totals",
+      "type": "json_path",
+      "hard": true,
+      "params": {
+        "artifact_path": "summary.json",
+        "path": "$.by_region",
+        "equals_from_oracle": "$.checks.by_region"
+      }
+    },
+    {
+      "id": "workspace-policy",
+      "type": "workspace_diff",
+      "hard": true,
+      "params": {
+        "allowed_paths": ["summary.json"],
+        "forbidden_paths": ["input.csv"],
+        "required_paths": ["summary.json"]
+      }
+    }
+  ],
+  "optimizer_policy": {
+    "adapter": "skill_markdown_v1",
+    "patchable_components": ["skill_instruction"],
+    "allowed_paths": ["SKILL.md"],
+    "visible_splits": ["dev"],
+    "beam_width": 1,
+    "max_rounds": 1,
+    "max_candidate_snapshots": 1,
+    "max_added_lines": 24,
+    "forbid_case_literals": true
+  }
+}

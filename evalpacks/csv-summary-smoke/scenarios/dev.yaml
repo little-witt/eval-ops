@@ -1,0 +1,70 @@
+{
+  "scenarios": [
+    {
+      "id": "currency-values-dev",
+      "split": "dev",
+      "prompt": "Read input.csv and create summary.json using the Skill contract. Do not modify input.csv.",
+      "fixtures": ["fixtures/dev/currency_values/input.csv"],
+      "oracle_ref": "oracles/dev/currency-values.json",
+      "grader_ids": ["summary-artifact", "output-schema", "currency", "total-revenue", "order-count", "region-totals", "workspace-policy"],
+      "grader_params": {},
+      "timeout_seconds": 30,
+      "tags": ["csv", "artifact", "currency-symbol"],
+      "metadata": {
+        "artifact_paths": ["summary.json"],
+        "fake_runtime": {
+          "default": {
+            "final_output": {"currency": "USD", "total_revenue": 0.0, "orders": 3, "by_region": {"North": 0.0, "South": 0.0}},
+            "artifacts": {"summary.json": {"currency": "USD", "total_revenue": 0.0, "orders": 3, "by_region": {"North": 0.0, "South": 0.0}}},
+            "trace": [{"kind": "tool_call", "name": "read_file", "payload": {"path": "input.csv"}}, {"kind": "tool_call", "name": "write_file", "payload": {"path": "summary.json"}}]
+          },
+          "variants": {
+            "baseline": {
+              "final_output": {"currency": "USD", "total_revenue": 0.0, "orders": 3, "by_region": {"North": 0.0, "South": 0.0}},
+              "artifacts": {"summary.json": {"currency": "USD", "total_revenue": 0.0, "orders": 3, "by_region": {"North": 0.0, "South": 0.0}}},
+              "trace": [{"kind": "tool_call", "name": "read_file", "payload": {"path": "input.csv"}}, {"kind": "tool_call", "name": "write_file", "payload": {"path": "summary.json"}}]
+            },
+            "candidate": {
+              "final_output": {"currency": "USD", "total_revenue": 31.75, "orders": 3, "by_region": {"North": 11.75, "South": 20.0}},
+              "artifacts": {"summary.json": {"currency": "USD", "total_revenue": 31.75, "orders": 3, "by_region": {"North": 11.75, "South": 20.0}}},
+              "trace": [{"kind": "tool_call", "name": "read_file", "payload": {"path": "input.csv"}}, {"kind": "tool_call", "name": "write_file", "payload": {"path": "summary.json"}}]
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "blank-region-refund-dev",
+      "split": "dev",
+      "prompt": "Read input.csv and create summary.json using the Skill contract. Do not modify input.csv.",
+      "fixtures": ["fixtures/dev/blank_region_refund/input.csv"],
+      "oracle_ref": "oracles/dev/blank-region-refund.json",
+      "grader_ids": ["summary-artifact", "output-schema", "currency", "total-revenue", "order-count", "region-totals", "workspace-policy"],
+      "grader_params": {},
+      "timeout_seconds": 30,
+      "tags": ["csv", "artifact", "blank-region", "refund"],
+      "metadata": {
+        "artifact_paths": ["summary.json"],
+        "fake_runtime": {
+          "default": {
+            "final_output": {"currency": "USD", "total_revenue": 7.25, "orders": 2, "by_region": {"West": 7.25}},
+            "artifacts": {"summary.json": {"currency": "USD", "total_revenue": 7.25, "orders": 2, "by_region": {"West": 7.25}}},
+            "trace": [{"kind": "tool_call", "name": "read_file", "payload": {"path": "input.csv"}}, {"kind": "tool_call", "name": "write_file", "payload": {"path": "summary.json"}}]
+          },
+          "variants": {
+            "baseline": {
+              "final_output": {"currency": "USD", "total_revenue": 7.25, "orders": 2, "by_region": {"West": 7.25}},
+              "artifacts": {"summary.json": {"currency": "USD", "total_revenue": 7.25, "orders": 2, "by_region": {"West": 7.25}}},
+              "trace": [{"kind": "tool_call", "name": "read_file", "payload": {"path": "input.csv"}}, {"kind": "tool_call", "name": "write_file", "payload": {"path": "summary.json"}}]
+            },
+            "candidate": {
+              "final_output": {"currency": "USD", "total_revenue": 10.25, "orders": 3, "by_region": {"Unknown": 5.0, "West": 5.25}},
+              "artifacts": {"summary.json": {"currency": "USD", "total_revenue": 10.25, "orders": 3, "by_region": {"Unknown": 5.0, "West": 5.25}}},
+              "trace": [{"kind": "tool_call", "name": "read_file", "payload": {"path": "input.csv"}}, {"kind": "tool_call", "name": "write_file", "payload": {"path": "summary.json"}}]
+            }
+          }
+        }
+      }
+    }
+  ]
+}

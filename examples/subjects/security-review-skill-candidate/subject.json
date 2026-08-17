@@ -1,0 +1,8 @@
+{
+  "kind": "skill",
+  "id": "security-review-skill-candidate",
+  "version": "candidate",
+  "metadata": {
+    "variant": "candidate"
+  }
+}

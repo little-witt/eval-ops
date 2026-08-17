@@ -1,0 +1,16 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://aceval.dev/schemas/csv-summary-v1.json",
+  "type": "object",
+  "required": ["currency", "total_revenue", "orders", "by_region"],
+  "additionalProperties": false,
+  "properties": {
+    "currency": {"const": "USD"},
+    "total_revenue": {"type": "number"},
+    "orders": {"type": "integer", "minimum": 0},
+    "by_region": {
+      "type": "object",
+      "additionalProperties": {"type": "number"}
+    }
+  }
+}

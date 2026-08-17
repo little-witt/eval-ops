@@ -1,0 +1,6 @@
+{
+  "expected_records": [
+    {"rule_id": "path-traversal", "file": "path_traversal.py", "line": 5}
+  ],
+  "forbidden_records": []
+}

@@ -1,0 +1,56 @@
+{
+  "scenarios": [
+    {
+      "id": "allowlisted-command-validation",
+      "split": "validation",
+      "prompt": "Review the provided Python file for security issues. Return only JSON matching the declared review schema.",
+      "fixtures": ["fixtures/validation/safe_command.py"],
+      "oracle_ref": "oracles/validation/safe-command.json",
+      "grader_ids": ["output-schema", "expected-records", "source-grounding", "file-inspection-trace"],
+      "grader_params": {},
+      "timeout_seconds": 30,
+      "tags": ["python", "command-execution", "negative"],
+      "metadata": {
+        "fake_runtime": {
+          "default": {
+            "final_output": {"findings": [{"rule_id": "command-injection", "severity": "medium", "file": "safe_command.py", "line": 9, "evidence": "A service name reaches subprocess.run.", "recommendation": "Do not execute commands from user input."}]},
+            "trace": [{"kind": "tool_call", "name": "read_file", "payload": {"path": "safe_command.py"}}]
+          },
+          "variants": {
+            "baseline": {
+              "final_output": {"findings": [{"rule_id": "command-injection", "severity": "medium", "file": "safe_command.py", "line": 9, "evidence": "A service name reaches subprocess.run.", "recommendation": "Do not execute commands from user input."}]},
+              "trace": [{"kind": "tool_call", "name": "read_file", "payload": {"path": "safe_command.py"}}]
+            },
+            "candidate": {
+              "final_output": {"findings": []},
+              "trace": [{"kind": "tool_call", "name": "read_file", "payload": {"path": "safe_command.py"}}]
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "decoded-path-validation",
+      "split": "validation",
+      "prompt": "Review the provided Python file for security issues. Return only JSON matching the declared review schema.",
+      "fixtures": ["fixtures/validation/decoded_path.py"],
+      "oracle_ref": "oracles/validation/decoded-path.json",
+      "grader_ids": ["output-schema", "expected-records", "source-grounding", "file-inspection-trace"],
+      "grader_params": {},
+      "timeout_seconds": 30,
+      "tags": ["python", "path-traversal", "positive", "unseen-syntax"],
+      "metadata": {
+        "fake_runtime": {
+          "default": {"final_output": {"findings": []}, "trace": [{"kind": "tool_call", "name": "read_file", "payload": {"path": "decoded_path.py"}}]},
+          "variants": {
+            "baseline": {"final_output": {"findings": []}, "trace": [{"kind": "tool_call", "name": "read_file", "payload": {"path": "decoded_path.py"}}]},
+            "candidate": {
+              "final_output": {"findings": [{"rule_id": "path-traversal", "severity": "high", "file": "decoded_path.py", "line": 7, "evidence": "A decoded name is appended to the root and read without containment validation.", "recommendation": "Resolve the candidate and verify it remains under ROOT before reading."}]},
+              "trace": [{"kind": "tool_call", "name": "read_file", "payload": {"path": "decoded_path.py"}}]
+            }
+          }
+        }
+      }
+    }
+  ]
+}

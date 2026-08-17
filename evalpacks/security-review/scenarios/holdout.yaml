@@ -1,0 +1,56 @@
+{
+  "scenarios": [
+    {
+      "id": "popen-command-holdout",
+      "split": "holdout",
+      "prompt": "Review the provided Python file for security issues. Return only JSON matching the declared review schema.",
+      "fixtures": ["fixtures/holdout/popen_command.py"],
+      "oracle_ref": "oracles/holdout/popen-command.json",
+      "grader_ids": ["output-schema", "expected-records", "source-grounding", "file-inspection-trace"],
+      "grader_params": {},
+      "timeout_seconds": 30,
+      "tags": ["python", "command-injection", "positive", "holdout"],
+      "metadata": {
+        "fake_runtime": {
+          "default": {"final_output": {"findings": []}, "trace": [{"kind": "tool_call", "name": "read_file", "payload": {"path": "popen_command.py"}}]},
+          "variants": {
+            "baseline": {"final_output": {"findings": []}, "trace": [{"kind": "tool_call", "name": "read_file", "payload": {"path": "popen_command.py"}}]},
+            "candidate": {
+              "final_output": {"findings": [{"rule_id": "command-injection", "severity": "high", "file": "popen_command.py", "line": 5, "evidence": "The archive name is concatenated into a shell command passed to os.popen.", "recommendation": "Invoke tar with a fixed argument vector and validate the archive name."}]},
+              "trace": [{"kind": "tool_call", "name": "read_file", "payload": {"path": "popen_command.py"}}]
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "contained-path-holdout",
+      "split": "holdout",
+      "prompt": "Review the provided Python file for security issues. Return only JSON matching the declared review schema.",
+      "fixtures": ["fixtures/holdout/safe_path.py"],
+      "oracle_ref": "oracles/holdout/safe-path.json",
+      "grader_ids": ["output-schema", "expected-records", "source-grounding", "file-inspection-trace"],
+      "grader_params": {},
+      "timeout_seconds": 30,
+      "tags": ["python", "path-traversal", "negative", "holdout"],
+      "metadata": {
+        "fake_runtime": {
+          "default": {
+            "final_output": {"findings": [{"rule_id": "path-traversal", "severity": "medium", "file": "safe_path.py", "line": 6, "evidence": "A user name is combined with a file root.", "recommendation": "Reject path separators."}]},
+            "trace": [{"kind": "tool_call", "name": "read_file", "payload": {"path": "safe_path.py"}}]
+          },
+          "variants": {
+            "baseline": {
+              "final_output": {"findings": [{"rule_id": "path-traversal", "severity": "medium", "file": "safe_path.py", "line": 6, "evidence": "A user name is combined with a file root.", "recommendation": "Reject path separators."}]},
+              "trace": [{"kind": "tool_call", "name": "read_file", "payload": {"path": "safe_path.py"}}]
+            },
+            "candidate": {
+              "final_output": {"findings": []},
+              "trace": [{"kind": "tool_call", "name": "read_file", "payload": {"path": "safe_path.py"}}]
+            }
+          }
+        }
+      }
+    }
+  ]
+}
