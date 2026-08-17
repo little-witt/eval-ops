@@ -424,13 +424,29 @@ Optimizer 使用同一 JSON envelope，但 `tools` 为空；其最终 `content` 
 
 ## 40 天求职作品路线
 
-1. 将公司 Session 的 ImportedRunBundle 接入完整 EvalRun、Replay 和 Case 反生成；
-2. 增加更完整的故障分类、证据等级和经人工标注校准的结构化 Judge；
-3. 将两个 Pack 扩展为分层 Benchmark，重复运行并报告置信区间、flake、成本和延迟；
-4. 增加 capability-gated `AgentSubject` 或 `FixedAgentTarget`，验证 Kernel 对完整 Agent 的迁移；
-5. 为多文件/二进制 Subject 与 shell/network/browser/multimodal 工具增加显式受信组件和 capability；
-6. 建设 Evaluator Replay CI Gate、受限 Worker、作品文档和消融实验；
-7. 增加 Profile 驱动的公司 Agent Runtime Adapter，同时保持核心不依赖任一公司 API。
+D20 已经前置实现 repair/tune、Pack Builder/冻结锁、Doctor、公司 Profile、Session Import 和 paired gates。D40 不再以继续堆底层功能为主，而改为：
+
+1. 完成真实模型 repair/tune Benchmark 和重复执行统计；
+2. 抽取 CLI/Web 共用的 Application Service；
+3. 建设本地 Skill Doctor Console 和静态 HTML 报告；
+4. 将公司 Execute/Session 接成 `CompanyRuntimeAdapter`、EvalRun 和 Replay；
+5. 建设 EvalPack Quality Gate，衡量 Oracle 完整度、覆盖率、区分能力、泄漏和 flake；
+6. 完成一个经人工确认 Rubric 的主观 Judge Pilot；
+7. 用 `FixedAgentTarget`、CI、教程、演示视频和真实消融实验完成求职作品化。
+
+完整排期、完成定义和优先级见 [ROADMAP.md](./ROADMAP.md)。可视化产品与技术方案见 [VISUAL_CONSOLE_DESIGN.md](./VISUAL_CONSOLE_DESIGN.md)。
+
+## 可视化操作与结果平台
+
+项目将建设本地单用户 `Skill Doctor Console`，而不是当前阶段的多租户 SaaS。Console 重点覆盖：
+
+- EvalPack 生成、校准和冻结确认；
+- baseline -> repair/tune -> validation -> holdout 实时进度；
+- Case、Grader evidence 和 Trace 时间线；
+- baseline/candidate 指标、Skill diff 和候选谱系；
+- 公司 Session 导入、completeness 和 Replay。
+
+实施顺序为：真实实验数据 -> 静态 HTML -> Application Service -> Read-only Console -> Operational Console。UI 不重新实现 Gate、Objective 或 Pack 生命周期语义。
 
 ## 开发与测试
 
@@ -444,6 +460,8 @@ git diff --check
 
 ## 仓库文档
 
+- [ROADMAP.md](./ROADMAP.md)：更新后的 D20/D40 路线图、已前置能力、待办与完成定义；
+- [VISUAL_CONSOLE_DESIGN.md](./VISUAL_CONSOLE_DESIGN.md)：本地可视化操作台的产品、架构、API、安全和分阶段方案；
 - [EVALPACK_SPEC.md](./EVALPACK_SPEC.md)：EvalPack 边界、Manifest 和公共 Protocol；
 - [TECHNICAL_DESIGN.md](./TECHNICAL_DESIGN.md)：完整技术方案、状态机和验收标准；
 - [SKILL_CATEGORY_AND_ITERATION_DESIGN.md](./SKILL_CATEGORY_AND_ITERATION_DESIGN.md)：Skill 分类、输入输出契约和自迭代设计；

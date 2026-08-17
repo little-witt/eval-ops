@@ -706,6 +706,8 @@ MVP 已证明第一种路径可以跨安全审查和 CSV artifact 两类任务�
 
 ## 16. D40 规划（Planned）
 
+本节只保留 EvalPack 相关 backlog；跨模块的最新路线图、优先级和完成定义见 [ROADMAP.md](./ROADMAP.md)，可视化 Pack 校准方案见 [VISUAL_CONSOLE_DESIGN.md](./VISUAL_CONSOLE_DESIGN.md)。
+
 1. 扩大 `v1alpha1` legacy repair 与 `v1alpha2` repair/tune 的兼容性测试；
 2. 增加显式可信 Extension Loader，但 Manifest 仍不得自动 import 代码；
 3. 为多文件 Skill bundle、二进制 artifact 和 shell/network/browser/multimodal 工具定义受信组件与 capability，并为非单 entrypoint 文本 Candidate 定义显式 `verify_candidate_patch` 类扩展契约；

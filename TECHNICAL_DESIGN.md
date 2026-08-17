@@ -424,31 +424,31 @@ MVP 的工程验收是：
 
 ## 14. D40 规划（Planned）
 
-D40 的目标是把当前 Skill MVP 扩展为可用于求职展示的 Agent EvalOps 项目，同时保持 D20 契约可兼容。
+D20 已前置完成 repair/tune、Pack Builder/冻结锁、Doctor、公司 Profile/Session Import 和 paired gates。D40 的目标因此调整为：用真实证据、现实 Agent 接入、EvalPack 校准质量和本地可视化操作台，把 Kernel 变成可用于求职展示的 Agent EvalOps 产品，同时保持 D20 契约兼容。
+
+跨模块的详细排期、待办和完成定义以 [ROADMAP.md](./ROADMAP.md) 为准；Console 设计以 [VISUAL_CONSOLE_DESIGN.md](./VISUAL_CONSOLE_DESIGN.md) 为准。
 
 ### 14.1 优先能力
 
-1. **真实实验基线**：选择一个模型 bridge，冻结模型/参数/环境，重复关键 Case 并报告波动、成本和失败率。
-2. **Session Replay 接线**：把已实现的 `ImportedRunBundle` 和 completeness flags 接入 EvalRun、Grader Replay 与 Case 反生成。
-3. **Agent target 契约**：Runtime 能原子加载并回报 Agent 配置 hash 时支持 `AgentSubject`；否则只注册 `FixedAgentTarget`，不做虚假的版本归因。
-4. **持久化与 Replay**：增加版本化 Run manifest、Trace/artifact store 和确定性 Replay；具体存储可以从文件 manifest 起步，是否使用 SQLite 由实现验证决定。
-5. **受限 Worker**：加强进程身份、目录权限、资源限制和 evaluator-only 数据边界；容器化是条件能力。
-6. **受信能力扩展**：为多文件 Skill bundle、二进制 artifact，以及 shell/network/browser/multimodal 需求定义新的 Subject/Runtime/Optimizer、候选验证扩展契约和 capability，不扩大内置 Runtime 的隐含权限。
-7. **可信扩展入口**：由操作者显式注册新 Subject/Driver/Grader/Runtime/Optimizer，不允许 Pack Manifest 静默执行代码。
-8. **Benchmark 与消融**：12–20 个冻结 Case，关键 Case 至少 3 次；完成 output-only 与 trace-aware 诊断对照。
-9. **Judge 校准**：只有完成人工标注与 agreement 测量后，才加入结构化 LLM Judge。
-10. **CI**：零模型执行 Pack lint、单元测试和确定性 Replay；在线模型评测单独受凭证和预算控制。
+1. **真实实验基线**：冻结模型、参数、环境和预算，完成真实 repair/tune、多次采样和消融。
+2. **Application Service**：从 argparse handler 抽取 CLI/Web/API 共用的应用服务与实验事件协议。
+3. **可视化 Console**：先静态 HTML，再实现本地 Read-only/Operational Console；UI 只调用 Service，不复制 Kernel 语义。
+4. **公司 Agent 闭环**：CompanyRuntimeAdapter、Imported Session -> EvalRun、Grader Replay 与 Case 草稿。
+5. **EvalPack Quality Gate**：Oracle 完整度、覆盖率、区分能力、split 泄漏、evaluator flake 和冻结 blocker。
+6. **统计与 Judge Pilot**：p50/p95、方差、置信区间、flake，以及经人工确认 Rubric 的结构化 Judge。
+7. **Agent 迁移证据**：优先实现 `FixedAgentTarget`，不在 Runtime 无法回报实际配置 hash 时声称 AgentSubject 优化。
+8. **持久化与 CI**：Run index、detailed report、Trace/artifact 引用、Replay 和 CI Gate。
 
 ### 14.2 D21–D40 建议节奏
 
 | 阶段 | 交付 |
 |---|---|
-| D21–D24 | 冻结 MVP Schema，补 Reference Runtime 真实 E2E、重复执行和能力矩阵 |
-| D25–D28 | Imported Session -> EvalRun/Replay、公司 RuntimeAdapter 原型 |
-| D29–D31 | AgentSubject/FixedAgentTarget 边界、可信扩展入口 |
-| D32–D34 | Run manifest、Trace/artifact 持久化、Replay、受限 Worker |
-| D35–D37 | 12–20 Case Benchmark、统计聚合和 Trace-aware 消融 |
-| D38–D40 | CI、教程、演示视频、限制说明和版本化 Release |
+| D21–D24 | 真实 repair/tune Benchmark、detailed report、静态 HTML |
+| D25–D28 | Application Service、Run index、事件协议、Console 骨架 |
+| D29–D32 | CompanyRuntimeAdapter、Session EvalRun/Replay、Trace 页面 |
+| D33–D35 | EvalPack Quality Gate 和 Pack 校准/冻结页面 |
+| D36–D38 | 重复执行统计、flake、主观 Judge Pilot |
+| D39–D40 | FixedAgentTarget、CI、教程、视频、消融和版本化 Release |
 
 ### 14.3 D40 仍不承诺
 
