@@ -401,7 +401,37 @@ def _run_summary(run: EvalRun) -> Dict[str, Any]:
         "splits": [_split_summary(run, split) for split in _ordered_splits(run)],
     }
     summary.update(_measurement_summary(run))
+    summary["diagnostics"] = _diagnostic_summary(run)
     return summary
+
+
+def _diagnostic_summary(run: EvalRun) -> Mapping[str, Any]:
+    cards = []
+    decisions = {}
+    for scenario in run.scenarios:
+        report = getattr(scenario, "diagnostic_report", None)
+        if report is None:
+            continue
+        decision = report.patch_decision.value
+        decisions[decision] = decisions.get(decision, 0) + 1
+        cards.extend(report.failure_cards)
+    categories = {}
+    components = {}
+    for card in cards:
+        categories[card.category] = categories.get(card.category, 0) + 1
+        components[card.observed_component] = (
+            components.get(card.observed_component, 0) + 1
+        )
+    return {
+        "scenario_decisions": decisions,
+        "failure_card_count": len(cards),
+        "patchable_card_count": sum(card.skill_patch_authorized for card in cards),
+        "blocked_card_count": sum(
+            not card.skill_patch_authorized for card in cards
+        ),
+        "categories": categories,
+        "observed_components": components,
+    }
 
 
 def _paired_summary(baseline: EvalRun, candidate: EvalRun) -> Dict[str, Any]:
@@ -777,6 +807,33 @@ def _render_run(run: EvalRun) -> str:
         "## Measurements",
         "",
         _measurement_table(summary),
+        "",
+        "## Failure Attribution",
+        "",
+        _table(
+            ("Scenario", "Patch decision", "Failure cards", "Blocked reason"),
+            tuple(
+                (
+                    item.scenario_id,
+                    (
+                        item.diagnostic_report.patch_decision.value
+                        if item.diagnostic_report is not None
+                        else "not_run"
+                    ),
+                    (
+                        len(item.diagnostic_report.failure_cards)
+                        if item.diagnostic_report is not None
+                        else 0
+                    ),
+                    (
+                        _joined(item.diagnostic_report.blocked_reasons)
+                        if item.diagnostic_report is not None
+                        else "—"
+                    ),
+                )
+                for item in run.scenarios
+            ),
+        ),
         ]
     )
     _append_limitations(lines, _limitations(run))

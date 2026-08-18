@@ -13,6 +13,7 @@ from __future__ import annotations
 import base64
 import copy
 from dataclasses import dataclass
+import hashlib
 import json
 import os
 from pathlib import Path, PurePath, PureWindowsPath
@@ -30,6 +31,11 @@ from .pack_lifecycle import (
     CALIBRATION_STATUSES,
     PACK_LOCK_FILE,
     write_pack_lock,
+)
+from .pack_quality import (
+    TEST_DESIGN_API_VERSION,
+    PackQualityError,
+    validate_pack_quality_for_freeze,
 )
 from .registry import build_builtin_registry
 
@@ -109,6 +115,7 @@ def generate_evalpack(
     version: Optional[str] = None,
     description: Optional[str] = None,
     source_root: Optional[Union[str, Path]] = None,
+    test_design: Optional[Mapping[str, Any]] = None,
     registry: Optional[Any] = None,
 ) -> PackBuildResult:
     """Generate a deterministic, structurally validated draft EvalPack.
@@ -155,6 +162,7 @@ def generate_evalpack(
         )
     ).strip()
     normalized_objective = _normalize_objective(objective)
+    normalized_test_design = _normalize_test_design(test_design)
     objective_origin = "explicit" if normalized_objective is not None else "none"
     if normalized_objective is None:
         normalized_objective = infer_objective_from_goal(normalized_goal)
@@ -187,6 +195,7 @@ def generate_evalpack(
             fixture_root,
             requested_type,
             objective_origin,
+            normalized_test_design,
         )
         active_registry = registry if registry is not None else build_builtin_registry()
         EvalPackLoader(active_registry).load(temporary)
@@ -240,6 +249,10 @@ def freeze_evalpack(
     current_pack = loader.load(root)
     pack_type = _generated_pack_type(document)
     _validate_calibration_readiness(current_pack, pack_type)
+    try:
+        validate_pack_quality_for_freeze(current_pack)
+    except PackQualityError as exc:
+        raise PackCalibrationError(str(exc)) from exc
     if status == CALIBRATION_FROZEN:
         return PackBuildResult(
             root=root,
@@ -454,6 +467,56 @@ def _normalize_objective(value: Optional[Mapping[str, Any]]) -> Optional[Dict[st
     return dict(primitive)
 
 
+def _normalize_test_design(
+    value: Optional[Mapping[str, Any]],
+) -> Optional[Dict[str, Any]]:
+    if value is None:
+        return None
+    if not isinstance(value, Mapping):
+        raise PackBuilderError("test_design must be an object")
+    required = {
+        "capability_graph",
+        "test_plan",
+        "coverage_target",
+        "generation_provenance",
+    }
+    missing = required.difference(value)
+    unknown = set(value).difference(required)
+    if missing:
+        raise PackBuilderError(
+            "test_design is missing field(s): %s"
+            % ", ".join(sorted(missing))
+        )
+    if unknown:
+        raise PackBuilderError(
+            "test_design contains unsupported field(s): %s"
+            % ", ".join(sorted(str(item) for item in unknown))
+        )
+    normalized = {}
+    for key in sorted(required):
+        item = as_primitive(value[key])
+        if not isinstance(item, Mapping):
+            raise PackBuilderError("test_design.%s must be an object" % key)
+        normalized[key] = dict(item)
+    plan_payload = json.dumps(
+        normalized["test_plan"],
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+    normalized["generation_provenance"].setdefault(
+        "test_plan_hash", "sha256:" + hashlib.sha256(plan_payload).hexdigest()
+    )
+    try:
+        json.dumps(normalized, allow_nan=False)
+    except (TypeError, ValueError) as exc:
+        raise PackBuilderError(
+            "test_design must contain finite JSON values: %s" % exc
+        ) from exc
+    return normalized
+
+
 def infer_objective_from_goal(goal: str) -> Optional[Dict[str, Any]]:
     """Infer one conservative efficiency objective from a natural-language goal.
 
@@ -515,12 +578,30 @@ def _build_pack_tree(
     source_root: Path,
     requested_type: str,
     objective_origin: str,
+    test_design: Optional[Mapping[str, Any]],
 ) -> None:
     for directory in ("scenarios", "oracles", "fixtures", "schemas"):
         (root / directory).mkdir(parents=True, exist_ok=True)
 
     schema_path, schema = _schema_for(pack_type)
     _write_json(root / schema_path, schema)
+    if test_design is not None:
+        _write_json(
+            root / "design" / "capability-graph.json",
+            test_design["capability_graph"],
+        )
+        _write_json(
+            root / "design" / "test-plan.json",
+            test_design["test_plan"],
+        )
+        _write_json(
+            root / "design" / "coverage-target.json",
+            test_design["coverage_target"],
+        )
+        _write_json(
+            root / "design" / "generation-provenance.json",
+            test_design["generation_provenance"],
+        )
     manifest = _manifest_for(
         cases,
         pack_type,
@@ -532,6 +613,7 @@ def _build_pack_tree(
         schema_path,
         requested_type,
         objective_origin,
+        test_design,
     )
     by_split = {split: [] for split in _SPLITS}  # type: Dict[str, List[Dict[str, Any]]]
     for case in cases:
@@ -565,6 +647,7 @@ def _manifest_for(
     schema_path: str,
     requested_type: str,
     objective_origin: str,
+    test_design: Optional[Mapping[str, Any]],
 ) -> Dict[str, Any]:
     suites = {item.split for item in cases}
     suite = {"dev": "scenarios/dev.yaml"}  # type: Dict[str, Any]
@@ -589,29 +672,41 @@ def _manifest_for(
     if objective is not None:
         optimizer["objective"] = dict(objective)
 
+    metadata = {
+        "name": name,
+        "version": version,
+        "description": description,
+        "labels": {
+            "aceval.generated": "true",
+            "aceval.pack_type": pack_type,
+            "aceval.requested_type": requested_type,
+        },
+        "calibration_status": CALIBRATION_DRAFT,
+        "generated_by": GENERATOR_ID,
+        "generation_warning": (
+            "Generated evaluators are untrusted until cases and oracles are "
+            "reviewed and the Pack is explicitly frozen."
+        ),
+        "template_fallback": (
+            requested_type if requested_type != pack_type else None
+        ),
+        "objective_origin": objective_origin,
+    }
+    if test_design is not None:
+        graph = test_design["capability_graph"]
+        metadata["test_design"] = {
+            "api_version": TEST_DESIGN_API_VERSION,
+            "source_subject_hash": graph.get("subject_hash"),
+            "capability_graph_ref": "design/capability-graph.json",
+            "test_plan_ref": "design/test-plan.json",
+            "coverage_target_ref": "design/coverage-target.json",
+            "generation_provenance_ref": "design/generation-provenance.json",
+        }
+
     return {
         "api_version": LATEST_API_VERSION,
         "kind": "EvalPack",
-        "metadata": {
-            "name": name,
-            "version": version,
-            "description": description,
-            "labels": {
-                "aceval.generated": "true",
-                "aceval.pack_type": pack_type,
-                "aceval.requested_type": requested_type,
-            },
-            "calibration_status": CALIBRATION_DRAFT,
-            "generated_by": GENERATOR_ID,
-            "generation_warning": (
-                "Generated evaluators are untrusted until cases and oracles are "
-                "reviewed and the Pack is explicitly frozen."
-            ),
-            "template_fallback": (
-                requested_type if requested_type != pack_type else None
-            ),
-            "objective_origin": objective_origin,
-        },
+        "metadata": metadata,
         "subject_contract": {
             "kinds": ["skill"],
             "adapter": "skill_markdown_v1",

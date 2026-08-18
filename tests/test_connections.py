@@ -20,6 +20,7 @@ from aceval.connections import (
     SessionLogProvider,
     extract_json_path,
     import_session_log,
+    load_imported_run_bundle,
     load_session_log,
 )
 from aceval.contracts import RuntimeResult
@@ -353,6 +354,43 @@ class SessionLogImportTest(unittest.TestCase):
     def test_completeness_contract_rejects_unknown_channels(self):
         with self.assertRaisesRegex(ValueError, "unsupported observation"):
             ObservationCompleteness(observed=frozenset({"screenshots"}))
+
+    def test_loads_normalized_imported_bundle_for_offline_diagnosis(self):
+        document = {
+            "schema_version": "aceval.imported-session/v1",
+            "session_id": "session-offline",
+            "profile_name": "company-agent",
+            "source": "company_session_log",
+            "completeness": {
+                "expected": ["output", "trace", "usage"],
+                "observed": ["output", "trace", "usage"],
+            },
+            "observation": {
+                "output": "failed",
+                "trace": [
+                    {
+                        "kind": "tool_result",
+                        "seq": 1,
+                        "tool": "process_exec",
+                        "payload": {"ok": False, "exit_code": 127},
+                    }
+                ],
+                "artifacts": {},
+                "pre_state": {},
+                "post_state": {},
+                "error": None,
+                "usage": {"total_tokens": 3},
+                "metadata": {},
+            },
+        }
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir, "imported.json")
+            path.write_text(json.dumps(document), encoding="utf-8")
+            bundle = load_imported_run_bundle(path)
+
+        self.assertEqual("session-offline", bundle.session_id)
+        self.assertEqual(127, bundle.trace[0].payload["exit_code"])
+        self.assertTrue(bundle.completeness.complete)
 
 
 class HTTPSessionLogProviderTest(unittest.TestCase):

@@ -1,13 +1,13 @@
 # 复杂 Skill 测试规划与故障归因技术方案
 
 > 项目：Skill Doctor / Agent Capability EvalOps  
-> 状态：Planned，作为现有 MVP 的下一阶段设计基线  
+> 状态：D20 核心已实现；D40 扩展项在文中单独标注
 > 日期：2026-08-18  
 > 适用范围：D20 黑客松增强版与 D40 求职作品
 
 ## 1. 方案结论
 
-现有 EvalOps Kernel、Reference Agent Runtime、EvalPack 生命周期和 repair/tune 门禁继续作为可信执行底座。在它们之前和之后分别新增两个独立能力面：
+现有 EvalOps Kernel、Reference Agent Runtime、EvalPack 生命周期和 repair/tune 门禁继续作为可信执行底座。D20 已在它们之前和之后分别实现两个独立能力面：
 
 1. **Test Intelligence Plane**：分析复杂 Skill，建立能力图，规划测试义务，生成 Case 草稿并给出可审计覆盖报告；
 2. **Failure Intelligence Plane**：从 Observation、Trace、Grader、Runtime 和外部 Session 证据中识别故障边界，生成 Failure Card，并决定是否允许修改 Skill。
@@ -42,19 +42,19 @@ Skill + 少量种子 Case + Goal + Runtime Profile
             repair / tune / external action
 ```
 
-这不是把一个大模型直接放在循环中“自己出题、自己判卷、自己修改答案”。模型负责语义理解、候选测试设计和解释；确定性代码负责结构校验、来源追踪、能力检查、覆盖计算、冻结锁、证据门控和修改授权。
+这不是把一个大模型直接放在循环中“自己出题、自己判卷、自己修改答案”。当前 D20 Planner 和 Failure Attribution 均为确定性实现：代码负责 source-grounded inventory、风险 Requirement、Case 选择、覆盖计算、冻结锁、故障规则和修改授权。D40 可以增加模型辅助语义理解、候选测试设计和解释，但其输出仍只能是草稿，不能绕过确定性门禁。
 
 ## 2. 当前能力与新增能力边界
 
-| 能力 | 当前 MVP | 本方案目标 |
+| 能力 | D20 当前实现 | D40 后续增强 |
 |---|---|---|
-| Case 到 EvalPack | 编译用户已提供的 Case | 从 Skill 和种子 Case 生成有来源依据的测试计划与 Case 草稿 |
-| 复杂 Skill 分析 | 不读取 `SKILL.md` 规划测试 | 生成 Capability Graph、风险和 Runtime capability gap |
-| 路径覆盖 | 无显式模型 | 声明能力、分支、风险、工具和状态转换覆盖 |
-| EvalPack 可信度 | 生命周期、内容锁、基础校准 | Oracle 可信级别、mutation score、已知好坏样本区分能力 |
-| 非 Skill 失败 | `_has_non_skill_failure()` 布尔阻断 | 证据化分类、置信度、补救面和 Failure Card |
-| CLI 问题 | Reference Runtime 不执行任意 CLI | 导入日志可诊断；后续增加受控 argv Process Tool |
-| 公司 Session | 已归一化为 `ImportedRunBundle` | Replay、重评分、诊断和 Case 草稿生成 |
+| Case 到 EvalPack | `plan -> pack generate --plan`，保留种子 Case 并生成 bounded Case 草稿 | seed expansion、metamorphic fixture 和 Session mining |
+| 复杂 Skill 分析 | 确定性读取冻结 `SKILL.md`，生成 source-grounded Capability Graph、ambiguity 和 Runtime gap | 模型辅助语义层、多文件 Skill bundle 和外部契约 |
+| 路径覆盖 | planned、executable、oracle-ready、显式 observed requirement coverage | EvalRun 自动动态工具/状态覆盖和统计聚合 |
+| EvalPack 可信度 | design Sidecar、Oracle trust、critical coverage、Runtime/split/hash Freeze Gate | mutation、known-good/bad、evaluator flake 和 revision diff |
+| 非 Skill 失败 | Diagnostic Signal、Failure Card、证据等级和 Patch Authorization 已接入 Orchestrator | 重复归因、探针和标注 Benchmark |
+| CLI 问题 | Imported Session 可离线分类常见 CLI/tool 错误；Reference Runtime 不执行任意 CLI | 受控 argv Process Tool 和只读健康探针 |
+| 公司 Session | fetch/import、completeness 和离线 `session diagnose` | CompanyRuntimeAdapter、EvalRun/Grader Replay 和 Case mining |
 
 任何新增能力都不得改变以下规则：
 
@@ -78,12 +78,12 @@ Skill + 少量种子 Case + Goal + Runtime Profile
 系统执行：
 
 ```text
-1. 扫描 Skill 和引用资源
+1. 冻结并扫描 UTF-8 SKILL.md
 2. 提取能力、步骤、分支、工具、状态和副作用
 3. 对照 Runtime Profile 标出可执行与不可执行路径
 4. 将种子 Case 映射到测试义务
-5. 在预算内补充边界、异常和高风险 Case
-6. 为每个 Case 选择 Oracle 策略并标出可信级别
+5. 在预算内补充 requirement-synthesis Case 草稿
+6. 为每个 Case 标出 Oracle 策略、可信级别和待确认项
 7. 展示 Test Plan、Coverage Matrix 和 Freeze Blockers
 8. 用户只确认未解决的语义问题
 9. 校准并冻结 EvalPack
@@ -92,7 +92,7 @@ Skill + 少量种子 Case + Goal + Runtime Profile
 12. 经过 validation/holdout 输出候选和报告
 ```
 
-系统不要求普通用户理解 Driver、Grader ID 或 Manifest。高级用户仍可编辑生成的 Pack 和测试计划。
+对应 CLI 已实现为 `aceval plan`、`aceval pack generate --plan`、`aceval pack quality` 和 `aceval doctor --auto-plan`。系统不要求普通用户手写 Driver、Grader ID 或 Manifest；若生成草稿缺少语义 Oracle，或存在 critical/runtime blocker，会停在 calibration，用户仍需确认会改变成功标准的内容。
 
 ### 3.2 三种自动化结果
 
@@ -106,12 +106,12 @@ Skill + 少量种子 Case + Goal + Runtime Profile
 
 ## 4. Test Intelligence Plane
 
-### 4.1 输入与扫描范围
+### 4.1 输入与扫描范围（Implemented）
 
-D20 支持：
+D20 当前支持：
 
 - UTF-8 `SKILL.md`；
-- 当前 `skill_markdown_v1` 可见的 `subject.json`；
+- `skill_markdown_v1` 冻结的可选 `subject.json` 参与 Subject hash，但当前不从中提取语义能力；
 - 用户提供的种子 Case、Goal 和 Runtime Profile；
 - `SKILL.md` 中可定位的标题、段落和行号。
 
@@ -121,21 +121,23 @@ D40 扩展：
 - 工具 Schema、CLI help/version 输出和外部 API 契约；
 - 公司 Session 中实际出现过的能力与工具路径。
 
-扫描分为两层：
+扫描分为两层，其中第一层已实现，第二层属于 D40：
 
-1. **Deterministic Inventory**：文件、引用、显式工具名、输入输出格式、限制和 source span；
-2. **Semantic Extraction**：模型将自然语言说明转换为结构化能力和测试义务。
+1. **Deterministic Inventory（Implemented）**：标题、显式工具名、输入输出、前置条件、步骤、条件、状态/副作用/风险文本和 source span；
+2. **Semantic Extraction（D40）**：模型辅助把更隐含的自然语言说明转换为结构化能力草稿。
 
 模型输出必须通过 Schema、ID、引用存在性和 source span 校验。无法对应原文的节点必须标记 `inferred=true`，不能冒充 Skill 明确声明。
 
-### 4.2 Capability Graph
+### 4.2 Capability Graph（Implemented）
 
-建议新增版本化契约 `aceval.skill-analysis/v1`：
+当前版本化契约为 `aceval.skill-analysis/v1`：
 
 ```json
 {
   "api_version": "aceval.skill-analysis/v1",
-  "subject_hash": "sha256:...",
+  "subject_hash": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+  "source_path": "SKILL.md",
+  "sections": [],
   "capabilities": [
     {
       "id": "cap.validate-input",
@@ -145,7 +147,7 @@ D40 扩展：
           "path": "SKILL.md",
           "start_line": 18,
           "end_line": 25,
-          "quote_sha256": "sha256:...",
+          "quote_sha256": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
           "binding": "explicit"
         }
       ],
@@ -153,7 +155,19 @@ D40 扩展：
       "outputs": ["validation result"],
       "preconditions": ["input exists"],
       "steps": ["list files", "read input", "validate rows"],
-      "branches": ["valid", "malformed", "empty"],
+      "branches": [
+        {
+          "id": "cap.validate-input.branch.malformed",
+          "condition": "输入 malformed 时明确失败",
+          "source_ref": {
+            "path": "SKILL.md",
+            "start_line": 23,
+            "end_line": 23,
+            "quote_sha256": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+            "binding": "explicit"
+          }
+        }
+      ],
       "tools": ["list_files", "read_file"],
       "state_transitions": [],
       "side_effects": [],
@@ -161,7 +175,8 @@ D40 扩展：
       "inferred": false
     }
   ],
-  "runtime_gaps": []
+  "tools": [],
+  "ambiguities": []
 }
 ```
 
@@ -180,7 +195,7 @@ D40 扩展：
 
 图结构只描述“需要被测试的行为”，不进入 EvalOps Kernel 的运行状态机。
 
-### 4.3 Test Requirement 与 Test Plan
+### 4.3 Test Requirement 与 Test Plan（Implemented）
 
 Capability Graph 会展开为可追踪的测试义务：
 
@@ -235,7 +250,7 @@ Capability Graph 会展开为可追踪的测试义务：
 - 已有种子 Case 优先复用；
 - 低价值组合进入 uncovered risk，不强行生成。
 
-Planner 第一版采用可解释的风险加权 set-cover，而不是让模型自由决定最终测试集：
+Planner 已采用可解释的风险加权 greedy set-cover，而不是让模型自由决定最终测试集：
 
 1. 为每个 requirement 计算 `risk_weight = severity × likelihood × side_effect × goal_relevance`；
 2. 先把种子 Case 映射到它能覆盖的 requirement 集合；
@@ -247,13 +262,13 @@ Planner 第一版采用可解释的风险加权 set-cover，而不是让模型�
 
 ### 4.4 Case 生成策略
 
-Case Generator 不只生成 Prompt，还需要同时生成 fixture、预期观察和 Grader 草稿。建议支持五类策略：
+当前 `compile_case_drafts()` 会保留种子 Case 的 fixture 和精确期望值，并为选中的未覆盖 Requirement 生成 Prompt、expected observables、来源、Runtime 要求和 Oracle trust 元数据；它不会自动发明 fixture 内容或语义金标。当前已实现 `Requirement synthesis`，其余策略属于 D40：
 
-1. **Seed expansion**：对种子 Case 做边界、缺失值、顺序和规模变换；
-2. **Requirement synthesis**：根据未覆盖测试义务生成新 Case；
-3. **Metamorphic testing**：构造输入变换和应保持/改变的关系，例如行顺序变化不应改变聚合结果；
-4. **Fault injection draft**：声明工具超时、错误码、畸形结果等故障场景；仅在 Runtime 支持注入时可执行；
-5. **Session mining**：从真实 Session 中抽取匿名化失败模式和 Case 草稿。
+1. **Requirement synthesis（Implemented）**：根据未覆盖且当前 Runtime 可执行的测试义务生成 bounded Case 草稿；
+2. **Seed expansion（D40）**：对种子 Case 做边界、缺失值、顺序和规模变换；
+3. **Metamorphic testing（D40）**：构造输入变换和应保持/改变的关系，例如行顺序变化不应改变聚合结果；
+4. **Fault injection draft（D40）**：声明工具超时、错误码、畸形结果等故障场景；仅在 Runtime 支持注入时可执行；
+5. **Session mining（D40）**：从真实 Session 中抽取匿名化失败模式和 Case 草稿。
 
 每个生成 Case 必须记录：
 
@@ -291,26 +306,22 @@ Case Generator 不只生成 Prompt，还需要同时生成 fixture、预期观�
 
 模型 Judge 只能作为经过校准的补充评分器，不能覆盖确定性 hard Grader，也不能单独授权修改 Skill。
 
-### 4.6 Coverage Matrix
+### 4.6 Coverage Matrix（Implemented core）
 
 “全路径覆盖”对开放自然语言输入和概率型 Agent 不可证明。本项目提供有边界、可追踪的覆盖声明：
 
 ```text
-Declared capability coverage
-Branch/risk requirement coverage
-Tool coverage
-State-transition coverage
-Oracle-ready coverage
+Requirement planned coverage
 Runtime-executable coverage
-Dynamic exercised coverage
-Mutation detection score
+Oracle-ready coverage
+Explicit observed coverage
 ```
 
 每个测试义务经过以下状态：
 
 ```text
-declared -> planned -> case_generated -> oracle_ready
-         -> executable -> calibrated -> exercised
+requirement -> planned case -> executable case -> oracle-ready case
+                                      -> explicit observed evidence
 ```
 
 覆盖率按维度分别报告，不用一个模糊总分掩盖缺口。若需要摘要分数，使用风险权重：
@@ -322,16 +333,17 @@ weighted coverage = covered requirement weight / total requirement weight
 报告必须同时给出分子、分母、范围、未覆盖项和原因。例如：
 
 ```text
-能力覆盖             8 / 9
-高风险分支覆盖       6 / 7
-Runtime 可执行路径   12 / 16
-已校准 Oracle        10 / 12
-动态执行             9 / 10
+Planned Requirement  8 / 9
+Runtime 可执行路径   7 / 9
+Oracle-ready         5 / 9
+显式 observed        3 / 9
 
 未覆盖：
 - browser 登录路径：Reference Runtime 不支持 browser
 - CLI 部分成功后的回滚：Skill 未声明预期行为
 ```
+
+当前 `CoverageReport` 同时给出普通计数和风险权重分子/分母。`observed_case_ids` 或 `observed_requirement_ids` 必须由调用方显式提供，且不能把未知或不可执行 Case 标为 observed；EvalRun 完成后自动提取 tool/state transition 并回写 Coverage 尚属 D40。
 
 ### 4.7 Runtime Capability Gap
 
@@ -375,27 +387,27 @@ Feasibility Router 按顺序检查：
 
 无法映射到现有组件的 requirement 保留为 `blocked_capability`，而不是降级成没有有效 Oracle 的 generic Case。
 
-### 4.8 Pack Quality Gate
+### 4.8 Pack Quality Gate（Implemented core）
 
-自动生成 Pack 后增加独立质量门禁：
+自动生成 Pack 后已经增加独立质量门禁。当前检查：
 
-1. 所有 capability、requirement、Case 和 Grader 引用可解析；
-2. hard Oracle 必须达到允许的可信级别；
-3. Case 不重复，split 无明显 fixture/字面量泄漏；
-4. baseline 能产生完整 Observation；
-5. 已知好样本应通过，已知坏样本应失败；
-6. 重复执行时 evaluator flake 在阈值内；
-7. Runtime capability gap 已确认或排除；
-8. coverage blocker 为零或得到显式豁免。
+1. design Sidecar 引用、源 Subject hash、Test Plan hash 和 provenance 一致；
+2. Capability、Requirement 和 Case cross-reference 可解析；
+3. hard Oracle 达到允许的可信级别并存在实际断言；
+4. generated Case 不进入 sealed holdout，Case family 不跨 split；
+5. critical Requirement 有映射 Case，且 Runtime gap/不可执行 Case 不被隐藏；
+6. Planner Freeze Blocker 为零。
 
-为了验证生成 Pack 是否真的有区分能力，引入 **Mutation Calibration**：
+`pack quality` 会输出 blocker/warning 以及 planned、critical、Oracle-ready coverage；`pack freeze --approve` 会再次执行同一门禁。没有 `metadata.test_design` 的手写/legacy Pack 保持原生命周期兼容行为。
+
+D40 高级 Quality Gate 再增加 known-good/known-bad、evaluator flake、Pack revision diff 和 **Mutation Calibration**：
 
 - 基于能力图生成少量隔离的已知坏 Skill 变体，例如删除关键步骤、使用错误工具、跳过输入校验；
 - 这些 mutant 只用于校准 EvalPack，不进入生产候选；
 - `mutation score = 被测试捕获的有效 mutant / 可执行有效 mutant`；
 - 未捕获 mutant 会转化为新的覆盖缺口，而不是直接修改 Grader 以“刷分”。
 
-模型可以提出 mutation 草稿，但有效性、修改范围和预期缺陷必须由确定性规则或人工确认。
+当前实现不会自动生成 mutant。`generation-provenance.json` 中如存在 `mutation_score`，Quality Gate 只验证它是 `[0, 1]` 内的有限数；不能把该字段描述为已完成 mutation calibration。未来模型可以提出 mutation 草稿，但有效性、修改范围和预期缺陷必须由确定性规则或人工确认。
 
 ### 4.9 EvalPack 与 Skill 的双循环隔离
 
@@ -419,7 +431,7 @@ frozen revision N -> baseline -> diagnose -> repair/tune -> validation/holdout
 
 ### 5.1 为什么需要单独的归因层
 
-当前 `_has_non_skill_failure()` 只能判断 Scenario 是否存在 Runtime error、Grader `ERROR` 或 `NOT_EVALUABLE`。它能够阻止误修，但不能回答：
+D20 之前 `_has_non_skill_failure()` 只能判断 Scenario 是否存在 Runtime error、Grader `ERROR` 或 `NOT_EVALUABLE`。当前已实现的 Attributor 能进一步生成结构化 Card 和修改授权，但单次日志仍不能可靠回答所有因果问题，例如：
 
 - CLI 是未安装、版本不兼容还是参数错误；
 - 错误参数来自 Skill 指令还是 Agent 临时推理；
@@ -451,7 +463,7 @@ frozen revision N -> baseline -> diagnose -> repair/tune -> validation/holdout
 | `oracle` | 成功标准冲突、缺失或不可观察 | EvalPack calibration |
 | `unknown` | 证据不完整或存在多个同等解释 | 人工/追加诊断 |
 
-这些一级类别是对 [SKILL_CATEGORY_AND_ITERATION_DESIGN.md](./SKILL_CATEGORY_AND_ITERATION_DESIGN.md) 中既有 Failure Card 分类的工程化扩展。实现时应提供稳定 reason-code 映射，而不是维护两套相互冲突的“谁背锅”体系。
+当前 Failure Card 的 `category` 使用 `execution | evaluator | evidence_gap | tool_or_dependency | quality_failure | recovery_failure` 等稳定大类，上表更细的名称通过 `reason_code`、`observed_component` 和 `remediation_surface` 表达。规则覆盖 runtime/driver/fixture/grader/oracle、command not found、permission/auth/network/timeout、unknown tool/bad argument、missing evidence、普通 hard failure 和 Expected Fault recovery。它是对 [SKILL_CATEGORY_AND_ITERATION_DESIGN.md](./SKILL_CATEGORY_AND_ITERATION_DESIGN.md) 中既有分类的工程化映射，不维护两套相互冲突的“谁背锅”体系。
 
 ### 5.3 证据层级
 
@@ -464,11 +476,11 @@ frozen revision N -> baseline -> diagnose -> repair/tune -> validation/holdout
 | `inferred` | 与 Trace 和规则一致，但仍有其他解释 |
 | `insufficient` | 关键 telemetry 缺失，不能安全分类 |
 
-模型可以生成 `inferred` 假设和解释，但不能把它提升为 `direct/corroborated`。
+当前规则引擎直接产生这些等级，不调用模型。未来模型可以生成 `inferred` 假设和解释，但不能把它提升为 `direct/corroborated`。
 
 ### 5.4 Failure Card 契约
 
-建议新增 `aceval.failure-card/v1`：
+当前契约为 `aceval.failure-card/v1`，DiagnosticReport 为 `aceval.diagnostic-report/v1`：
 
 ```json
 {
@@ -476,30 +488,35 @@ frozen revision N -> baseline -> diagnose -> repair/tune -> validation/holdout
   "failure_id": "f-001",
   "scenario_id": "case-malformed-csv",
   "symptom": "process exited with status 127",
-  "category": "cli_binary",
-  "origin_component": "external_dependency",
+  "category": "tool_or_dependency",
+  "observed_component": "cli",
   "remediation_surface": "runtime_profile",
   "confidence": "direct",
   "evidence": [
     {
-      "kind": "tool_result",
-      "event_seq": 8,
-      "tool": "process_exec",
-      "exit_code": 127,
-      "stderr_excerpt": "command not found"
+      "kind": "diagnostic_signal",
+      "ref": "trace:8",
+      "code": "cli.binary_not_found",
+      "data": {
+        "tool": "process_exec",
+        "exit_code": 127,
+        "error_type": "command_not_found"
+      }
     }
   ],
   "alternative_hypotheses": [],
   "patch_decision": "deny_skill_intervention",
   "skill_patch_authorized": false,
   "recommended_actions": ["安装并锁定 CLI 版本", "检查 PATH/Profile"],
-  "additional_probe": null
+  "reason_code": "cli.binary_not_found",
+  "additional_probe": null,
+  "expected_fault": false
 }
 ```
 
 关键字段：
 
-- `origin_component`：失败最可能发生的位置；
+- `observed_component`：失败信号被观察到的位置；
 - `remediation_surface`：建议修改的组件；
 - `patch_decision`：`allow_skill_intervention | deny_skill_intervention | needs_more_evidence | none`；
 - `skill_patch_authorized`：供报告使用的派生布尔值，只有 `allow_skill_intervention` 时为 true；
@@ -507,7 +524,7 @@ frozen revision N -> baseline -> diagnose -> repair/tune -> validation/holdout
 - `alternative_hypotheses`：防止把相关性写成唯一因果；
 - `additional_probe`：证据不足时下一步最小诊断动作。
 
-### 5.5 归因流水线
+### 5.5 归因流水线（Implemented core）
 
 ```text
 Observation / ImportedRunBundle
@@ -516,13 +533,11 @@ Observation / ImportedRunBundle
               |
       2. Runtime/tool health rules
               |
-      3. Trace conformance analysis
+      3. Structured/common tool error rules
               |
       4. Outcome/Grader analysis
               |
-      5. Repeat or diagnostic probe
-              |
-      6. Evidence-backed classifier
+      5. Evidence-backed classifier
               |
          Failure Cards
 ```
@@ -531,12 +546,13 @@ Observation / ImportedRunBundle
 
 1. Pack、fixture、Subject 和运行配置是否完整；
 2. Runtime 是否启动，工具是否存在，Observation 是否足够；
-3. 实际工具序列是否满足 Test Plan/Skill 的步骤约束；
-4. 结果失败是否可由输入、Oracle 或 Grader解释；
-5. 必要时进行重复执行或最小控制探针；
-6. 仍不确定时输出 `unknown`。
+3. Trace 中是否有 expected/unexpected tool error、unknown tool 或 bad argument；
+4. Grader 是否 `ERROR/NOT_EVALUABLE`，或是否存在无外部阻断的 hard `FAIL`；
+5. 仍不确定时输出 `needs_more_evidence`。
 
-### 5.6 诊断探针
+当前未自动执行重复运行或控制探针，也未把 Test Plan 步骤约束自动编译成 Trace automaton；这些属于 D40。
+
+### 5.6 诊断探针（D40）
 
 探针只能由受信代码发起，并受独立预算、权限和脱敏策略约束。可用探针包括：
 
@@ -572,31 +588,24 @@ Attributor 先将匹配信号标为 `expected_fault=true`，再判断 Agent 是�
 
 ### 5.8 Skill 修改授权
 
-修改授权不等于根因分类。决策规则建议为：
+修改授权不等于根因分类。当前决策规则为：
 
 | 情况 | 是否进入 Skill repair |
 |---|---|
-| `skill_instruction` 且证据 `direct/corroborated` | 是 |
 | 完整 Observation 下的确定性 hard `FAIL`，且无外部故障 | 是 |
-| `agent_reasoning/planning` 多次稳定失败，并能定位缺失/歧义指令 | 可以，标记为 mitigation 而非根因修复 |
 | CLI、权限、认证、网络、Runtime、Driver、Grader、Oracle 故障 | 否 |
-| 单次 Agent flake | 否，先重复执行 |
-| `unknown` 或 telemetry 不完整 | 否 |
+| unknown tool 或 bad argument | `needs_more_evidence`，不修改 |
+| telemetry/Observation 不完整 | 否 |
+| 未匹配的执行异常 | `needs_more_evidence`，不修改 |
 
 Optimizer 只接收经过脱敏的可修复 Failure Card 和 dev evidence，不接收 validation/holdout 详情或私有 Oracle。
 
-### 5.9 与现有 Orchestrator 的集成
+### 5.9 与现有 Orchestrator 的集成（Implemented）
 
 当前：
 
 ```python
-_has_non_skill_failure(run) -> bool
-```
-
-目标：
-
-```python
-FailureAttributor.attribute(run, context) -> DiagnosticReport
+FailureAttributor.attribute_scenario(evaluation, metadata) -> DiagnosticReport
 
 DiagnosticReport:
     failure_cards
@@ -605,14 +614,13 @@ DiagnosticReport:
     skill_patch_allowed
     eligible_skill_failures
     blocked_reasons
-    recommended_actions
 ```
 
 Orchestrator 行为：
 
-1. baseline dev 后生成 DiagnosticReport；
+1. 每个 Scenario 完成 Observation/Grade 后生成 DiagnosticReport；
 2. `evaluable=false` 时停止候选生成；
-3. 只把 `eligible_skill_failures` 传给 Optimizer；
+3. 只把 `eligible_skill_failures` 的 Card 摘要附到 dev FailureEvidence 并传给 Optimizer；
 4. validation/holdout 出现外部故障时将实验标记为 inconclusive，而不是 candidate regression；
 5. 报告同时展示 quality failure 与 infrastructure/evaluator failure；
 6. `unknown` 默认 fail closed。
@@ -654,21 +662,19 @@ Canonical Trace 至少记录：
 
 ### 6.2 公司 Session
 
-现有 `ImportedRunBundle` 接入以下流程：
+当前已实现的离线流程是：
 
 ```text
 session fetch/import
   -> completeness gate
-  -> RuntimeResult/Observation
-  -> EvalRun replay（可用的 Grader）
-  -> Failure Attribution
+  -> 保存/重载 canonical Observation
+  -> session diagnose
   -> Failure Cards
-  -> 可选 Case Draft
 ```
 
-如果 Session 只有 output 而没有 Trace，只允许结果评分和低置信度分析；不能判断工具或 CLI 根因。若缺 artifact/workspace，则相应 Grader 必须保持 `NOT_EVALUABLE`。
+离线命令不需要 Pack，也不执行 Grader；如果 Session 只有 output 而没有 Trace，不能判断工具或 CLI 根因，completeness 缺口会阻止 Skill Patch。D40 才接入 `ImportedRunBundle -> Pack/Scenario -> EvalRun -> Grader Replay`，届时若缺 artifact/workspace，则相应 Grader 必须保持 `NOT_EVALUABLE`。
 
-Profile 的 Trace mapping 后续应支持标准化以下字段：
+当前 Importer 会保留 Canonical Trace 的 `payload` 扩展字段，Attributor 已能消费常见 `exit_code`、错误文本和 tool result；D40 的公司 Profile/Runtime 仍应稳定标准化以下字段：
 
 - tool name；
 - argv/arguments；
@@ -680,46 +686,50 @@ Profile 的 Trace mapping 后续应支持标准化以下字段：
 - error kind；
 - retry/attempt。
 
-## 7. 新增模块与公共契约
+## 7. 模块与公共契约
 
-建议模块映射：
+当前模块映射：
 
 | 文件 | 职责 |
 |---|---|
-| `src/aceval/skill_analysis.py` | Inventory、语义分析、Capability Graph 校验 |
+| `src/aceval/skill_analysis.py` | 确定性 Inventory、Capability Graph 和 source-ref 校验 |
 | `src/aceval/test_planning.py` | Test Requirement、风险优先级和 split 规划 |
-| `src/aceval/case_generation.py` | Case/fixture/Oracle 草稿和来源追踪 |
+| `src/aceval/case_generation.py` | TestPlan 到可编辑 Case 草稿和来源追踪 |
 | `src/aceval/coverage.py` | 静态/动态 Coverage Matrix 与 gap |
-| `src/aceval/pack_quality.py` | Oracle 可信级别、泄漏、flake、mutation calibration |
+| `src/aceval/pack_quality.py` | 基础 Oracle/coverage/runtime/split/hash Freeze Gate |
 | `src/aceval/failure_attribution.py` | 规则、分类、Failure Card 和修改授权 |
+| `src/aceval/planning_workflow.py` | 规划产物写入、重载和一致性检查 |
+
+D40 计划新增：
+
+| 文件 | 职责 |
+|---|---|
 | `src/aceval/diagnostic_probes.py` | 受控重复、health check 和 replay |
 | `src/aceval/process_tool.py` | D40 allowlisted argv Process Tool |
 | `src/aceval/replay.py` | Imported Session 到 EvalRun/Grader replay |
 
-建议 Protocol：
+当前类/函数入口等价于：
 
 ```python
-class SkillAnalyzer(Protocol):
-    def analyze(self, subject, seed_cases, goal, runtime_profile): ...
+class SkillAnalyzer:
+    def analyze(self, source, *, source_path="SKILL.md"): ...
 
-class TestPlanner(Protocol):
-    def plan(self, analysis, seed_cases, constraints): ...
+class TestPlanner:
+    def plan(self, graph, *, seed_cases, goal, runtime_capabilities): ...
 
-class CaseGenerator(Protocol):
-    def generate(self, plan, constraints): ...
+def compile_case_drafts(plan, seed_cases): ...
 
-class CoverageAnalyzer(Protocol):
-    def evaluate(self, analysis, plan, pack=None, runs=()): ...
+def build_coverage_report(plan, *, observed_case_ids=(), observed_requirement_ids=()): ...
 
-class FailureAttributor(Protocol):
-    def attribute(self, run, context): ...
+class FailureAttributor:
+    def attribute_scenario(self, evaluation, metadata=None): ...
 ```
 
 这些扩展属于应用/分析层。Kernel 仍只消费 frozen EvalPack、RuntimeResult、RunObservation 和 GradeResult。
 
-## 8. CLI 与 Application Service 草案
+## 8. CLI 与 Application Service
 
-### 8.1 CLI
+### 8.1 CLI（Implemented）
 
 ```bash
 # Skill + 少量 Case -> 能力图、测试计划和覆盖缺口
@@ -727,20 +737,22 @@ aceval plan \
   --subject ./my-skill \
   --cases seed-cases.json \
   --goal '准确处理输入，并在失败时不留下部分产物' \
-  --runtime-profile reference.json \
+  --runtime-profile reference \
   --output .aceval/plans/my-skill
 
 # 从已确认计划生成 EvalPack draft
 aceval pack generate \
-  --from-plan .aceval/plans/my-skill/test-plan.json \
+  --plan .aceval/plans/my-skill \
+  --type generic \
   --output .aceval/packs/my-skill-v1
 
 # 查看 Pack 质量和覆盖门禁
 aceval pack quality .aceval/packs/my-skill-v1
 
-# 对已有运行或公司 Session 做故障归因
-aceval diagnose --run .aceval/runs/exp-123
-aceval session diagnose --input .aceval/imported/session.json --pack ./evalpack
+# 对已经归一化并保存的公司 Session 做离线故障归因
+aceval session diagnose \
+  --input .aceval/imported/session.json \
+  --output .aceval/imported/session-diagnosis.json
 
 # 快速入口；有 blocker 时停在计划/校准页
 aceval doctor \
@@ -748,10 +760,14 @@ aceval doctor \
   --cases seed-cases.json \
   --goal '修复失败并减少工具调用' \
   --auto-plan \
-  --runtime reference
+  --approve-pack \
+  --runtime reference \
+  --model-command 'python model_bridge.py'
 ```
 
-### 8.2 Application Service
+当前没有 `aceval diagnose --run`，也没有 `session diagnose --pack`；普通 EvalRun 的 Failure Attribution 已由 Orchestrator 自动执行。公司 Session 的 Pack/Grader Replay 属于 D40。
+
+### 8.2 Application Service（D40）
 
 ```python
 analyze_skill(...)
@@ -765,65 +781,73 @@ run_diagnostic_probe(...)
 replay_session(...)
 ```
 
-CLI、Console 和未来 API 共用这些服务，不各自实现规划、冻结或归因逻辑。
+当前 CLI 直接复用规划、Quality 和 Attribution 的 Python 模块；D40 抽取 Application Service 后，CLI、Console 和未来 API 共用服务层，不各自实现规划、冻结或归因逻辑。
 
 ## 9. 本地数据布局
 
 ```text
 .aceval/
-  analyses/<analysis-id>/
-    inventory.json
-    capability-graph.json
-    runtime-gaps.json
   plans/<plan-id>/
+    capability-graph.json
     test-plan.json
     case-drafts.json
     coverage.json
-    unresolved-questions.json
+    runtime-gaps.json
+    generation-provenance.json
+    seed-cases.json
+    summary.json
   packs/<pack-id>/
+    design/
+      capability-graph.json
+      test-plan.json
+      coverage-target.json
+      generation-provenance.json
   runs/<experiment-id>/
     report.json
-    diagnostics.json
-    failure-cards.json
-    coverage-observed.json
+    report.md
 ```
 
-所有分析产物记录：
+当前规划产物记录：
 
 - subject hash；
 - seed Case hash；
-- analyzer/model profile；
-- Runtime Profile hash；
-- 生成参数和预算；
-- 父 revision。
+- analyzer/planner API version；
+- Runtime capability 声明或 unknown 状态；
+- Case 生成参数、选择决策和预算淘汰项。
 
-分析结果不是冻结 EvalPack 的一部分，除非通过显式 `generate_pack_from_plan` 编译并校准。
+独立规划目录不是冻结 EvalPack 的一部分；通过 `pack generate --plan` 编译后，四个 `design/` Sidecar 会进入 Pack 全树 hash 和 freeze lock。独立 Trace store、`diagnostics.json`、`failure-cards.json` 和自动 `coverage-observed.json` 尚属 D40。
 
-## 10. D20 黑客松交付范围
+## 10. D20 黑客松交付状态
 
-### 10.1 P0：必须可演示
+### 10.1 已实现能力
 
-1. `SKILL.md + 2–5 seed cases + Goal` 生成 schema-valid Capability Graph；
-2. 每个能力节点具有 source ref 或显式 `inferred` 标记；
-3. 生成 happy/boundary/negative/step-order 四类测试义务；
-4. 在现有文件工具和内置 Grader 能力内生成 6–12 个 Case 草稿；
-5. 输出 Coverage Matrix、Runtime Gap 和 Freeze Blockers；
-6. 只有 deterministic/seed-derived Oracle 可以自动进入 hard gate；
-7. 对当前 Runtime、Driver、Grader、missing evidence 和常见 tool error 生成 Failure Card；
-8. 用 Failure Card 替代黑盒布尔提示，已知非 Skill 故障不产生候选；
-9. 导入一条带结构化 CLI/tool error 的公司 Session，生成不可修 Skill 的 Failure Card；
-10. HTML 报告展示能力图摘要、覆盖缺口和故障归因；
-11. 使用一个多步骤 Skill 展示“少量 Case -> 自动补 Case -> 发现缺口 -> 冻结 -> repair/tune”。
+1. `SKILL.md + seed cases + Goal` 生成 schema-valid Capability Graph；
+2. 每个能力节点具有 line/quote hash source ref 或显式 `inferred` 标记；
+3. 生成 happy、branch/negative、risk、recovery、idempotency、state-transition 和 diagnostic step-order Requirement；
+4. 在当前 Runtime 能力与 `max_generated_cases` 预算内生成 bounded Case 草稿；
+5. 输出 planned/executable/oracle-ready/observed Coverage、Runtime Gap 和 Freeze Blockers；
+6. 未确认 Oracle、critical gap、Runtime gap、generated holdout、family leakage 和 hash mismatch 阻止冻结；
+7. 对 Runtime、Driver、fixture、Grader、Oracle、missing evidence 和常见 tool error 生成 Failure Card；
+8. Failure Card 与 Patch Authorization 已接入 Orchestrator，已知非 Skill 故障不产生候选；
+9. 已保存的 Imported Session 可通过 `session diagnose` 生成不可修 Skill 的 Failure Card；
+10. 全量自动测试通过。
 
-### 10.2 P1：时间允许
+### 10.2 黑客松仍需完成的演示交付
+
+- 接入真实模型并完成可复现 repair/tune；
+- 用一个多步骤 Skill 现场展示“少量 Case -> 自动补 Case 草稿 -> 发现缺口 -> 校准/冻结 -> repair/tune”；
+- 准备一条离线 CLI/环境故障 Session 与一张允许 Skill intervention 的对照 Card；
+- 生成静态 HTML 或录屏友好的结果页；当前只有 JSON/Markdown/CLI 输出。
+
+### 10.3 D20 未实现、移入 D40
 
 - 从已导入公司 Session 生成可 Replay 的 EvalRun/Case 草稿；
 - 生成少量受限 mutant 并计算 mutation score；
 - 在 Console/静态 HTML 中展示 requirement-to-case 矩阵；
-- 对 canonical CLI trace 做 `cli_binary/permission/auth/network` 规则分类；
+- Web Console；
 - 一个 Profile 固定、无副作用的 CLI health probe。
 
-### 10.3 D20 明确不做
+### 10.4 D20 明确不做
 
 - 任意多文件/binary Skill bundle 自动分析；
 - 自由 shell 或任意 CLI 执行；
@@ -834,18 +858,20 @@ CLI、Console 和未来 API 共用这些服务，不各自实现规划、冻结�
 
 ## 11. D21–D40 求职作品范围
 
-### D21–D24：规划与归因协议工程化
+### D21–D24：规划与归因 Benchmark
 
-- 完成版本化 Analysis/TestPlan/Coverage/FailureCard Schema；
+- 保持已实现 Analysis/TestPlan/Coverage/FailureCard v1 兼容；
 - 建立 3–5 个手工标注复杂 Skill 的 analyzer benchmark；
-- 完成来源追踪、Case 去重、风险优先级和 Runtime gap；
-- 建立故障规则库和 canonical failure fixture suite。
+- 测量 capability/requirement recall、source-ref validity 和 seed mapping accuracy；
+- 扩展 canonical failure fixture suite，测量分类、拒判和误授权率；
+- 增加详细 Failure Card 持久化和 Run index。
 
-### D25–D28：Pack Quality 与产品入口
+### D25–D28：高级 Case/Pack Quality 与产品入口
 
-- Case/Oracle 草稿编译；
+- seed expansion、boundary/metamorphic fixture 变换；
 - mutation calibration；
 - known-good/known-bad 区分能力；
+- evaluator flake 和 Pack revision diff；
 - Application Service；
 - 静态 HTML 和 Test Plan/Coverage 页面。
 
@@ -853,9 +879,9 @@ CLI、Console 和未来 API 共用这些服务，不各自实现规划、冻结�
 
 - Imported Session -> EvalRun；
 - 可用 Grader replay；
-- Session Failure Cards；
+- 在线/Replay Session Failure Cards；
 - Session -> Case Draft；
-- telemetry completeness 对归因置信度的门控。
+- Grader 级 telemetry completeness 对可重评分范围的门控。
 
 ### D33–D35：受控 CLI 与诊断探针
 
@@ -869,6 +895,7 @@ CLI、Console 和未来 API 共用这些服务，不各自实现规划、冻结�
 
 - flake、均值、方差和置信区间；
 - dynamic tool/state coverage；
+- EvalRun -> observed coverage 自动接线；
 - 相同 Case 的重复归因一致性；
 - 经人工确认的主观 rubric Pilot。
 
@@ -982,10 +1009,10 @@ insufficient evidence   -> skill_patch_authorized 必须为 false
 
 ## 16. 最终决策
 
-1. 复杂 Skill 自动生成不是直接扩展现有 Pack Builder，而是新增 Skill Analyzer、Test Planner、Coverage Analyzer 和 Pack Quality Gate；
+1. 复杂 Skill 自动生成已经通过独立 Skill Analyzer、Test Planner、Coverage 和 Pack Quality 模块实现，Pack Builder 继续只负责把确认后的设计编译成 EvalPack；
 2. 自动化目标是“有边界的高风险路径覆盖”，不承诺任意自然语言全路径覆盖；
-3. Failure Attribution 替代当前粗粒度布尔门控，但保持 fail closed；
+3. Failure Attribution 已替代优化主路径中的粗粒度布尔提示，同时保留 fail closed fallback；
 4. 根因组件与补救组件分开，非 Skill 根因不等于永远不能用 Skill 缓解；
-5. D20 先覆盖当前 UTF-8 文件工具能力，并能明确报告 Runtime gap；
+5. D20 已覆盖当前 UTF-8 文件工具能力，并能明确报告 Runtime gap；
 6. D40 再增加受控 CLI、公司 Session Replay、诊断探针和动态覆盖；
 7. EvalPack 与 Skill 永远使用两个独立 revision/优化循环。

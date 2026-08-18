@@ -17,10 +17,13 @@ from .agent_runtime import CommandModelClient, ReferenceAgentRuntime, ReferenceR
 from .connections import (
     CompanyApiProfile,
     HTTPSessionLogProvider,
+    IMPORTED_SESSION_API_VERSION,
     ImportedRunBundle,
+    load_imported_run_bundle,
     load_session_log,
 )
 from .contracts import GradeStatus, RunBudget, SubjectSnapshot, as_primitive
+from .failure_attribution import FailureAttributor
 from .optimizer import FrozenCandidateOptimizer, SkillMarkdownOptimizer
 from .orchestrator import EvalOrchestrator
 from .pack import EvalPackLoader, PackError
@@ -31,6 +34,12 @@ from .pack_builder import (
     generate_evalpack,
 )
 from .pack_lifecycle import pack_calibration_status
+from .pack_quality import evaluate_pack_quality
+from .planning_workflow import (
+    REFERENCE_RUNTIME_CAPABILITIES,
+    create_planning_artifacts,
+    load_planning_artifacts,
+)
 from .registry import build_builtin_registry
 from .reporting import to_report_dict, write_report
 from .runtime import FakeRuntime, ReferenceRuntimeAdapter
@@ -94,6 +103,30 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--version", action="version", version="%(prog)s " + __version__)
     commands = parser.add_subparsers(dest="command", required=True)
 
+    plan = commands.add_parser(
+        "plan",
+        help="Analyze a Skill and generate a source-grounded Test Plan",
+    )
+    plan.add_argument("--subject", required=True, help="Skill directory or SKILL.md")
+    plan.add_argument("--cases", required=True, help="Seed cases JSON file")
+    plan.add_argument("--goal", required=True)
+    plan.add_argument("--output", required=True, help="New planning artifact directory")
+    plan.add_argument(
+        "--runtime-profile",
+        choices=("reference", "unknown"),
+        default="reference",
+        help="Capabilities used for feasibility routing",
+    )
+    plan.add_argument(
+        "--runtime-capability",
+        action="append",
+        default=[],
+        metavar="NAME",
+        help="Additional/explicit Runtime capability (repeatable)",
+    )
+    plan.add_argument("--max-generated-cases", type=int, default=12)
+    plan.set_defaults(handler=_plan)
+
     pack = commands.add_parser("pack", help="Inspect an EvalPack")
     pack_commands = pack.add_subparsers(dest="pack_command", required=True)
     lint = pack_commands.add_parser("lint", help="Load and validate all Pack references")
@@ -110,9 +143,13 @@ def build_parser() -> argparse.ArgumentParser:
         "generate",
         help="Generate an untrusted draft Pack from a few cases and a goal",
     )
-    generate.add_argument("--type", required=True, dest="pack_type")
-    generate.add_argument("--cases", required=True, help="Cases JSON file")
-    generate.add_argument("--goal", required=True)
+    generate.add_argument("--type", dest="pack_type")
+    generate.add_argument("--cases", help="Cases JSON file")
+    generate.add_argument(
+        "--plan",
+        help="Planning artifact directory produced by `aceval plan`",
+    )
+    generate.add_argument("--goal")
     generate.add_argument("--output", required=True, help="New Pack directory")
     generate.add_argument(
         "--objective",
@@ -138,6 +175,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Confirm that cases, Oracles, Graders, and objective were reviewed",
     )
     freeze.set_defaults(handler=_pack_freeze)
+    quality = pack_commands.add_parser(
+        "quality",
+        help="Evaluate test-design coverage, Oracle trust, and freeze blockers",
+    )
+    quality.add_argument("path")
+    quality.set_defaults(handler=_pack_quality)
 
     run = commands.add_parser("run", help="Evaluate one frozen Subject")
     _add_pack_argument(run)
@@ -187,6 +230,18 @@ def build_parser() -> argparse.ArgumentParser:
     doctor.add_argument("--objective", help="Optional JSON object or @FILE")
     doctor.add_argument("--source-root")
     doctor.add_argument(
+        "--auto-plan",
+        action="store_true",
+        help="Analyze the Skill and generate a Test Plan before building the Pack",
+    )
+    doctor.add_argument("--plan-output", help="New planning artifact directory")
+    doctor.add_argument("--max-generated-cases", type=int, default=12)
+    doctor.add_argument(
+        "--allow-subject-drift",
+        action="store_true",
+        help="Explicitly allow a plan-generated Pack to run against a different Subject hash",
+    )
+    doctor.add_argument(
         "--approve-pack",
         action="store_true",
         help="Approve a supported generated template after reviewing its cases/Oracles",
@@ -231,6 +286,14 @@ def build_parser() -> argparse.ArgumentParser:
     session_execute.add_argument("--profile", required=True)
     session_execute.add_argument("--request", required=True, help="JSON file")
     session_execute.set_defaults(handler=_session_execute)
+    session_diagnose = session_commands.add_parser(
+        "diagnose",
+        help="Diagnose execution/tool failures in a normalized imported session",
+    )
+    session_diagnose.add_argument("--input", required=True)
+    session_diagnose.add_argument("--output")
+    session_diagnose.add_argument("--force", action="store_true")
+    session_diagnose.set_defaults(handler=_session_diagnose)
     return parser
 
 
@@ -351,24 +414,98 @@ def _pack_state_payload(result: Any) -> Mapping[str, Any]:
     }
 
 
+def _plan(args: argparse.Namespace) -> int:
+    if args.max_generated_cases < 0:
+        raise ValueError("--max-generated-cases must be non-negative")
+    if args.runtime_profile == "unknown" and not args.runtime_capability:
+        capabilities = None
+    else:
+        capabilities = set(args.runtime_capability)
+        if args.runtime_profile == "reference":
+            capabilities.update(REFERENCE_RUNTIME_CAPABILITIES)
+    artifacts = create_planning_artifacts(
+        args.subject,
+        args.cases,
+        args.goal,
+        args.output,
+        runtime_capabilities=(
+            tuple(sorted(capabilities)) if capabilities is not None else None
+        ),
+        max_generated_cases=args.max_generated_cases,
+    )
+    payload = dict(artifacts.summary())
+    payload.update(
+        {
+            "ok": True,
+            "files": {
+                "capability_graph": str(artifacts.root / "capability-graph.json"),
+                "test_plan": str(artifacts.root / "test-plan.json"),
+                "case_drafts": str(artifacts.root / "case-drafts.json"),
+                "coverage": str(artifacts.root / "coverage.json"),
+                "runtime_gaps": str(artifacts.root / "runtime-gaps.json"),
+            },
+            "freeze_blockers": [
+                item.to_dict() for item in artifacts.freeze_blockers
+            ],
+            "next_step": (
+                "Review pending Oracles and blockers, then run `aceval pack generate --plan ...`."
+            ),
+        }
+    )
+    print(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True))
+    return 0
+
+
 def _pack_generate(args: argparse.Namespace) -> int:
     objective = _json_object(args.objective, "objective") if args.objective else None
+    if args.plan:
+        if args.cases:
+            raise ValueError("--plan and --cases are mutually exclusive")
+        planned = load_planning_artifacts(args.plan)
+        cases = planned.case_generation.cases_document
+        pack_type = args.pack_type or "generic"
+        if args.goal is not None and args.goal != planned.test_plan.goal:
+            raise ValueError(
+                "--goal does not match the Test Plan; re-run `aceval plan` "
+                "so requirements and risk weights are derived from the new goal"
+            )
+        goal = planned.test_plan.goal
+        test_design = planned.test_design()
+        source_root = args.source_root or (
+            str(planned.seed_source_root)
+            if planned.seed_source_root is not None
+            else None
+        )
+    else:
+        if not args.cases or not args.pack_type or not args.goal:
+            raise ValueError(
+                "pack generate requires --type, --cases, and --goal unless --plan is used"
+            )
+        cases = args.cases
+        pack_type = args.pack_type
+        goal = args.goal
+        test_design = None
+        source_root = args.source_root
     result = generate_evalpack(
-        args.cases,
-        args.pack_type,
-        args.goal,
+        cases,
+        pack_type,
+        goal,
         args.output,
         objective=objective,
         name=args.name,
         version=args.version,
         description=args.description,
-        source_root=args.source_root,
+        source_root=source_root,
+        test_design=test_design,
     )
     payload = dict(_pack_state_payload(result))
     payload["next_step"] = (
         "Review the generated cases, Oracles, Graders, and objective; then run "
         "`aceval pack calibrate` / `aceval pack freeze --approve`."
     )
+    if args.plan:
+        payload["test_plan"] = str(Path(args.plan).expanduser().resolve())
+        payload["pack_quality"] = evaluate_pack_quality(result.root).to_dict()
     print(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True))
     return 0
 
@@ -394,6 +531,12 @@ def _pack_freeze(args: argparse.Namespace) -> int:
         )
     )
     return 0
+
+
+def _pack_quality(args: argparse.Namespace) -> int:
+    report = evaluate_pack_quality(args.path)
+    print(json.dumps(report.to_dict(), ensure_ascii=False, indent=2, sort_keys=True))
+    return 0 if report.ready_for_freeze else 2
 
 
 def _pack_lint(args: argparse.Namespace) -> int:
@@ -539,15 +682,60 @@ def _doctor(args: argparse.Namespace) -> int:
         objective = (
             _json_object(args.objective, "objective") if args.objective else None
         )
+        planned = None
+        if args.auto_plan:
+            if args.max_generated_cases < 0:
+                raise ValueError("--max-generated-cases must be non-negative")
+            plan_output = args.plan_output or (str(output) + ".plan")
+            planned = create_planning_artifacts(
+                args.subject,
+                args.cases,
+                args.goal,
+                plan_output,
+                runtime_capabilities=tuple(
+                    sorted(REFERENCE_RUNTIME_CAPABILITIES)
+                ),
+                max_generated_cases=args.max_generated_cases,
+            )
+            cases = planned.case_generation.cases_document
+            source_root = args.source_root or (
+                str(planned.seed_source_root)
+                if planned.seed_source_root is not None
+                else None
+            )
+            test_design = planned.test_design()
+        else:
+            cases = args.cases
+            source_root = args.source_root
+            test_design = None
         generated = generate_evalpack(
-            args.cases,
+            cases,
             args.pack_type,
             args.goal,
             output,
             objective=objective,
-            source_root=args.source_root,
+            source_root=source_root,
+            test_design=test_design,
         )
         pack_path = str(generated.root)
+        if planned is not None:
+            quality = evaluate_pack_quality(generated.root)
+            if not quality.ready_for_freeze:
+                calibrating = begin_calibration(generated.root)
+                payload = dict(_pack_state_payload(calibrating))
+                payload.update(
+                    {
+                        "status": "calibration_required",
+                        "reason": (
+                            "The generated Test Plan or Pack Quality report has blockers. "
+                            "Resolve them before an explicit freeze."
+                        ),
+                        "planning": planned.summary(),
+                        "pack_quality": quality.to_dict(),
+                    }
+                )
+                print(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True))
+                return 0
         if generated.requested_type not in PACK_TYPES:
             calibrating = begin_calibration(generated.root)
             payload = dict(_pack_state_payload(calibrating))
@@ -594,6 +782,7 @@ def _doctor(args: argparse.Namespace) -> int:
             freeze_evalpack(loaded.root, approve=True)
 
     registry, pack = _load_pack(str(pack_path))
+    _verify_planned_subject(pack, args.subject, registry, bool(args.allow_subject_drift))
     runtime = _runtime(args)
     if args.runtime == "fake" and not args.candidate:
         raise ValueError(
@@ -623,6 +812,32 @@ def _doctor(args: argparse.Namespace) -> int:
     return 0 if result.accepted else 2
 
 
+def _verify_planned_subject(
+    pack: Any,
+    subject_ref: str,
+    registry: Any,
+    allow_subject_drift: bool,
+) -> None:
+    test_design = pack.manifest.metadata.extra.get("test_design")
+    if not isinstance(test_design, Mapping):
+        return
+    expected = test_design.get("source_subject_hash")
+    if not isinstance(expected, str) or not expected:
+        raise ValueError("planned Pack is missing source_subject_hash")
+    adapter = registry.subject_adapter(pack.manifest.subject_contract.adapter)
+    snapshot = adapter.snapshot(
+        subject_ref, pack.manifest.subject_contract.params
+    )
+    actual = str(snapshot.content_hash)
+    if not actual.startswith("sha256:"):
+        actual = "sha256:" + actual
+    if actual != expected and not allow_subject_drift:
+        raise ValueError(
+            "planned Pack source Subject hash does not match --subject; "
+            "re-run `aceval plan` or pass --allow-subject-drift explicitly"
+        )
+
+
 def _profile_validate(args: argparse.Namespace) -> int:
     profile = CompanyApiProfile.load(args.path)
     payload = {
@@ -645,7 +860,7 @@ def _profile_validate(args: argparse.Namespace) -> int:
 
 def _imported_bundle_payload(bundle: ImportedRunBundle) -> Mapping[str, Any]:
     return {
-        "schema_version": "aceval.imported-session/v1",
+        "schema_version": IMPORTED_SESSION_API_VERSION,
         "session_id": bundle.session_id,
         "profile_name": bundle.profile_name,
         "source": bundle.source,
@@ -726,6 +941,29 @@ def _session_execute(args: argparse.Namespace) -> int:
         )
     )
     return 0
+
+
+def _session_diagnose(args: argparse.Namespace) -> int:
+    bundle = load_imported_run_bundle(args.input)
+    report = FailureAttributor().attribute(
+        scenario_id="session-%s" % bundle.session_id,
+        observation=bundle.observation,
+        error=bundle.observation.error,
+        metadata={"missing_observation_fields": bundle.completeness.missing},
+    )
+    payload = {
+        "ok": True,
+        "schema_version": "aceval.session-diagnosis/v1",
+        "session_id": bundle.session_id,
+        "profile_name": bundle.profile_name,
+        "completeness": bundle.completeness.as_dict(),
+        "diagnostic_report": report.to_dict(),
+    }
+    if args.output:
+        output = _write_json_output(args.output, payload, bool(args.force))
+        payload["output"] = str(output)
+    print(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True))
+    return 0 if report.patch_decision.value != "needs_more_evidence" else 1
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:

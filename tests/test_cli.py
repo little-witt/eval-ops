@@ -169,6 +169,341 @@ class CliBlackBoxTests(unittest.TestCase):
         self.assertEqual("frozen", payload["calibration_status"])
         self.assertTrue(payload["optimization_eligible"])
 
+    def test_plan_to_pack_quality_and_freeze_workflow(self) -> None:
+        skill = self.output_root / "planned-skill"
+        skill.mkdir()
+        (skill / "SKILL.md").write_text(
+            """# Answer Skill
+
+## Capabilities
+
+### Return JSON answer
+
+Inputs:
+- a question
+
+Outputs:
+- a JSON object with an `answer` field
+
+Return the requested answer as JSON.
+""",
+            encoding="utf-8",
+        )
+        cases = self.output_root / "planned-cases.json"
+        cases.write_text(
+            json.dumps(
+                {
+                    "name": "planned-answer",
+                    "cases": [
+                        {
+                            "id": "answer-dev",
+                            "prompt": "Return the answer 42 as JSON.",
+                            "expected_output": {"answer": 42},
+                        }
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+        plan = self.output_root / "answer-plan"
+        code, _, stderr, payload = self.invoke(
+            [
+                "plan",
+                "--subject",
+                str(skill),
+                "--cases",
+                str(cases),
+                "--goal",
+                "Return the exact JSON answer.",
+                "--output",
+                str(plan),
+                "--max-generated-cases",
+                "0",
+            ]
+        )
+        self.assertEqual(0, code, stderr)
+        self.assertEqual("needs_user_input", payload["outcome"], payload)
+        self.assertTrue(payload["freeze_blockers"])
+        self.assertTrue(Path(payload["files"]["test_plan"]).is_file())
+
+        # Simulate the operator resolving the single semantic ambiguity during
+        # calibration. The Pack must still preserve the reviewed plan revision.
+        plan_document = json.loads(
+            (plan / "test-plan.json").read_text(encoding="utf-8")
+        )
+        plan_document["freeze_blockers"] = []
+        plan_document["outcome"] = "ready_for_calibration"
+        (plan / "test-plan.json").write_text(
+            json.dumps(plan_document), encoding="utf-8"
+        )
+
+        code, output, stderr, payload = self.invoke(
+            [
+                "pack",
+                "generate",
+                "--plan",
+                str(plan),
+                "--type",
+                "generic",
+                "--goal",
+                "A different unplanned goal.",
+                "--output",
+                str(self.output_root / "goal-drift-pack"),
+            ]
+        )
+        self.assertEqual(2, code)
+        self.assertEqual("", output)
+        self.assertIsNone(payload)
+        self.assertIn("does not match the Test Plan", stderr)
+
+        pack = self.output_root / "planned-pack"
+        code, _, stderr, payload = self.invoke(
+            [
+                "pack",
+                "generate",
+                "--plan",
+                str(plan),
+                "--type",
+                "generic",
+                "--output",
+                str(pack),
+            ]
+        )
+        self.assertEqual(0, code, stderr)
+        self.assertTrue(payload["pack_quality"]["ready_for_freeze"])
+        self.assertTrue((pack / "design" / "capability-graph.json").is_file())
+
+        code, _, stderr, payload = self.invoke(["pack", "quality", str(pack)])
+        self.assertEqual(0, code, stderr)
+        self.assertTrue(payload["test_design_present"])
+        self.assertTrue(payload["ready_for_freeze"])
+
+        code, _, stderr, payload = self.invoke(
+            ["pack", "freeze", str(pack), "--approve"]
+        )
+        self.assertEqual(0, code, stderr)
+        self.assertTrue(payload["trusted"])
+
+    def test_doctor_auto_plan_stops_at_visible_calibration_blockers(self) -> None:
+        skill = self.output_root / "auto-plan-skill"
+        skill.mkdir()
+        (skill / "SKILL.md").write_text(
+            """# Writing Skill
+
+## Write answer
+
+Inputs:
+- a user request
+
+Write a good answer as appropriate.
+""",
+            encoding="utf-8",
+        )
+        cases = self.output_root / "auto-plan-cases.json"
+        cases.write_text(
+            json.dumps(
+                {
+                    "name": "auto-plan-answer",
+                    "cases": [
+                        {
+                            "id": "answer-dev",
+                            "prompt": "Write the answer.",
+                            "expected_output": {"answer": "ok"},
+                        }
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+        plan = self.output_root / "doctor-plan"
+        pack = self.output_root / "doctor-pack"
+
+        code, _, stderr, payload = self.invoke(
+            [
+                "doctor",
+                "--subject",
+                str(skill),
+                "--cases",
+                str(cases),
+                "--type",
+                "generic",
+                "--goal",
+                "Return a useful JSON answer.",
+                "--pack-output",
+                str(pack),
+                "--auto-plan",
+                "--plan-output",
+                str(plan),
+                "--max-generated-cases",
+                "0",
+                "--runtime",
+                "fake",
+                "--output-root",
+                str(self.output_root / "doctor-auto-plan-runs"),
+            ]
+        )
+
+        self.assertEqual(0, code, stderr)
+        self.assertEqual("calibration_required", payload["status"])
+        self.assertEqual("calibrating", payload["calibration_status"])
+        self.assertGreater(payload["planning"]["freeze_blocker_count"], 0)
+        self.assertFalse(payload["pack_quality"]["ready_for_freeze"])
+        self.assertTrue((plan / "test-plan.json").is_file())
+        self.assertTrue((plan / "case-drafts.json").is_file())
+        self.assertTrue((pack / "design" / "test-plan.json").is_file())
+        self.assertTrue((pack / "design" / "generation-provenance.json").is_file())
+
+    def test_doctor_planned_subject_drift_requires_explicit_override(self) -> None:
+        skill = self.output_root / "drift-skill"
+        skill.mkdir()
+        skill_file = skill / "SKILL.md"
+        skill_file.write_text(
+            """# Exact Answer Skill
+
+## Return exact JSON answer
+
+Inputs:
+- a request
+
+Outputs:
+- `response.json`
+
+Use `write_file` to create `response.json` with the exact answer.
+""",
+            encoding="utf-8",
+        )
+        (skill / "subject.json").write_text(
+            json.dumps({"metadata": {"variant": "baseline"}}),
+            encoding="utf-8",
+        )
+        cases = self.output_root / "drift-cases.json"
+        cases.write_text(
+            json.dumps(
+                {
+                    "name": "drift-answer",
+                    "cases": [
+                        {
+                            "id": "answer-dev",
+                            "prompt": "Return exact JSON answer.",
+                            "expected_output": {"answer": 42},
+                            "metadata": {
+                                "fake_runtime": {
+                                    "variants": {
+                                        "baseline": {
+                                            "final_output": {"answer": 0}
+                                        },
+                                        "candidate": {
+                                            "final_output": {"answer": 42}
+                                        },
+                                    }
+                                }
+                            },
+                        },
+                        {
+                            "id": "answer-validation",
+                            "split": "validation",
+                            "prompt": "Return the validation JSON answer.",
+                            "expected_output": {"answer": 7},
+                            "metadata": {
+                                "fake_runtime": {
+                                    "variants": {
+                                        "baseline": {
+                                            "final_output": {"answer": 0}
+                                        },
+                                        "candidate": {
+                                            "final_output": {"answer": 7}
+                                        },
+                                    }
+                                }
+                            },
+                        },
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+        plan = self.output_root / "drift-plan"
+        pack = self.output_root / "drift-pack"
+
+        code, _, stderr, payload = self.invoke(
+            [
+                "plan",
+                "--subject",
+                str(skill),
+                "--cases",
+                str(cases),
+                "--goal",
+                "Return the exact answer.",
+                "--output",
+                str(plan),
+                "--max-generated-cases",
+                "0",
+            ]
+        )
+        self.assertEqual(0, code, stderr)
+        self.assertEqual("ready_for_calibration", payload["outcome"])
+
+        code, _, stderr, payload = self.invoke(
+            [
+                "pack",
+                "generate",
+                "--plan",
+                str(plan),
+                "--type",
+                "generic",
+                "--output",
+                str(pack),
+            ]
+        )
+        self.assertEqual(0, code, stderr)
+        self.assertTrue(payload["pack_quality"]["ready_for_freeze"])
+        code, _, stderr, payload = self.invoke(
+            ["pack", "freeze", str(pack), "--approve"]
+        )
+        self.assertEqual(0, code, stderr)
+        self.assertTrue(payload["trusted"])
+
+        skill_file.write_text(
+            skill_file.read_text(encoding="utf-8")
+            + "\nThe implementation changed after planning.\n",
+            encoding="utf-8",
+        )
+        candidate = self.output_root / "drift-candidate"
+        candidate.mkdir()
+        (candidate / "SKILL.md").write_text(
+            skill_file.read_text(encoding="utf-8")
+            + "\nCandidate instruction restores the exact answer behavior.\n",
+            encoding="utf-8",
+        )
+        base_args = [
+            "doctor",
+            "--subject",
+            str(skill),
+            "--pack",
+            str(pack),
+            "--runtime",
+            "fake",
+            "--candidate",
+            str(candidate),
+            "--output-root",
+            str(self.output_root / "drift-runs"),
+        ]
+
+        code, output, stderr, payload = self.invoke(base_args)
+        self.assertEqual(2, code)
+        self.assertEqual("", output)
+        self.assertIsNone(payload)
+        self.assertIn("source Subject hash does not match", stderr)
+        self.assertIn("--allow-subject-drift", stderr)
+
+        code, output, stderr, payload = self.invoke(
+            base_args + ["--allow-subject-drift"]
+        )
+        self.assertEqual(0, code, stderr)
+        self.assertTrue(output)
+        self.assertTrue(payload["accepted"])
+        self.assertNotIn("source Subject hash does not match", stderr)
+
     def test_unknown_pack_type_uses_generic_calibration_fallback(self) -> None:
         cases = self.output_root / "unknown-cases.json"
         cases.write_text(
@@ -416,7 +751,18 @@ class CliBlackBoxTests(unittest.TestCase):
                 {
                     "data": {
                         "output": {"ok": True},
-                        "events": [{"kind": "tool_call", "name": "read_file"}],
+                        "events": [
+                            {"kind": "tool_call", "name": "read_file"},
+                            {
+                                "kind": "tool_result",
+                                "tool": "process_exec",
+                                "payload": {
+                                    "ok": False,
+                                    "exit_code": 127,
+                                    "stderr_excerpt": "command not found",
+                                },
+                            },
+                        ],
                         "usage": {"total_tokens": 10},
                     }
                 }
@@ -445,6 +791,26 @@ class CliBlackBoxTests(unittest.TestCase):
         self.assertEqual(
             "tool_call", normalized["observation"]["trace"][0]["kind"]
         )
+
+        diagnosis = self.output_root / "session-diagnosis.json"
+        code, _, stderr, payload = self.invoke(
+            [
+                "session",
+                "diagnose",
+                "--input",
+                str(imported),
+                "--output",
+                str(diagnosis),
+            ]
+        )
+        self.assertEqual(0, code, stderr)
+        report = payload["diagnostic_report"]
+        self.assertEqual("deny_skill_intervention", report["patch_decision"])
+        self.assertEqual(
+            "cli.binary_not_found",
+            report["failure_cards"][0]["reason_code"],
+        )
+        self.assertTrue(diagnosis.is_file())
 
     def test_reference_runtime_executes_json_bridge_and_file_tools(self) -> None:
         bridge = self.output_root / "deterministic_bridge.py"

@@ -10,7 +10,9 @@ from aceval.contracts import (
     MetricSourceSpec,
     ObjectiveSpec,
     RunObservation,
+    TraceEvent,
 )
+from aceval.failure_attribution import FailureAttributor
 from aceval.objectives import compare_objective
 from aceval.orchestrator import (
     CandidateTrial,
@@ -120,6 +122,74 @@ class ReportingTests(unittest.TestCase):
             self.assertIn("| Pack | csv-summary-smoke |", first_markdown_text)
             self.assertIn("| dev | 0/1 | 0/1 | 0.0% | FAIL |", first_markdown_text)
             self.assertIn("## Limitations", first_markdown_text)
+
+    def test_run_report_counts_and_renders_failure_attribution(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            run = make_run(root, "baseline", GradeStatus.FAIL)
+            attributor = FailureAttributor()
+            allowed = attributor.attribute(
+                "dev-case",
+                observation=run.scenarios[0].observation,
+                grades=run.scenarios[0].grades,
+            )
+            blocked = attributor.attribute(
+                "validation-case",
+                observation=RunObservation(
+                    trace=(
+                        TraceEvent(
+                            kind="tool_result",
+                            seq=7,
+                            tool="process_exec",
+                            payload={
+                                "ok": False,
+                                "exit_code": 127,
+                                "stderr_excerpt": "command not found",
+                            },
+                        ),
+                    )
+                ),
+            )
+            run = replace(
+                run,
+                scenarios=(
+                    replace(run.scenarios[0], diagnostic_report=allowed),
+                    replace(run.scenarios[1], diagnostic_report=blocked),
+                ),
+            )
+
+            report = to_report_dict(run)
+            _, markdown_path = write_report(run, root / "diagnostic-report")
+            diagnostics = report["summary"]["diagnostics"]
+            markdown = markdown_path.read_text(encoding="utf-8")
+
+            self.assertEqual(
+                {
+                    "allow_skill_intervention": 1,
+                    "deny_skill_intervention": 1,
+                },
+                diagnostics["scenario_decisions"],
+            )
+            self.assertEqual(2, diagnostics["failure_card_count"])
+            self.assertEqual(1, diagnostics["patchable_card_count"])
+            self.assertEqual(1, diagnostics["blocked_card_count"])
+            self.assertEqual(
+                {"quality_failure": 1, "tool_or_dependency": 1},
+                diagnostics["categories"],
+            )
+            self.assertEqual(
+                {"agent_behavior": 1, "cli": 1},
+                diagnostics["observed_components"],
+            )
+            self.assertIn("## Failure Attribution", markdown)
+            self.assertIn(
+                "| dev-case | allow_skill_intervention | 1 | — |",
+                markdown,
+            )
+            self.assertIn(
+                "| validation-case | deny_skill_intervention | 1 | cli.binary_not_found |",
+                markdown,
+            )
 
     def test_usage_simulation_flag_and_html_escaping_are_explicit(self):
         with TemporaryDirectory() as directory:

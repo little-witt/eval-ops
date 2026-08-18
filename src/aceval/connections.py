@@ -37,6 +37,7 @@ from .contracts import RunObservation, RuntimeResult, TraceEvent, canonical_trac
 
 
 PROFILE_API_VERSION = "aceval.company-profile/v1"
+IMPORTED_SESSION_API_VERSION = "aceval.imported-session/v1"
 DEFAULT_TIMEOUT_SECONDS = 30.0
 DEFAULT_MAX_RESPONSE_BYTES = 4 * 1024 * 1024
 MAX_PROFILE_BYTES = 1024 * 1024
@@ -619,6 +620,100 @@ class ImportedRunBundle:
         )
 
 
+def load_imported_run_bundle(path: Union[str, Path]) -> ImportedRunBundle:
+    """Load a previously normalized imported-session document for diagnosis.
+
+    This restores only the canonical Observation and completeness contract.  A
+    saved workspace path is intentionally ignored because it is not an
+    immutable Replay artifact.
+    """
+
+    source_path = Path(path).expanduser().resolve()
+    try:
+        raw = source_path.read_bytes()
+    except OSError as exc:
+        raise SessionLogImportError(
+            "cannot read imported session: %s" % exc
+        ) from exc
+    try:
+        document = _decode_json_bytes(
+            raw, "imported session", DEFAULT_MAX_RESPONSE_BYTES
+        )
+    except ValueError as exc:
+        raise SessionLogImportError(str(exc)) from exc
+    root = _mapping(document, "imported session", SessionLogImportError)
+    if root.get("schema_version") != IMPORTED_SESSION_API_VERSION:
+        raise SessionLogImportError(
+            "unsupported imported session schema_version"
+        )
+    session_id = _session_id(root.get("session_id"))
+    profile_name = root.get("profile_name")
+    if not isinstance(profile_name, str) or not profile_name.strip():
+        raise SessionLogImportError("profile_name must be a non-empty string")
+    source = root.get("source", "company_session_log")
+    if not isinstance(source, str) or not source:
+        raise SessionLogImportError("source must be a non-empty string")
+
+    completeness_value = _mapping(
+        root.get("completeness"), "completeness", SessionLogImportError
+    )
+    expected = completeness_value.get("expected", ())
+    observed = completeness_value.get("observed", ())
+    for label, value in (("expected", expected), ("observed", observed)):
+        if isinstance(value, (str, bytes)) or not isinstance(value, Sequence):
+            raise SessionLogImportError(
+                "completeness.%s must be an array" % label
+            )
+        if any(not isinstance(item, str) for item in value):
+            raise SessionLogImportError(
+                "completeness.%s must contain strings" % label
+            )
+    completeness = ObservationCompleteness(
+        expected=frozenset(expected), observed=frozenset(observed)
+    )
+
+    observation_value = _mapping(
+        root.get("observation"), "observation", SessionLogImportError
+    )
+    raw_trace = observation_value.get("trace", [])
+    trace = _trace(raw_trace)
+    usage_value = observation_value.get("usage", {})
+    usage = _usage(usage_value)
+    error = observation_value.get("error")
+    if error is not None and not isinstance(error, str):
+        raise SessionLogImportError("observation.error must be a string")
+    artifacts = observation_value.get("artifacts", {})
+    pre_state = observation_value.get("pre_state", {})
+    post_state = observation_value.get("post_state", {})
+    metadata = observation_value.get("metadata", {})
+    for label, value in (
+        ("artifacts", artifacts),
+        ("pre_state", pre_state),
+        ("post_state", post_state),
+        ("metadata", metadata),
+    ):
+        if not isinstance(value, Mapping):
+            raise SessionLogImportError("observation.%s must be an object" % label)
+    observation = RunObservation(
+        output=observation_value.get("output"),
+        trace=trace,
+        artifacts=dict(artifacts),
+        pre_state=dict(pre_state),
+        post_state=dict(post_state),
+        workspace_root=None,
+        error=error,
+        usage=usage,
+        metadata=dict(metadata),
+    )
+    return ImportedRunBundle(
+        session_id=session_id,
+        profile_name=profile_name.strip(),
+        observation=observation,
+        completeness=completeness,
+        source=source,
+    )
+
+
 def _session_id(value: Any) -> str:
     if (
         not isinstance(value, str)
@@ -1065,6 +1160,7 @@ class HTTPSessionLogProvider:
 
 __all__ = [
     "PROFILE_API_VERSION",
+    "IMPORTED_SESSION_API_VERSION",
     "CompanyApiProfileError",
     "JsonPathError",
     "CompanyApiRequestError",
@@ -1084,4 +1180,5 @@ __all__ = [
     "load_company_api_profile",
     "import_session_log",
     "load_session_log",
+    "load_imported_run_bundle",
 ]

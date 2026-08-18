@@ -38,6 +38,7 @@ from .contracts import (
     SubjectSnapshot,
     is_tool_call_event,
 )
+from .failure_attribution import FailureAttributor, PatchDecision
 from .optimizer import (
     CandidateRejected,
     FailureEvidence,
@@ -281,6 +282,7 @@ class ScenarioEvaluation:
     observation: Optional[RunObservation] = None
     duration_seconds: float = 0.0
     error: Optional[str] = None
+    diagnostic_report: Optional[Any] = None
 
     @property
     def passed(self) -> bool:
@@ -535,11 +537,13 @@ class EvalOrchestrator:
         runtime: Any,
         output_root: Path = Path(".aceval/runs"),
         budget: Optional[RunBudget] = None,
+        failure_attributor: Optional[FailureAttributor] = None,
     ) -> None:
         self.registry = registry
         self.runtime = runtime
         self.output_root = Path(output_root).expanduser().resolve()
         self.budget = budget or RunBudget()
+        self.failure_attributor = failure_attributor or FailureAttributor()
         for name, value in (
             ("max_wall_time_seconds", self.budget.max_wall_time_seconds),
             ("max_total_tokens", self.budget.max_total_tokens),
@@ -1724,7 +1728,7 @@ class EvalOrchestrator:
                 error = "%s; %s" % (error, timeout_error) if error else timeout_error
             grades = self._not_evaluable_grades(pack, scenario, timeout_error)
         status = _overall_status(grades, error)
-        return ScenarioEvaluation(
+        evaluation = ScenarioEvaluation(
             scenario_id=scenario.id,
             split=scenario.split,
             status=status,
@@ -1733,6 +1737,11 @@ class EvalOrchestrator:
             duration_seconds=duration,
             error=error,
         )
+        diagnostic_report = self.failure_attributor.attribute_scenario(
+            evaluation,
+            metadata=scenario.scenario.metadata,
+        )
+        return replace(evaluation, diagnostic_report=diagnostic_report)
 
     async def _grade(
         self,
@@ -1862,14 +1871,53 @@ class EvalOrchestrator:
     def _failure_evidence(run: EvalRun) -> Tuple[FailureEvidence, ...]:
         failures = []
         for scenario in run.scenarios:
+            report = scenario.diagnostic_report
+            if report is not None and not report.skill_patch_allowed:
+                continue
+            eligible_cards = (
+                tuple(report.eligible_skill_failures)
+                if report is not None
+                else ()
+            )
             for grade in scenario.grades:
                 if grade.hard and grade.status == GradeStatus.FAIL:
+                    grade_cards = ()
+                    if report is not None:
+                        grade_ref = "grade:%s" % grade.grader_id
+                        grade_cards = tuple(
+                            card
+                            for card in eligible_cards
+                            if any(
+                                isinstance(item, Mapping)
+                                and item.get("ref") == grade_ref
+                                for item in card.evidence
+                            )
+                        )
+                        if not grade_cards:
+                            continue
                     evidence = []
                     for item in grade.evidence:
                         if isinstance(item, Mapping):
                             evidence.append(dict(item))
                         else:
                             evidence.append({"value": str(item)})
+                    if grade_cards:
+                        evidence.append(
+                            {
+                                "failure_cards": [
+                                    {
+                                        "failure_id": card.failure_id,
+                                        "reason_code": card.reason_code,
+                                        "observed_component": card.observed_component,
+                                        "remediation_surface": card.remediation_surface,
+                                        "confidence": card.confidence.value,
+                                        "patch_decision": card.patch_decision.value,
+                                        "skill_patch_authorized": card.skill_patch_authorized,
+                                    }
+                                    for card in grade_cards
+                                ]
+                            }
+                        )
                     failures.append(
                         FailureEvidence(
                             scenario_id=scenario.scenario_id,
@@ -1901,6 +1949,18 @@ class EvalOrchestrator:
     @staticmethod
     def _has_non_skill_failure(run: EvalRun) -> bool:
         for scenario in run.scenarios:
+            report = scenario.diagnostic_report
+            if report is not None:
+                if (
+                    not report.evaluable
+                    or report.patch_decision
+                    in (
+                        PatchDecision.DENY_SKILL_INTERVENTION,
+                        PatchDecision.NEEDS_MORE_EVIDENCE,
+                    )
+                ):
+                    return True
+                continue
             if scenario.error:
                 return True
             if any(

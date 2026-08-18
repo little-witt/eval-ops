@@ -47,18 +47,24 @@ MVP 的声明式通用性只覆盖已注册组件的能力交集。当前内置�
 - `auto | repair | tune` improvement policy 与单一 Primary Objective；
 - Objective 来源：Grader score/metric、usage、duration、tool-call count；
 - Pack Builder：`generic`、`csv-summary`、`security-review` 以及未知类型的 generic fallback；
+- Complex Skill Planning：source-grounded Capability Graph、风险加权 Test Requirement、Case 草稿和 Runtime gap；
+- Coverage：planned、Runtime-executable、Oracle-ready 和显式 observed requirement coverage；
+- Pack 内 `design/` Sidecar 与 `metadata.test_design` 引用；
+- Pack Quality Gate：Subject/Plan hash、cross-reference、critical coverage、Oracle trust、Runtime gap、generated holdout 和 family split leakage；
 - `draft -> calibrating -> frozen` 生命周期、显式冻结和内容锁；
+- Quality blocker 接入 `pack freeze --approve`；
 - 公司 Agent Profile 与 Session Log 的独立导入契约；
+- Imported Session 的离线 Failure Attribution；
 - `pack lint` 与 FakeRuntime `pack test`；
 - `security-review` 和 `csv-summary-smoke` 两个内置示例 Pack。
 
 ### 2.2 Planned（D40）
 
-- Skill Analyzer、Capability Graph 和风险加权 Test Requirement；
-- Case/Oracle 草稿生成、来源追踪和 Runtime feasibility routing；
-- requirement-to-case、Oracle-ready、Runtime-executable 和 observed coverage；
-- Pack Quality Gate、已知好坏样本区分能力和 mutation calibration；
-- Failure Card、Patch Authorization 和 Imported Session Replay；
+- model-assisted richer semantic analysis 和自动 fixture 变换；
+- seed expansion、metamorphic Case、Session Case mining 和 Run-to-coverage 自动接线；
+- 已知好坏样本区分能力、mutation calibration 和 evaluator flake；
+- Imported Session -> EvalRun、Grader Replay 和公司在线 Runtime；
+- 受控 argv-only Process Tool 与诊断探针；
 - 操作者显式加载的可信 Python Extension；
 - 外部 validation/holdout suite resolver；
 - AgentSubject/FixedAgentTarget；
@@ -67,7 +73,7 @@ MVP 的声明式通用性只覆盖已注册组件的能力交集。当前内置�
 - 不可信插件隔离、签名或 Marketplace；
 - 远程 Pack 安装和依赖解析。
 
-当前已有 `pack generate/calibrate/freeze` 和公司 Session 导入，但还没有 `--extension`、公司 Runtime Adapter、经人工标注校准的 LLM Judge。Runtime 由宿主/CLI 选择，不写入 Pack。
+当前已有 `plan`、`pack generate --plan`、`pack quality`、质量门禁冻结和 `session diagnose`，但还没有 `--extension`、公司 Runtime Adapter、Grader Replay、Process Tool、经人工标注校准的 LLM Judge 或 Web Console。Runtime 由宿主/CLI 选择，不写入 Pack。
 
 ## 3. 三层边界
 
@@ -123,7 +129,7 @@ Pack Builder 生成的 Pack 必须在 `metadata.calibration_status` 中声明生
 | `calibrating` | 运行校准、补充正反例、修订评测器 | Skill optimize |
 | `frozen` | run、compare、repair/tune | 原地修改评测语义 |
 
-`pack freeze --approve` 只改变生命周期元数据并生成 `.aceval-pack-lock.json`，不会自动补 Oracle、改 Grader、推断新 Objective 或删除失败 Case。内容锁覆盖除自身外的全部 Pack 文件；冻结后任一文件变化都会使 Loader fail closed。
+`pack freeze --approve` 会先执行基础校准就绪检查；带 `metadata.test_design` 的 Pack 还必须通过 Pack Quality Gate。通过后命令只改变生命周期元数据并生成 `.aceval-pack-lock.json`，不会自动补 Oracle、改 Grader、推断新 Objective 或删除失败 Case。内容锁覆盖除自身外的全部 Pack 文件；冻结后任一文件变化都会使 Loader fail closed。
 
 内置 legacy `v1alpha1` Pack 没有生命周期字段，为兼容已有资产按 grandfathered frozen 处理。新生成 Pack 不得利用该兼容路径。若需要改 frozen Pack，应创建新版本、重新冻结并从 baseline 重跑；不同 Pack hash 下的 uplift 不可直接续算。
 
@@ -135,9 +141,9 @@ Pack calibration loop -> frozen Pack hash -> Skill repair/tune loop
         +-------- new Pack version ------------+
 ```
 
-### 4.2 复杂 Skill 测试设计 Sidecar（Planned）
+### 4.2 复杂 Skill 测试设计 Sidecar（Implemented）
 
-D20 计划先保持 `v1alpha2` 顶层契约不变，把测试设计作为 Pack 内受内容锁保护的 sidecar：
+D20 保持 `v1alpha2` 顶层契约不变，把测试设计作为 Pack 内受内容锁保护的 sidecar：
 
 ```text
 evalpacks/<pack-name>/
@@ -148,21 +154,24 @@ evalpacks/<pack-name>/
     generation-provenance.json
 ```
 
-Manifest `metadata.test_design` 保存这些文件的版本、相对引用、源 Subject hash、Planner Profile hash 和审批状态；Scenario `metadata.aceval_test` 保存 requirement IDs、Case family、origin、verification path，以及故障注入 Case 的 `expected_signals/expected_recovery`。正式实现必须对这些引用执行与 `schema_ref` 同等级别的路径、Schema、hash 和 cross-reference 校验；不能因为 `metadata` 当前允许扩展字段，就假设 Loader 已经验证它们。
+Manifest `metadata.test_design` 保存 Sidecar API version、相对引用和源 Subject hash；Scenario `metadata.aceval_test` 保存 requirement IDs、Case family、origin、Oracle trust、Runtime capability、可执行性和选择来源。`pack quality` 会校验引用留在 Pack 内、Sidecar Subject hash 一致、generation provenance 与 Test Plan hash 一致，以及 Capability -> Requirement -> Case 的 cross-reference。Sidecar 仍由 Pack 全树 hash 和 freeze lock 保护。
 
 设计 Sidecar 的职责是解释 Case 从哪里来、覆盖什么以及有哪些缺口。Kernel 仍只按冻结 Scenario、fixture、Oracle 和 Grader 执行；Planner 不能在运行时改变 Gate。
 
-冻结前计划增加以下质量 blocker：
+冻结前当前会检查以下质量 blocker：
 
 - critical Test Requirement 有 Case，或存在带原因的显式 waiver；
-- active Case 所需 Runtime/Driver/Grader 能力可满足；
+- active Case 和 critical Requirement 的 Runtime 可执行性；
 - hard Oracle 不是未确认的 `model_proposed`；
 - Case family 不跨 split 泄漏；
-- Capability -> Requirement -> Case -> Oracle/Grader 双向引用一致；
+- Capability -> Requirement -> Case 引用一致，且 Case Oracle/Grader 可评；
 - 不可观察和不可执行路径没有被计为已覆盖；
-- 已知好样本/坏样本与可选 mutant 能证明基本区分能力。
+- 自动生成 Case 不能冒充 sealed holdout；
+- 源 Subject hash、Test Plan hash 和设计 Sidecar provenance 一致。
 
-Coverage 分为 planned、executable、oracle-ready、calibrated 和 observed。自然语言 Agent 路径不可穷举，因此不得把该报告描述为数学意义的“全路径覆盖”。自动生成且与 dev 同源的 Case 默认只能作为 dev/validation 草稿，不能作为独立 sealed holdout。
+Coverage 当前分为 planned、executable、oracle-ready 和 observed。`observed` 必须来自显式 Case/Requirement evidence；当前尚未在每次 EvalRun 后自动回写动态工具/状态覆盖。自然语言 Agent 路径不可穷举，因此不得把该报告描述为数学意义的“全路径覆盖”。自动生成且与 dev 同源的 Case 默认只能作为 dev/validation 草稿，不能作为独立 sealed holdout。
+
+当前 `mutation_score` 仅作为可选 provenance 数值校验；系统尚未生成 mutant，也没有 known-good/known-bad、mutation detection 或 evaluator flake 校准。这些属于 D40 的高级 Pack Quality。
 
 完整技术方案见 [COMPLEX_SKILL_EVAL_AND_DIAGNOSIS_DESIGN.md](./COMPLEX_SKILL_EVAL_AND_DIAGNOSIS_DESIGN.md)。
 
@@ -672,9 +681,16 @@ EvalPack 不能声明模型命令、环境变量、API key 或任意 Runtime 初
 ```bash
 aceval pack lint evalpacks/security-review
 aceval pack test evalpacks/security-review --runtime fake
+
+aceval plan --subject ./my-skill --cases seed-cases.json \
+  --goal '保持正确并减少工具调用' --runtime-profile reference \
+  --output .aceval/plans/my-skill
+aceval pack generate --plan .aceval/plans/my-skill \
+  --type generic --output .aceval/packs/my-skill
+aceval pack quality .aceval/packs/my-skill
 ```
 
-当前提供 `aceval pack generate/calibrate/freeze`，不再需要手写最小目录骨架。
+当前提供 `aceval plan` 和 `aceval pack generate/calibrate/freeze/quality`，不再需要手写最小目录骨架或测试设计 Sidecar。
 
 ### 13.2 `pack lint`
 
@@ -745,10 +761,10 @@ MVP 已证明第一种路径可以跨安全审查和 CSV artifact 两类任务�
 本节只保留 EvalPack 相关 backlog；跨模块的最新路线图、优先级和完成定义见 [ROADMAP.md](./ROADMAP.md)，复杂 Skill 规划与归因见 [COMPLEX_SKILL_EVAL_AND_DIAGNOSIS_DESIGN.md](./COMPLEX_SKILL_EVAL_AND_DIAGNOSIS_DESIGN.md)，可视化 Pack 校准方案见 [VISUAL_CONSOLE_DESIGN.md](./VISUAL_CONSOLE_DESIGN.md)。
 
 1. 扩大 `v1alpha1` legacy repair 与 `v1alpha2` repair/tune 的兼容性测试；
-2. 验证 `design/` Sidecar、Capability/TestPlan/Coverage Schema 和 cross-reference freeze gate；
-3. 增加 Case provenance、family leakage、Oracle trust、Runtime feasibility 和 mutation calibration；
-4. 将已定义的 Session `ObservationCompleteness` 接入 EvalRun、Replay、Failure Card 与 Case 草稿；
-5. 增加 Run manifest、Trace/artifact store 和 Replay；
+2. 在现有 `design/` Sidecar 与 cross-reference freeze gate 上增加 schema migration 和 Pack revision diff；
+3. 增加 seed expansion/metamorphic fixture、known-good/known-bad、mutation calibration 和 evaluator flake；
+4. 将已接入离线 Failure Card 的 Session `ObservationCompleteness` 继续接入 EvalRun、Grader Replay 与 Case mining；
+5. 增加 Run manifest、Trace/artifact store、公司在线 Runtime 和 Replay；
 6. 增加显式可信 Extension Loader，但 Manifest 仍不得自动 import 代码；
 7. 为多文件 Skill bundle、二进制 artifact 和受控 process/network/browser 工具定义受信组件与 capability，并为非单 entrypoint 文本 Candidate 定义显式 `verify_candidate_patch` 类扩展契约；
 8. 增加外部 suite resolver 和 evaluator-only 数据读取边界；

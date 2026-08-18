@@ -2,7 +2,7 @@
 
 > Agent Capability EvalOps: 在一个可控的参考 Agent 环境中，对 Skill 做可复现评测、成对比较和受控迭代。
 
-当前状态：仓库已经包含可运行的 `aceval 0.2.0` 参考实现、两个手写 EvalPack、Pack Builder、公司 Session 连接层、示例 Skill、命令行工具和自动测试。仓库中的 FakeRuntime 结果是确定性模拟，只用于验证 Kernel、Pack、Grader 和门禁流程；它们不是实际模型效果或提升数据。
+当前状态：仓库已经包含可运行的 `aceval 0.2.1` 参考实现、两个手写 EvalPack、复杂 Skill 规划与覆盖链路、Pack Builder/Quality Gate、Failure Attribution、公司 Session 导入与离线诊断、示例 Skill、命令行工具和自动测试。仓库中的 FakeRuntime 结果是确定性模拟，只用于验证 Kernel、Pack、Grader 和门禁流程；它们不是实际模型效果或提升数据。
 
 ## 一句话介绍
 
@@ -101,28 +101,48 @@ FakeRuntime 读取 Scenario 中预注册的 baseline/candidate 输出，用于�
 
 它不执行模型，也不证明示例候选能在真实模型上获得同样结果。所有 FakeRuntime 报告都会包含 `simulated: true`。
 
-## 下一阶段：复杂 Skill 规划与故障归因（Planned）
+## 复杂 Skill 规划与故障归因（Implemented，D20）
 
-当前 Pack Builder 是“Case 编译器”：它不会读取复杂 Skill、自动推导分支或证明路径覆盖。下一阶段将在 Kernel 外增加两个正式产品能力：
+当前实现已经在 Kernel 外增加两个正式能力面：
 
 ```text
 Skill + 少量种子 Case + Goal
   -> Capability Graph
-  -> Test Plan + Case/Oracle drafts
+  -> Test Plan + bounded Case drafts
   -> Coverage Matrix + Runtime gaps
   -> Pack Quality Gate -> frozen EvalPack
 
 Observation + Trace + Grade
   -> Failure Cards
-  -> Skill / Agent / CLI / Runtime / evaluator 分类
+  -> quality / tool / CLI / Runtime / evaluator / evidence-gap 分类
   -> Patch Authorization
 ```
 
-Planner 的目标是覆盖 Skill 明确声明的能力、关键风险、工具和状态转换，并列出未覆盖/不可执行路径，不宣称穷举任意自然语言路径。模型只提出结构化能力、Case、Oracle 和归因假设；代码校验 source refs、Runtime capability、Oracle 可信级别、覆盖分母、冻结 blocker 和是否允许修改 Skill。
+`aceval plan` 会确定性读取冻结的 UTF-8 `SKILL.md`，生成带行号和 quote hash 的 Capability Graph，将显式分支、风险、工具和状态声明编译为风险加权 Test Requirement，把种子 Case 映射到 Requirement，并在 `max_generated_cases` 预算内生成可编辑 Case 草稿。规划产物同时给出 planned、Runtime-executable、Oracle-ready 和显式 observed coverage、Runtime gap 与 Freeze Blocker；它不宣称穷举任意自然语言路径，也不会凭空生成并信任语义 Oracle。
 
-故障归因会把“在哪里观察到故障”“最可能原因”和“应该修改哪个组件”分开。CLI 未安装、权限/认证、网络、Runtime、Driver、Grader、Oracle 或证据缺失默认不会触发 Skill 修改；证据不足保持 `unknown`。公司 Session 在只有 Trace 时可做局部执行诊断，只有 Pack/Scenario/Oracle/artifact/state 足够完整时才允许完整 Replay。
+`aceval pack generate --plan ...` 会把规划产物编译进 Pack 的 `design/` Sidecar。`aceval pack quality` 和 `pack freeze --approve` 会校验 Sidecar source-subject/Plan hash 一致性、引用、critical coverage、Oracle trust、Runtime gap、generated holdout 和 Case family 跨 split 泄漏；`doctor` 运行前还会比较实际 Subject hash，除非用户显式允许 drift。当前 Quality Gate 还不包含 known-good/known-bad、mutation detection 或 evaluator flake 校准。
+
+Failure Attribution 已接入 Orchestrator：每个 Scenario 生成版本化 Failure Card 和 Patch Decision，只有授权的 dev hard failure 才会进入 Optimizer。CLI 未安装、权限/认证、网络、Runtime、Driver、Grader、Oracle 或证据缺失默认不会触发 Skill 修改；证据不足保持 `needs_more_evidence`。`aceval session diagnose` 可以读取已经归一化的 Imported Session，做 Trace/执行层离线诊断；它不是 EvalRun/Grader Replay，也不会在公司平台在线重跑 Agent。
+
+当前 Planner 和修改授权路径不依赖 LLM：语义更丰富的模型辅助分析只能作为未来草稿层，不能绕过确定性 source-ref、Quality Gate 或 Patch Authorization。
 
 完整方案和 D20/D40 范围见 [COMPLEX_SKILL_EVAL_AND_DIAGNOSIS_DESIGN.md](./COMPLEX_SKILL_EVAL_AND_DIAGNOSIS_DESIGN.md)。
+
+```bash
+aceval plan \
+  --subject ./my-skill \
+  --cases ./seed-cases.json \
+  --goal '结果正确，失败时不留下部分产物' \
+  --runtime-profile reference \
+  --output .aceval/plans/my-skill
+
+aceval pack generate \
+  --plan .aceval/plans/my-skill \
+  --type generic \
+  --output .aceval/packs/my-skill
+
+aceval pack quality .aceval/packs/my-skill
+```
 
 ## 安装
 
@@ -182,6 +202,30 @@ aceval pack freeze .aceval/packs/generic-answer --approve
 
 `--type` 可以传尚未支持的领域名；此时系统会一键生成 `generic` draft，并记录请求类型，但不会允许 `doctor --approve-pack` 直接用它优化 Skill。用户需要先补齐/确认语义 Oracle 和 Grader，再单独冻结。主观“更好”不会被悄悄翻译成模型自己定义、自己打分的标准。
 
+## 从复杂 Skill 生成 Test Plan
+
+当用户只有 Skill、少量种子 Case 和目标时，先运行规划链路。Planner 会输出 Capability Graph、Test Plan、Case 草稿、Coverage、Runtime gap 和生成来源，再将它们作为 `design/` Sidecar 编译进 EvalPack：
+
+```bash
+aceval plan \
+  --subject ./my-skill \
+  --cases ./seed-cases.json \
+  --goal '结果必须准确，并覆盖失败恢复路径' \
+  --runtime-profile reference \
+  --output .aceval/plans/my-skill
+
+aceval pack generate \
+  --plan .aceval/plans/my-skill \
+  --type generic \
+  --output .aceval/packs/my-skill
+
+aceval pack quality .aceval/packs/my-skill
+aceval pack calibrate .aceval/packs/my-skill
+aceval pack freeze .aceval/packs/my-skill --approve
+```
+
+若存在未确认 Oracle、critical coverage 缺口、Runtime 不支持的关键路径、Subject/Plan hash 不一致或 split 泄漏，`pack quality`/`freeze` 会阻断。用户应修订新 Pack 版本或校准草稿，不应通过删除失败 Case 来绕过门禁。自动生成 Case 只进入 dev/validation 草稿，不会成为 sealed holdout。
+
 ## 傻瓜式 repair/tune 入口
 
 `doctor` 把 Pack 生成、生命周期检查、baseline、自动模式选择和候选门禁串在一起。已支持模板可通过一次显式确认直接启动；baseline 有硬失败时选择 repair，全部 hard gate 已通过时选择 tune。
@@ -200,6 +244,21 @@ aceval doctor \
 ```
 
 若生成的 Pack 仍需校准，命令会停在 `calibration_required`，不会同时修改评测器和 Skill。
+
+希望一次命令先分析复杂 Skill 时，增加 `--auto-plan`；系统仍会在任何规划或质量 blocker 处安全停止：
+
+```bash
+aceval doctor \
+  --subject ./my-skill \
+  --cases ./seed-cases.json \
+  --type generic \
+  --goal '修复错误，并在正确性不回退的前提下减少 token' \
+  --auto-plan \
+  --plan-output .aceval/plans/my-skill \
+  --pack-output .aceval/packs/my-skill \
+  --runtime reference \
+  --model-command 'python path/to/model_bridge.py'
+```
 
 ## 公司 Agent API 与 Session 日志
 
@@ -220,9 +279,13 @@ aceval session import \
   --session-id SESSION_ID \
   --input downloaded-session.json \
   --output .aceval/imported/session.json
+
+aceval session diagnose \
+  --input .aceval/imported/session.json \
+  --output .aceval/imported/session-diagnosis.json
 ```
 
-导入结果统一为 `RunObservation` 语义：`output + canonical trace + usage + completeness`。当前连接层已经预留 Execute endpoint 和 Session 获取能力；把导入 Observation 直接接入完整 EvalRun/Replay 是后续扩展面。
+导入结果统一为 `RunObservation` 语义：`output + canonical trace + usage + completeness`。离线 `session diagnose` 已能对结构化 Runtime/tool/CLI 错误生成 Failure Card；把导入 Observation 接入 Pack/Scenario、完整 EvalRun、Grader Replay 或公司在线 Runtime 仍是 D40 扩展面。
 
 ## 双 Pack 可复制演示
 
@@ -435,30 +498,28 @@ Optimizer 使用同一 JSON envelope，但 `tools` 为空；其最终 `content` 
 
 ## 20 天黑客松路线
 
-当前代码已经提供 Reference Runtime、repair/tune Kernel、Pack Builder/冻结锁、双 Pack、公司 Session 连接层、确定性 Grader、FakeRuntime conformance、受控优化门禁和 JSON/Markdown 报告。D20 剩余重点是把它打磨成可信演示：
+当前代码已经提供 Reference Runtime、repair/tune Kernel、复杂 Skill Analyzer/Test Planner/Coverage、Pack Builder/Quality/冻结锁、Failure Attribution、离线 Session diagnose、双 Pack、确定性 Grader、FakeRuntime conformance、受控优化门禁和 JSON/Markdown 报告。D20 剩余重点是把这些能力打磨成可信演示，而不是继续补同层契约：
 
 1. 接入一个真实模型桥接并冻结模型参数，完成双 Pack 的重复实验；
-2. 从一个复杂文件型 Skill 和少量种子 Case 生成 Capability Graph、Test Plan、Case 草稿和 Coverage Matrix；
-3. 展示一个 critical gap/未确认 Oracle 阻止冻结，并在确认后进入 Pack Quality Gate；
-4. 生成可修 Skill 与不可修 CLI/Runtime/Grader 两类 Failure Card，证明不会误改；
-5. 校验候选在 dev、validation、holdout 上的实际表现，不预填提升数字；
-6. 固化 6 分钟演示、失败降级方案、录屏和可复现实验说明；
-7. 展示第二 Pack 的实际接入改动与工时，证明扩展边界而非口头宣称通用。
+2. 用一个复杂文件型 Skill 演示 `plan -> pack generate --plan -> pack quality -> freeze`，展示 critical gap、未确认 Oracle 和 Runtime gap；
+3. 演示一张允许 Skill intervention 的 Failure Card，以及一张来自离线 Session 的 CLI/Runtime/Grader 阻断 Card；
+4. 校验候选在 dev、validation、holdout 上的实际表现，不预填提升数字；
+5. 固化 6 分钟演示、失败降级方案、录屏和可复现实验说明；
+6. 展示第二 Pack 的实际接入改动与工时，证明扩展边界而非口头宣称通用。
 
 黑客松提交应把 FakeRuntime 演示标记为 simulation，并将任何实际提升数字绑定到可复现的真实模型报告。
 
 ## 40 天求职作品路线
 
-D20 已经前置实现 repair/tune、Pack Builder/冻结锁、Doctor、公司 Profile、Session Import 和 paired gates。D40 不再以继续堆底层功能为主，而改为：
+D20 已经前置实现 repair/tune、复杂 Skill 规划/覆盖、基础 Pack Quality、Failure Attribution、Doctor、公司 Profile、Session Import/离线 Diagnosis 和 paired gates。D40 不再重复实现这些契约，而改为：
 
 1. 完成真实模型 repair/tune Benchmark 和重复执行统计；
-2. 完成 Capability Graph、Test Plan、Case 草稿和 Coverage Matrix；
-3. 完成 Failure Card、Skill Patch Authorization 和 canonical failure fixtures；
-4. 建设 EvalPack Quality Gate，衡量 Oracle 可信级别、覆盖率、区分能力、mutation、泄漏和 flake；
-5. 将公司 Execute/Session 接成 `CompanyRuntimeAdapter`、EvalRun、Replay 和 Diagnosis；
-6. 增加受控 argv-only Process Tool、CLI 分类和诊断探针；
-7. 抽取 CLI/Web 共用的 Application Service，建设静态 HTML 和本地 Skill Doctor Console；
-8. 用重复统计、主观 Judge Pilot、`FixedAgentTarget`、CI、教程、视频和消融完成求职作品化。
+2. 用标注集评测并增强 Analyzer/Planner，加入 seed expansion、metamorphic Case 和自动动态覆盖接线；
+3. 将基础 Pack Quality 扩展到 known-good/known-bad、mutation、evaluator flake 和 Pack revision diff；
+4. 将公司 Execute/Session 接成 `CompanyRuntimeAdapter`、EvalRun、Grader Replay 和 Case mining；
+5. 增加受控 argv-only Process Tool 和只读诊断探针；
+6. 抽取 CLI/Web 共用的 Application Service，建设静态 HTML 和本地 Skill Doctor Console；
+7. 用重复统计、主观 Judge Pilot、`FixedAgentTarget`、CI、教程、视频和消融完成求职作品化。
 
 完整排期、完成定义和优先级见 [ROADMAP.md](./ROADMAP.md)。可视化产品与技术方案见 [VISUAL_CONSOLE_DESIGN.md](./VISUAL_CONSOLE_DESIGN.md)。
 
@@ -473,7 +534,7 @@ D20 已经前置实现 repair/tune、Pack Builder/冻结锁、Doctor、公司 Pr
 - baseline/candidate 指标、Skill diff 和候选谱系；
 - 公司 Session 导入、completeness、Diagnosis 和 Replay。
 
-实施顺序为：真实实验数据 -> Test Plan/Coverage/Failure Card 契约 -> 静态 HTML -> Application Service -> Read-only Console -> Session Replay/Pack Quality/统计 -> Operational Console。UI 不重新实现 Gate、Objective、归因授权或 Pack 生命周期语义。
+实施顺序为：真实实验数据 -> 规划/归因 Benchmark 与高级 Pack Quality -> 公司在线 Replay/Process Tool -> 静态 HTML -> Application Service -> Read-only Console -> Operational Console。当前仓库没有 Web Console；未来 UI 也不重新实现 Gate、Objective、归因授权或 Pack 生命周期语义。
 
 ## 开发与测试
 

@@ -20,6 +20,7 @@ from aceval.contracts import (
     TraceEvent,
 )
 from aceval.drivers import ArtifactWorkspaceDriver, builtin_drivers
+from aceval.failure_attribution import FailureAttributor, PatchDecision
 from aceval.graders import builtin_graders
 from aceval.optimizer import (
     CandidateRejected,
@@ -70,6 +71,27 @@ class RecordingCandidateOptimizer(FrozenCandidateOptimizer):
             output_root,
             policy=policy,
             forbidden_literals=forbidden_literals,
+        )
+
+
+class InformationalCardAttributor(FailureAttributor):
+    """Add a non-patchable informational card beside actionable failures."""
+
+    def attribute_scenario(self, evaluation, metadata=None):
+        report = super().attribute_scenario(evaluation, metadata=metadata)
+        if not report.eligible_skill_failures:
+            return report
+        informational = replace(
+            report.eligible_skill_failures[0],
+            failure_id="info-" + report.eligible_skill_failures[0].failure_id,
+            category="expected_fault",
+            reason_code="expected.observed",
+            patch_decision=PatchDecision.NONE,
+            expected_fault=True,
+        )
+        return replace(
+            report,
+            failure_cards=report.failure_cards + (informational,),
         )
 
 
@@ -570,6 +592,66 @@ class OrchestratorTest(unittest.IsolatedAsyncioTestCase):
             SkillMarkdownSubjectAdapter()
             .snapshot(str(result.selected_candidate_path))
             .content_hash,
+        )
+
+    async def test_optimizer_receives_only_patch_authorized_failure_cards(self):
+        registry = component_registry()
+        pack = self.load_pack("security-review", registry)
+        optimizer = RecordingCandidateOptimizer(
+            self.subject("security-review-skill-candidate")
+        )
+
+        result = await EvalOrchestrator(
+            registry,
+            FakeRuntime(),
+            output_root=self.output_root,
+            failure_attributor=InformationalCardAttributor(),
+        ).optimize(
+            pack,
+            self.subject("security-review-skill"),
+            optimizer,
+        )
+
+        self.assertTrue(result.accepted)
+        self.assertTrue(optimizer.calls)
+        allowed_ids = {
+            card.failure_id
+            for scenario in result.baseline_dev.scenarios
+            for card in scenario.diagnostic_report.failure_cards
+            if card.patch_decision == PatchDecision.ALLOW_SKILL_INTERVENTION
+        }
+        non_patchable_ids = {
+            card.failure_id
+            for scenario in result.baseline_dev.scenarios
+            for card in scenario.diagnostic_report.failure_cards
+            if card.patch_decision != PatchDecision.ALLOW_SKILL_INTERVENTION
+        }
+        transmitted_cards = [
+            card
+            for optimizer_call in optimizer.calls
+            for failure in optimizer_call
+            for item in failure.evidence
+            if isinstance(item, dict)
+            for card in item.get("failure_cards", ())
+        ]
+
+        self.assertTrue(allowed_ids)
+        self.assertTrue(non_patchable_ids)
+        self.assertEqual(
+            allowed_ids,
+            {card["failure_id"] for card in transmitted_cards},
+        )
+        self.assertTrue(
+            all(
+                card["patch_decision"] == "allow_skill_intervention"
+                and card["skill_patch_authorized"] is True
+                for card in transmitted_cards
+            )
+        )
+        self.assertTrue(
+            non_patchable_ids.isdisjoint(
+                card["failure_id"] for card in transmitted_cards
+            )
         )
 
     async def test_tune_reduces_tokens_through_paired_dev_validation_and_holdout(self):
