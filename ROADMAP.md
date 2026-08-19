@@ -2,7 +2,7 @@
 
 > 状态日期：2026-08-18  
 > 适用版本：`aceval 0.2.1` 之后
-> 本文是 D20 黑客松交付和 D40 求职作品的当前计划基线；旧研究文档中的时间安排保留为决策记录，若有冲突以本文为准。
+> 本文是 D20 黑客松交付和 D40 完整作品的当前计划基线；旧研究文档中的时间安排保留为决策记录，若有冲突以本文为准。
 
 ## 1. 当前产品结论
 
@@ -294,7 +294,7 @@ Skill + Goal + 2–5 个种子 Case + Runtime Profile
 - [ ] Operational Console、Experiment 事件协议和 SSE；
 - [ ] Pack 校准、Coverage 和 Diagnosis 页面。
 
-### D39–D40：求职作品化
+### D39–D40：完整作品化
 
 - [ ] FixedAgentTarget 最小迁移验证；
 - [ ] CI Gate；

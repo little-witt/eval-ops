@@ -509,7 +509,7 @@ Optimizer 使用同一 JSON envelope，但 `tools` 为空；其最终 `content` 
 
 黑客松提交应把 FakeRuntime 演示标记为 simulation，并将任何实际提升数字绑定到可复现的真实模型报告。
 
-## 40 天求职作品路线
+## 40 天完整作品路线
 
 D20 已经前置实现 repair/tune、复杂 Skill 规划/覆盖、基础 Pack Quality、Failure Attribution、Doctor、公司 Profile、Session Import/离线 Diagnosis 和 paired gates。D40 不再重复实现这些契约，而改为：
 
@@ -519,7 +519,7 @@ D20 已经前置实现 repair/tune、复杂 Skill 规划/覆盖、基础 Pack Qu
 4. 将公司 Execute/Session 接成 `CompanyRuntimeAdapter`、EvalRun、Grader Replay 和 Case mining；
 5. 增加受控 argv-only Process Tool 和只读诊断探针；
 6. 抽取 CLI/Web 共用的 Application Service，建设静态 HTML 和本地 Skill Doctor Console；
-7. 用重复统计、主观 Judge Pilot、`FixedAgentTarget`、CI、教程、视频和消融完成求职作品化。
+7. 用重复统计、主观 Judge Pilot、`FixedAgentTarget`、CI、教程、视频和消融完成完整作品化。
 
 完整排期、完成定义和优先级见 [ROADMAP.md](./ROADMAP.md)。可视化产品与技术方案见 [VISUAL_CONSOLE_DESIGN.md](./VISUAL_CONSOLE_DESIGN.md)。
 

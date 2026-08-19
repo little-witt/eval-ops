@@ -25,7 +25,7 @@ D20 已在 Kernel 外实现“复杂 Skill 测试规划”和“证据化故障�
 本文用以下两个状态区分实现与规划：
 
 - **Implemented（MVP）**：当前仓库已有代码和测试，可通过 CLI 或公共 Python 契约运行。
-- **Planned（D40）**：求职作品阶段计划，不属于当前能力，也不能用于描述当前交付。
+- **Planned（D40）**：完整作品阶段计划，不属于当前能力，也不能用于描述当前交付。
 
 ## 3. MVP 已实现范围
 
@@ -604,6 +604,6 @@ git diff --check
 
 > 一个项目内置的 Reference Agent Runtime，可以驱动通用 EvalPack 生命周期；系统能从当前支持面内的复杂 Skill 和少量种子 Case 生成可审计测试计划，明确覆盖/Runtime 缺口，并将可用 Skill 干预的行为失败与 CLI、Runtime、Grader 等外部故障分开，再执行受控候选生成和回归门禁。
 
-40 天求职版本负责进一步证明：
+40 天完整版本负责进一步证明：
 
 > 同一核心可以把 Skill、Agent 或 Workflow 转换为有来源和覆盖声明的测试契约，接收真实 Runtime 运行和外部 Session 日志，通过证据化归因选择正确干预面，并在不可变评测 revision 下持续优化，而不是把当前 `SKILL.md` Runtime 夸大为任意平台适配层。

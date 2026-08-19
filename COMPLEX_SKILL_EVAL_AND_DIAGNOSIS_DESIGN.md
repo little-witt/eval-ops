@@ -3,7 +3,7 @@
 > 项目：Skill Doctor / Agent Capability EvalOps  
 > 状态：D20 核心已实现；D40 扩展项在文中单独标注
 > 日期：2026-08-18  
-> 适用范围：D20 黑客松增强版与 D40 求职作品
+> 适用范围：D20 黑客松增强版与 D40 完整作品
 
 ## 1. 方案结论
 
@@ -856,7 +856,7 @@ replay_session(...)
 - 数学意义的全路径覆盖；
 - 从单次日志宣称强因果根因。
 
-## 11. D21–D40 求职作品范围
+## 11. D21–D40 完整作品范围
 
 ### D21–D24：规划与归因 Benchmark
 
@@ -899,7 +899,7 @@ replay_session(...)
 - 相同 Case 的重复归因一致性；
 - 经人工确认的主观 rubric Pilot。
 
-### D39–D40：求职作品化
+### D39–D40：完整作品化
 
 - Local Console 完整串联 Plan、Pack、Run、Diagnosis；
 - CI Gate 和一键 Replay；
