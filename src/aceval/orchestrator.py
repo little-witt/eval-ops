@@ -39,6 +39,11 @@ from .contracts import (
     is_tool_call_event,
 )
 from .failure_attribution import FailureAttributor, PatchDecision
+from .experiments import (
+    ExperimentPlan,
+    ExperimentPlanError,
+    resolve_experiment_plan,
+)
 from .optimizer import (
     CandidateRejected,
     FailureEvidence,
@@ -446,6 +451,9 @@ class OptimizationResult:
     dev_objective: Optional[ObjectiveComparison] = None
     validation_objective: Optional[ObjectiveComparison] = None
     holdout_objective: Optional[ObjectiveComparison] = None
+    experiment_plan_hash: Optional[str] = None
+    experiment_plan_source: Optional[str] = None
+    eval_suite_hash: Optional[str] = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "trials", tuple(self.trials))
@@ -779,10 +787,18 @@ class EvalOrchestrator:
         mode: Optional[str] = None,
         goal: Optional[str] = None,
         objective: Optional[ObjectiveSpec] = None,
+        experiment_plan: Optional[ExperimentPlan] = None,
     ) -> OptimizationResult:
-        policy = pack.manifest.optimizer_policy
-        if policy is None:
-            raise OrchestrationError("EvalPack is eval-only and declares no optimizer policy")
+        try:
+            active_experiment = (
+                experiment_plan
+                if experiment_plan is not None
+                else resolve_experiment_plan(pack)
+            )
+            active_experiment.validate_suite(pack)
+        except ExperimentPlanError as exc:
+            raise OrchestrationError(str(exc)) from exc
+        policy = active_experiment.optimization
         calibration_status = pack_calibration_status(pack)
         if calibration_status not in (CALIBRATION_FROZEN, CALIBRATION_LEGACY):
             raise OrchestrationError(
@@ -839,6 +855,9 @@ class EvalOrchestrator:
             values.setdefault("mode", active_mode.value)
             values.setdefault("goal", active_goal)
             values.setdefault("objective", active_objective)
+            values.setdefault("experiment_plan_hash", active_experiment.content_hash)
+            values.setdefault("experiment_plan_source", active_experiment.source)
+            values.setdefault("eval_suite_hash", pack.suite_hash)
             return OptimizationResult(**values)
 
         baseline_dev = await self._evaluate(

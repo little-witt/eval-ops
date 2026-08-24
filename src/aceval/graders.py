@@ -1175,6 +1175,8 @@ def _matches_any(paths: Sequence[str], pattern: str) -> bool:
 
 
 def builtin_graders() -> Mapping[str, Any]:
+    from .code_review import CodeReviewFindingsGrader
+
     graders = (
         JsonSchemaGrader(),
         JsonPathGrader(),
@@ -1183,6 +1185,7 @@ def builtin_graders() -> Mapping[str, Any]:
         SourceReferenceGrader(),
         TraceAssertGrader(),
         WorkspaceDiffGrader(),
+        CodeReviewFindingsGrader(),
     )
     return {grader.id: grader for grader in graders}
 

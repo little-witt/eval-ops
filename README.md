@@ -4,6 +4,12 @@
 
 当前状态：仓库已经包含可运行的 `aceval 0.2.1` 参考实现、两个手写 EvalPack、复杂 Skill 规划与覆盖链路、Pack Builder/Quality Gate、Failure Attribution、公司 Session 导入与离线诊断、示例 Skill、命令行工具和自动测试。仓库中的 FakeRuntime 结果是确定性模拟，只用于验证 Kernel、Pack、Grader 和门禁流程；它们不是实际模型效果或提升数据。
 
+代码评审场景的 P0 已加入内容寻址环境契约、离线只读 Docker Provider、覆盖
+TypeScript Web、React Native、微信小程序 JS 与 Java 后端的统一分支式 Git
+fixture lab、`repository.verify/v1`、专用 findings Grader，以及 CATX 精确
+Skill/仓库绑定的 fail-closed 适配边界。搭建和 Ready 标准见
+[CODE_REVIEW_P0_RUNBOOK.md](./CODE_REVIEW_P0_RUNBOOK.md)。
+
 ## 一句话介绍
 
 Skill Doctor 把“人工运行 Skill -> 搬运会话日志 -> 请 Agent 分析 -> 修改 Skill -> 手工回归”的过程，收敛为一套受确定性工作流控制的 EvalOps 系统：加载冻结测试契约，在统一 Runtime 中执行 Skill，采集标准 Trace、产物和 usage；baseline 有硬失败时进入 `repair`，baseline 已可用时按明确 Objective 进入 `tune`，再经过 validation 与可选 holdout 门禁输出候选和证据报告。
@@ -58,7 +64,7 @@ baseline / compare / dev candidate search
 validation promotion -> optional one-shot holdout -> report
 ```
 
-Kernel 负责 Pack 完整性校验、Subject 快照、Runtime capability 检查、工作区生命周期、预算、评分聚合、候选 lineage 和回归门禁。领域知识位于 EvalPack 的 Scenario、fixture、Oracle、Grader 配置和 Optimizer policy 中，Orchestrator 不包含安全审查或 CSV 的条件分支。
+Kernel 负责 Pack 完整性校验、Subject 快照、Runtime capability 检查、工作区生命周期、预算、评分聚合、候选 lineage 和回归门禁。领域评测知识位于 EvalPack 的 Scenario、fixture、Oracle 和 Grader 配置中；优化目标、预算和修改约束位于独立 ExperimentPlan 中。Orchestrator 不包含安全审查或 CSV 的条件分支。
 
 当前内置 Optimizer 只修改 UTF-8 `SKILL.md`，不会覆盖原 Skill。候选受允许路径、最大新增行数、最大候选数、父版本 hash 和测试字面量泄漏检查约束。`repair` 只能接收 dev 的确定性硬失败证据；`tune` 只能接收 dev 的目标与测量值。validation/holdout 从不反馈给 Optimizer。Tune 在 dev、validation 和 holdout 上都保持 hard Grader 非劣，并对 baseline/candidate 做成对 Objective 比较。
 
@@ -66,11 +72,11 @@ Kernel 负责 Pack 完整性校验、Subject 快照、Runtime capability 检查�
 
 当前 `candidate-patch-v1` 的可验证格式仍是刻意收窄的：候选目录提供完整文件快照，`content` 必须是 UTF-8 文本，diff 只能修改单个声明的 entrypoint，Kernel 会从冻结 parent/candidate 重新计算 unified diff 并逐项核对。无效 base/path/hash/diff 会计入 rejected proposal 和 usage 后以结构化协议错误停止。多文件或二进制优化不能只注册一个新 Subject Adapter；D40 需要同时定义显式的候选验证扩展契约（例如 `verify_candidate_patch`）及对应安全测试。
 
-Manifest 中三类自由参数有固定传递边界：`subject_contract.params` 进入 Subject Adapter 的 `snapshot/materialize` 以及候选重验；`driver.params` 只通过 Driver `RunContext.metadata.driver_params` 进入 `prepare`，不会转发给 Runtime；`optimizer_policy.params` 通过 `PatchConstraints.metadata.optimizer_params` 交给 `candidate-patch-v1` Optimizer。当前内置 Adapter/Driver 不消费这些自定义参数。
+两类评测参数和一类实验参数有固定传递边界：`subject_contract.params` 进入 Subject Adapter 的 `snapshot/materialize` 以及候选重验；`driver.params` 只通过 Driver `RunContext.metadata.driver_params` 进入 `prepare`，不会转发给 Runtime；ExperimentPlan 的 `optimization.params` 通过 `PatchConstraints.metadata.optimizer_params` 交给 `candidate-patch-v1` Optimizer。当前内置 Adapter/Driver 不消费这些自定义参数。
 
 ### EvalPack
 
-`EvalPack v1alpha1` 保持 legacy repair 兼容；`v1alpha2` 新增 `auto | repair | tune`、自然语言 Goal 和单一 Primary Objective。Objective 第一版支持 Grader score/metric、Token/成本、场景耗时和工具调用数；所有 hard Grader 始终是正确性与安全 guardrail。仓库内置两个 Pack：
+`EvalPack v1alpha1` 保持 legacy repair 兼容；旧 Pack 中的 `optimizer_policy` 仍可由兼容适配器读取，但新 Builder 不再写入该字段。新生成的薄 EvalPack 只定义评测契约；`auto | repair | tune`、自然语言 Goal、单一 Primary Objective、优化器和补丁预算进入相邻的 `ExperimentPlan v1`。Objective 第一版支持 Grader score/metric、Token/成本、场景耗时和工具调用数；所有 hard Grader 始终是正确性与安全 guardrail。仓库内置两个 legacy Pack：
 
 | Pack | 输入与输出 | Case | 主要 Grader |
 |---|---|---:|---|
@@ -79,7 +85,7 @@ Manifest 中三类自由参数有固定传递边界：`subject_contract.params` 
 
 接入新任务时，若 UTF-8 `SKILL.md`、固定文件工具和现有 Driver/Grader 已足够，优先用 Pack Builder 从少量 Case 和 Goal 生成 Pack。已支持 `generic`、`csv-summary`、`security-review` 模板；未知类型会安全降级到 `generic` 草稿。出现新的 Subject 文件形态、工具能力、输入输出模态、评分语义或修改表面时，需要实现并显式注册相应受信组件；目标是保持 Kernel 状态机不随领域变化，而不是宣称扩展永远零代码。
 
-生成的 EvalPack 采用独立生命周期：
+生成的 EvalPack 采用独立生命周期，并在 Pack 目录旁生成 `<pack>.experiment.json`：
 
 ```text
 draft -> calibrating（可反复改 Case/Oracle/Grader） -> frozen
@@ -88,7 +94,10 @@ draft -> calibrating（可反复改 Case/Oracle/Grader） -> frozen
                                               repair/tune Skill
 ```
 
-草稿可以 `lint`、`test` 和人工校准，但不能进入 Skill 优化。显式冻结时会生成 `.aceval-pack-lock.json`；冻结后任何 Case、Oracle、Grader、fixture 或 Objective 变化都会使加载失败。需要调整评测器时，应创建新 Pack 版本并重新跑 baseline，不能让模型在同一实验里同时改 EvalPack 和 Skill。
+草稿可以 `lint`、`test` 和人工校准，但不能进入 Skill 优化。显式冻结时会生成 `.aceval-pack-lock.json`；冻结后任何 Case、Oracle、Grader 或 fixture 变化都会使加载失败。ExperimentPlan 可独立调整且不会改变 Pack hash，但必须绑定正确的 Suite hash。需要调整评测器时，应创建新 Pack 版本并重新跑 baseline，不能让模型在同一实验里同时改 EvalPack 和 Skill。
+
+这一职责拆分的完整迭代方案、迁移策略和验收标准见 [SKILL_OPTIMIZATION_DECOUPLING_PLAN.md](./SKILL_OPTIMIZATION_DECOUPLING_PLAN.md)。
+热门研发与工作类 Skill 的评测画像、优先级和复用建议见 [COMMON_SKILL_EVALUATION_STRATEGY.md](./COMMON_SKILL_EVALUATION_STRATEGY.md)。
 
 ### FakeRuntime 的定位
 
@@ -186,7 +195,7 @@ aceval pack test evalpacks/csv-summary-smoke --runtime fake
 
 ## 从少量 Case 生成 EvalPack
 
-已支持类型只需提供 Case JSON 和 Goal；若 Goal 明确包含 Token、成本、工具调用或延迟，Builder 会生成一个可测量的单一效率 Objective，并保留 hard Grader 作为正确性约束。示例输入见 `examples/cases/generic-cases.example.json`。
+已支持类型只需提供 Case JSON 和 Goal；若 Goal 明确包含 Token、成本、工具调用或延迟，Builder 会在独立 ExperimentPlan 中生成一个可测量的单一效率 Objective，EvalPack 内的 hard Grader 只负责正确性约束。示例输入见 `examples/cases/generic-cases.example.json`。
 
 ```bash
 aceval pack generate \
@@ -199,6 +208,8 @@ aceval pack calibrate .aceval/packs/generic-answer
 aceval pack lint .aceval/packs/generic-answer
 aceval pack freeze .aceval/packs/generic-answer --approve
 ```
+
+生成结果包含 `.aceval/packs/generic-answer/` 和同级的 `.aceval/packs/generic-answer.experiment.json`。普通用户不需要手工传入后者，`doctor` 和 `optimize` 会自动发现；高级用户可用 `--experiment` 显式选择另一份绑定相同 Suite hash 的实验计划。
 
 `--type` 可以传尚未支持的领域名；此时系统会一键生成 `generic` draft，并记录请求类型，但不会允许 `doctor --approve-pack` 直接用它优化 Skill。用户需要先补齐/确认语义 Oracle 和 Grader，再单独冻结。主观“更好”不会被悄悄翻译成模型自己定义、自己打分的标准。
 
@@ -228,7 +239,22 @@ aceval pack freeze .aceval/packs/my-skill --approve
 
 ## 傻瓜式 repair/tune 入口
 
-`doctor` 把 Pack 生成、生命周期检查、baseline、自动模式选择和候选门禁串在一起。已支持模板可通过一次显式确认直接启动；baseline 有硬失败时选择 repair，全部 hard gate 已通过时选择 tune。
+`doctor` 把评测装配、复用、baseline、自动模式选择和候选门禁串在一起。普通用户不需要提供 Pack 或类型：系统从 Skill 和验收标准推断内部评测画像，按精确签名检索已有冻结 EvalSuite；完全匹配则复用，否则从内部 Blueprint 生成最小草稿。Cases 是可选增强输入。
+
+不提供 Cases 时，可以直接提供一项任务及预期 JSON：
+
+```bash
+aceval doctor \
+  --subject ./my-skill \
+  --standards @acceptance-standards.md \
+  --prompt '处理示例输入并返回结果' \
+  --expected-output @expected-output.json \
+  --approve-evaluation \
+  --runtime reference \
+  --model-command 'python path/to/model_bridge.py'
+```
+
+如果暂时没有可信预期结果，可以只传 `--standards`。系统会返回 `needs_user_input` 和需要补充的预期，不要求用户编辑 EvalPack。D2C、在线文档编辑等超出当前 Runtime 的场景会返回 `runtime_adapter_required`，不会用 generic 评测代替真实视觉或远端状态验证。
 
 ```bash
 aceval doctor \
@@ -244,6 +270,8 @@ aceval doctor \
 ```
 
 若生成的 Pack 仍需校准，命令会停在 `calibration_required`，不会同时修改评测器和 Skill。
+
+高级入口保持不变：`--cases` 提供完整自定义用例，`--pack` 直接使用指定 EvalPack，`--experiment` 使用自定义优化计划，`--type` 覆盖自动模板选择，`--suite-root` 增加复用搜索目录，`--no-reuse` 强制生成新评测草稿。
 
 希望一次命令先分析复杂 Skill 时，增加 `--auto-plan`；系统仍会在任何规划或质量 blocker 处安全停止：
 
@@ -286,6 +314,45 @@ aceval session diagnose \
 ```
 
 导入结果统一为 `RunObservation` 语义：`output + canonical trace + usage + completeness`。离线 `session diagnose` 已能对结构化 Runtime/tool/CLI 错误生成 Failure Card；把导入 Observation 接入 Pack/Scenario、完整 EvalRun、Grader Replay 或公司在线 Runtime 仍是 D40 扩展面。
+
+### CATX 线上 Agent
+
+CATX Profile 示例见 `examples/catx-api-profile.example.json`。连接器支持创建 Session、写入首条 `user.message`、状态查询、全事件日志获取，以及通过 Supabase Edge Function 监听 SSE；SSE 到达终态后会重新读取 CATX 状态与全量事件，并保存为同一种 `ImportedRunBundle`。
+
+本地使用可在 Profile 中配置 `credentials_file`（相对路径按 Profile 所在目录解析），文件内容为环境变量名到凭据值的 JSON 对象，且在 POSIX 系统上权限必须为 `0600`。同名环境变量会覆盖文件值，便于 CI/云端注入；Profile 校验不会加载或输出凭据。
+
+```bash
+export CATX_API_KEY='...'
+export USER_MIS_ID='your-mis'
+export CATX_AGENT_ID='agent_xxx'
+export CATX_ENV_ID='env_xxx'
+export SUPABASE_ANON_KEY='...'
+# 可选；未设置时 Authorization 使用 SUPABASE_ANON_KEY
+export SUPABASE_ACCESS_TOKEN='...'
+
+aceval profile validate examples/catx-api-profile.example.json
+
+aceval session execute \
+  --profile examples/catx-api-profile.example.json \
+  --request examples/catx-session-request.example.json
+
+aceval session status \
+  --profile examples/catx-api-profile.example.json \
+  --session-id SESSION_ID
+
+aceval session listen \
+  --profile examples/catx-api-profile.example.json \
+  --session-id SESSION_ID \
+  --output .aceval/imported/catx-session.json
+```
+
+没有 SSE 代理时可直接用 `session fetch` 获取当前状态和所有事件类型。完整接入说明、安全边界和排障步骤见 [CATX_ONLINE_AGENT.md](./CATX_ONLINE_AGENT.md)。
+
+CATX 精确绑定候选 Skill 和挂载仓库的请求字段尚待正式接口。当前实现已冻结
+`CatxExecutionBinding` 契约和 `CatxRuntimeAdapter`：接入后必须回读实际 Skill /
+仓库 hash 与 base/head commit，证据缺失或漂移不会进入评分。代码评审 P0 的本地
+fixture、隔离验证和评分可独立运行，详见
+[CODE_REVIEW_P0_RUNBOOK.md](./CODE_REVIEW_P0_RUNBOOK.md)。
 
 ## 双 Pack 可复制演示
 
@@ -549,7 +616,10 @@ git diff --check
 ## 仓库文档
 
 - [ROADMAP.md](./ROADMAP.md)：更新后的 D20/D40 路线图、已前置能力、待办与完成定义；
+- [SYSTEM_ARCHITECTURE_AND_INDUSTRY_ANALYSIS.md](./SYSTEM_ARCHITECTURE_AND_INDUSTRY_ANALYSIS.md)：总体架构、执行/验证环境分层、业界对标、价值判断、可行度与待办优先级；
 - [COMPLEX_SKILL_EVAL_AND_DIAGNOSIS_DESIGN.md](./COMPLEX_SKILL_EVAL_AND_DIAGNOSIS_DESIGN.md)：复杂 Skill 测试规划、覆盖、Pack Quality、故障归因和 CLI/Session 方案；
+- [SKILL_OPTIMIZATION_DECOUPLING_PLAN.md](./SKILL_OPTIMIZATION_DECOUPLING_PLAN.md)：薄 EvalSuite、独立 ExperimentPlan 和无感 Evaluation Compiler 迭代方案；
+- [COMMON_SKILL_EVALUATION_STRATEGY.md](./COMMON_SKILL_EVALUATION_STRATEGY.md)：常用 Skill 场景的评测画像、实施优先级和复用边界；
 - [VISUAL_CONSOLE_DESIGN.md](./VISUAL_CONSOLE_DESIGN.md)：本地可视化操作台的产品、架构、API、安全和分阶段方案；
 - [EVALPACK_SPEC.md](./EVALPACK_SPEC.md)：EvalPack 边界、Manifest 和公共 Protocol；
 - [TECHNICAL_DESIGN.md](./TECHNICAL_DESIGN.md)：完整技术方案、状态机和验收标准；
@@ -559,6 +629,7 @@ git diff --check
 - [src/aceval/orchestrator.py](./src/aceval/orchestrator.py)：通用执行、比较与优化门禁；
 - [src/aceval/pack_builder.py](./src/aceval/pack_builder.py)：EvalPack 草稿生成、校准和冻结；
 - [src/aceval/connections.py](./src/aceval/connections.py)：公司 API Profile 与 Session 日志归一化；
+- [src/aceval/catx.py](./src/aceval/catx.py)：CATX 会话创建、状态/事件获取与 Supabase SSE 监听；
 - [evalpacks](./evalpacks)：内置双 Pack 与 fixture/Oracle。
 
 ## 项目边界

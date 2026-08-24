@@ -4,6 +4,7 @@ import tempfile
 import unittest
 
 from aceval.pack import EvalPackLoader
+from aceval.experiments import ExperimentPlan
 from aceval.pack_builder import (
     CALIBRATION_CALIBRATING,
     CALIBRATION_DRAFT,
@@ -90,8 +91,16 @@ class PackBuilderTest(unittest.TestCase):
         manifest = self.read_json(first.manifest_path)
         self.assertEqual("aceval.dev/v1alpha2", manifest["api_version"])
         self.assertEqual("draft", manifest["metadata"]["calibration_status"])
-        self.assertEqual("auto", manifest["optimizer_policy"]["mode"])
-        self.assertEqual(objective, manifest["optimizer_policy"]["objective"])
+        self.assertNotIn("optimizer_policy", manifest)
+        self.assertIsNotNone(first.experiment_path)
+        experiment = ExperimentPlan.load(first.experiment_path)
+        self.assertEqual("auto", experiment.optimization.mode.value)
+        self.assertEqual("token-efficiency", experiment.optimization.objective.id)
+        self.assertEqual("total_tokens", experiment.optimization.objective.source.key)
+        self.assertEqual(
+            ExperimentPlan.load(first.experiment_path).to_dict(),
+            ExperimentPlan.load(second.experiment_path).to_dict(),
+        )
         self.assertIn("validation_ref", manifest["suite"])
         self.assertTrue((first.root / "fixtures").is_dir())
         self.assertTrue((first.root / "oracles" / "dev" / "answer-dev.json").is_file())
@@ -281,11 +290,46 @@ class PackBuilderTest(unittest.TestCase):
         self.assertEqual(
             "legal-document-analysis", manifest["metadata"]["template_fallback"]
         )
-        self.assertEqual("goal_heuristic", manifest["metadata"]["objective_origin"])
+        self.assertNotIn("objective_origin", manifest["metadata"])
+        self.assertNotIn("optimizer_policy", manifest)
+        experiment = ExperimentPlan.load(result.experiment_path)
+        self.assertEqual("goal_heuristic", experiment.metadata["objective_origin"])
         self.assertEqual(
             {"type": "trace_count", "key": "tool_call"},
-            manifest["optimizer_policy"]["objective"]["source"],
+            {
+                "type": experiment.optimization.objective.source.type,
+                "key": experiment.optimization.objective.source.key,
+            },
         )
+
+    def test_experiment_changes_do_not_change_evalpack_hash(self):
+        result = generate_evalpack(
+            {
+                "cases": [
+                    {
+                        "id": "hash-dev",
+                        "prompt": "Return JSON.",
+                        "expected_output": {"ok": True},
+                    }
+                ]
+            },
+            "generic",
+            "Return the correct result.",
+            self.root / "hash-pack",
+        )
+        loader = EvalPackLoader(build_builtin_registry())
+        before = loader.load(result.root)
+        document = self.read_json(result.experiment_path)
+        document["optimization"]["max_rounds"] = 9
+        result.experiment_path.write_text(
+            json.dumps(document, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        after = loader.load(result.root)
+
+        self.assertEqual(before.pack_hash, after.pack_hash)
+        self.assertEqual(before.suite_hash, after.suite_hash)
+        self.assertEqual(9, ExperimentPlan.load(result.experiment_path).optimization.max_rounds)
 
     def test_calibration_stage_is_editable_but_frozen_pack_cannot_reenter(self):
         result = generate_evalpack(

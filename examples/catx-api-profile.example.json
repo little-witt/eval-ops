@@ -1,0 +1,29 @@
+{
+  "api_version": "aceval.catx-profile/v1",
+  "name": "catx-online-agent",
+  "base_url": "https://api.catpaw.sankuai.com/v1",
+  "api_key_env": "CATX_API_KEY",
+  "user_mis_id_env": "USER_MIS_ID",
+  "agent_id_env": "CATX_AGENT_ID",
+  "environment_id_env": "CATX_ENV_ID",
+  "vault_ids": [
+    "vlt_replace_with_your_vault_id"
+  ],
+  "default_title": "aceval online evaluation",
+  "timeout_seconds": 30,
+  "max_response_bytes": 4194304,
+  "events_limit": 200,
+  "repository": {
+    "url": "ssh://git@git.sankuai.com/org/repo.git",
+    "authorization_token_env": "CATX_REPOSITORY_AUTHORIZATION_TOKEN",
+    "mount_path": "/workspace/repo"
+  },
+  "stream": {
+    "base_url": "https://replace-with-your-project.supabase.co",
+    "path": "/functions/v1/nocode-catx-agent",
+    "action": "getMessage",
+    "api_key_env": "SUPABASE_ANON_KEY",
+    "bearer_env": "SUPABASE_ACCESS_TOKEN",
+    "max_stream_bytes": 16777216
+  }
+}

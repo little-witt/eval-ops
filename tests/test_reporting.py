@@ -376,6 +376,9 @@ class ReportingTests(unittest.TestCase):
                 stop_reason="candidate passed dev and validation",
                 output_dir=root / "optimization-1",
                 limitations=("Optimizer only received dev evidence.",),
+                eval_suite_hash="suite-hash",
+                experiment_plan_hash="experiment-hash",
+                experiment_plan_source="external",
             )
 
             report = to_report_dict(optimization)
@@ -389,6 +392,13 @@ class ReportingTests(unittest.TestCase):
             self.assertEqual(report["summary"]["holdout_batch_count"], 0)
             self.assertEqual(report["summary"]["proposal_attempt_count"], 0)
             self.assertEqual(report["summary"]["experiment_usage"], {})
+            self.assertEqual(report["summary"]["eval_suite_hash"], "suite-hash")
+            self.assertEqual(
+                report["summary"]["experiment_plan_hash"], "experiment-hash"
+            )
+            self.assertEqual(
+                report["summary"]["experiment_plan_source"], "external"
+            )
             self.assertEqual(
                 report["summary"]["selected_candidate_hash"], "candidate-hash"
             )
@@ -406,6 +416,7 @@ class ReportingTests(unittest.TestCase):
             self.assertIn("## Candidate Gates", markdown)
             self.assertIn("| dev | pass |", markdown)
             self.assertIn("candidate passed dev and validation", markdown)
+            self.assertIn("| ExperimentPlan source | external |", markdown)
             self.assertIn("| Hidden regression rate | not measured |", markdown)
             self.assertIn("Optimizer only received dev evidence.", markdown)
 

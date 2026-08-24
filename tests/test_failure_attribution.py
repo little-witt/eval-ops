@@ -152,6 +152,25 @@ class FailureAttributionTest(unittest.TestCase):
         self.assertEqual((), report.failure_cards)
         self.assertTrue(report.evaluable)
 
+    def test_catx_is_error_false_tool_result_is_success(self):
+        report = self.attributor.attribute(
+            "case-catx-pass",
+            observation=RunObservation(
+                output="done",
+                trace=(
+                    TraceEvent(
+                        kind="tool_result",
+                        seq=1,
+                        tool="read_file",
+                        payload={"is_error": False, "content": []},
+                    ),
+                ),
+            ),
+        )
+
+        self.assertEqual(PatchDecision.NONE, report.patch_decision)
+        self.assertEqual((), report.failure_cards)
+
     def test_failure_ids_are_stable(self):
         first = self.attributor.attribute(
             "case-stable",

@@ -205,13 +205,19 @@ def _tool_signal(event: Any, index: int, expected: Sequence[Mapping[str, Any]]) 
     payload = _event_payload(event)
     tool = _event_tool(event, payload)
     ok = payload.get("ok")
+    is_error = payload.get("is_error")
     exit_code = payload.get("exit_code")
     status = payload.get("status")
     error_type = str(payload.get("error_type") or "").strip().casefold()
     error = getattr(event, "error", None) or payload.get("error") or payload.get("stderr_excerpt")
     timed_out = payload.get("timed_out") is True
     http_status = payload.get("http_status")
-    if ok is True and not timed_out and error is None and exit_code in (None, 0):
+    if (
+        (ok is True or is_error is False)
+        and not timed_out
+        and error is None
+        and exit_code in (None, 0)
+    ):
         return None
 
     code = "tool.failure"
@@ -253,6 +259,7 @@ def _tool_signal(event: Any, index: int, expected: Sequence[Mapping[str, Any]]) 
             "exit_code": exit_code,
             "http_status": http_status,
             "error_type": error_type or None,
+            "is_error": is_error if isinstance(is_error, bool) else None,
             "remediation_surface": remediation,
         },
         expected=expected_fault,

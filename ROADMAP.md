@@ -1,8 +1,20 @@
 # Skill Doctor 更新路线图与待办
 
-> 状态日期：2026-08-18  
+> 状态日期：2026-08-21
 > 适用版本：`aceval 0.2.1` 之后
-> 本文是 D20 黑客松交付和 D40 完整作品的当前计划基线；旧研究文档中的时间安排保留为决策记录，若有冲突以本文为准。
+> 本文保留 D20/D40 里程碑视角；关于线上执行、本地验证、环境 Provider、代码评审/D2C 样板和后续云端化的总体优先级，以 [SYSTEM_ARCHITECTURE_AND_INDUSTRY_ANALYSIS.md](./SYSTEM_ARCHITECTURE_AND_INDUSTRY_ANALYSIS.md) 的 P0-P3 与阶段门为准。旧研究文档中的时间安排保留为决策记录。
+
+## 代码评审场景 P0（2026-08-21）
+
+- [x] 自动生成统一 Git fixture lab 和按栈/Case 分支（TypeScript Web、React Native、
+  微信小程序 JS、Java 后端；每栈 2 个缺陷 Case + 1 个零误报 Case）；
+- [x] `code_review_findings_v1` 确定性评分与内置注册；
+- [x] EnvironmentBlueprint / CandidateBundle / Validation Receipt 内容寻址契约；
+- [x] LocalDockerProvider 离线、只读、资源限制和生命周期清理；
+- [x] `repository.verify/v1` 镜像与 CLI；
+- [x] CATX 精确 Skill/仓库绑定契约、证据核对和 Runtime Adapter；
+- [ ] 按待提供的 CATX 正式字段实现 `CatxSessionBindingAdapter`；
+- [ ] 用真实候选 Skill 跑 baseline、validation 与独立 holdout。
 
 ## 1. 当前产品结论
 
@@ -56,6 +68,13 @@
 - [x] `pack generate/calibrate/freeze/lint/test/quality`；
 - [x] `design/` 测试设计 Sidecar 及 Subject/Plan hash、引用一致性检查；
 - [x] critical coverage、Oracle trust、Runtime gap、generated holdout 和 family split leakage 冻结门禁。
+- [x] 新 Builder 生成薄 EvalPack，优化策略不再写入 `pack.yaml`；
+- [x] 独立 `ExperimentPlan v1`、Suite hash 绑定、相邻自动发现与显式 `--experiment`；
+- [x] legacy `optimizer_policy` 无迁移兼容，优化报告记录 Suite/ExperimentPlan hash；
+- [x] Evaluation Compiler 支持无 Cases 最小评测生成和用户 Cases 覆盖；
+- [x] 按标准、Cases、fixture 内容和评测画像精确复用冻结 EvalSuite；
+- [x] `doctor` 默认自动分类/选模板，保留 Pack、Cases、类型和 ExperimentPlan 自定义入口；
+- [x] D2C、代码评审、在线文档、数据查询、文档产物、运维诊断、工作流与鉴权依赖画像；
 
 ### 2.3 产品入口与公司连接
 

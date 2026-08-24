@@ -1,0 +1,4 @@
+{
+  "title": "aceval online smoke test",
+  "prompt": "请执行一次最小冒烟任务，并直接返回最终结果。"
+}
