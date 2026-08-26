@@ -1,0 +1,13 @@
+{
+  "api_version": "aceval.kernel-input/v1",
+  "skill_name": "frontend-code-reviewer",
+  "goal": "使用团队已审核的评测契约回归并优化代码评审 Skill",
+  "standards": [
+    "保持自定义 EvalPack 的已审核 Oracle 和 Case 语义",
+    "严格遵循 Skill 关键执行步骤",
+    "不向候选 Skill 暴露 holdout Case"
+  ],
+  "evalpack_path": "/absolute/path/to/custom-evalpack",
+  "cases": [],
+  "notes": "自定义 EvalPack 的 dev Case 会进入迭代；holdout 不进入优化证据。系统仍可补充能力覆盖 Case。"
+}

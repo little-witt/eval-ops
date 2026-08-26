@@ -1,0 +1,12 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>FORGE D2C Fixture</title>
+    <style>
+      *{box-sizing:border-box}body{margin:0;background:#e9e5da;color:#29302a;font-family:-apple-system,BlinkMacSystemFont,"PingFang SC",sans-serif}.page{display:grid;place-items:center;min-height:100vh}.card{width:680px;padding:54px;background:#f7f4eb;border:1px solid #c9c3b7;border-radius:18px;box-shadow:0 24px 70px rgba(20,27,21,.14)}small{color:#315ee7;font:700 12px monospace;letter-spacing:.12em}h1{margin:12px 0;font:500 44px Georgia,"Songti SC",serif}p{color:#747b73;line-height:1.7}button{margin-top:20px;padding:13px 20px;color:#fff;background:#315ee7;border:0;border-radius:8px;font-weight:700}.status{display:inline-block;margin-left:12px;color:#328163;font-size:13px}
+    </style>
+  </head>
+  <body><main class="page"><section class="card"><small>DETERMINISTIC BROWSER EVIDENCE</small><h1>设计稿对比已就绪</h1><p>该页面用于验证独立 Chrome Worker、交互动作、DOM、网络、控制台和像素级视觉差异证据。</p><button id="verify">运行交互</button><span class="status" id="status">等待</span></section></main><script>document.querySelector('#verify').addEventListener('click',()=>{document.querySelector('#status').textContent='已验证';});</script></body>
+</html>

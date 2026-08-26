@@ -1,0 +1,27 @@
+{
+  "api_version": "aceval.kernel-input/v1",
+  "skill_name": "evidence-summary",
+  "operation": "create",
+  "goal": "创建一个把多来源排障证据整理为可追溯结论的 Skill",
+  "capabilities": [
+    "校验输入证据完整性",
+    "输出结论、证据引用和无法判断项"
+  ],
+  "non_goals": [
+    "不自行查询用户未授权的数据源",
+    "不在证据不足时猜测根因"
+  ],
+  "standards": [
+    "每个结论都能追溯到输入证据",
+    "无证据时明确返回 not_evaluable",
+    "相对无 Skill 对照具备可测增量价值"
+  ],
+  "cases": [
+    {
+      "id": "user-evidence-empty-001",
+      "prompt": "输入为空时生成排障摘要",
+      "expected_output": "not_evaluable"
+    }
+  ],
+  "notes": "skill_repository 指向已初始化且目标分支不含 SKILL.md 的干净仓库。"
+}

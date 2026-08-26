@@ -22,6 +22,14 @@ from .connections import (
     load_imported_run_bundle,
     load_session_log,
 )
+from .console import build_console, serve_console
+from .d2c import (
+    D2C_PROFILE_API_VERSION,
+    D2CBrowserProfile,
+    D2CValidationRequest,
+    check_d2c_profile,
+    validate_d2c,
+)
 from .catx import (
     CATX_PROFILE_API_VERSION,
     CatxAgentClient,
@@ -48,6 +56,9 @@ from .environment_contracts import (
     write_contract,
 )
 from .environments import LocalDockerProvider, build_repository_verify_image
+from .execution_path import ExecutionPathSpec, evaluate_trace_conformance
+from .iteration_kernel import IterationKernel
+from .kernel_contracts import KernelConfig, KernelInput
 from .failure_attribution import FailureAttributor
 from .experiments import (
     ExperimentPlanError,
@@ -58,6 +69,7 @@ from .evaluation_compiler import (
     default_output_path,
 )
 from .optimizer import FrozenCandidateOptimizer, SkillMarkdownOptimizer
+from .online_code_review import run_online_review_suite, write_online_review_benchmark
 from .orchestrator import EvalOrchestrator
 from .pack import EvalPackLoader, PackError
 from .pack_builder import (
@@ -76,6 +88,7 @@ from .planning_workflow import (
 from .registry import build_builtin_registry
 from .reporting import to_report_dict, write_report
 from .runtime import FakeRuntime, ReferenceRuntimeAdapter
+from .task_center import TaskStore
 
 
 def _add_pack_argument(parser: argparse.ArgumentParser) -> None:
@@ -363,6 +376,206 @@ def build_parser() -> argparse.ArgumentParser:
     code_review_grade.add_argument("--findings", required=True, help="JSON or @FILE")
     code_review_grade.add_argument("--oracle", required=True, help="JSON or @FILE")
     code_review_grade.set_defaults(handler=_code_review_grade)
+    code_review_online = code_review_commands.add_parser(
+        "online-run", help="Run frozen code-review cases through fresh CATX sessions"
+    )
+    code_review_online.add_argument("--profile", required=True)
+    code_review_online.add_argument("--lab", required=True)
+    code_review_online.add_argument("--skill-ref", required=True)
+    code_review_online.add_argument("--skill-commit", required=True)
+    code_review_online.add_argument("--workspace", required=True)
+    code_review_online.add_argument(
+        "--configuration", choices=("old_skill", "with_skill"), required=True
+    )
+    code_review_online.add_argument(
+        "--stack", action="append", choices=DEFAULT_CODE_REVIEW_STACKS
+    )
+    code_review_online.add_argument("--case", action="append", default=[])
+    code_review_online.add_argument("--task-root", default=".aceval/tasks")
+    code_review_online.add_argument("--task-id")
+    code_review_online.add_argument("--iteration", type=int, default=0)
+    code_review_online.add_argument(
+        "--execution-path", help="ExecutionPathSpec JSON used as a trace-conformance dimension"
+    )
+    code_review_online.set_defaults(handler=_code_review_online_run)
+    code_review_report = code_review_commands.add_parser(
+        "online-report", help="Aggregate candidate/baseline CATX runs with exact usage"
+    )
+    code_review_report.add_argument("--workspace", required=True)
+    code_review_report.add_argument(
+        "--skill-name", default="frontend-code-reviewer"
+    )
+    code_review_report.add_argument("--skill-path", default="")
+    code_review_report.set_defaults(handler=_code_review_online_report)
+
+    console = commands.add_parser(
+        "console", help="Build or serve the local Skill Optimization Cockpit"
+    )
+    console_commands = console.add_subparsers(dest="console_command", required=True)
+    console_build = console_commands.add_parser(
+        "build", help="Build a static offline optimization console"
+    )
+    console_build.add_argument("--workspace", required=True)
+    console_build.add_argument("--output", required=True)
+    console_build.add_argument("--plan")
+    console_build.add_argument("--profile")
+    console_build.add_argument("--task-root")
+    console_build.set_defaults(handler=_console_build)
+    console_serve = console_commands.add_parser(
+        "serve", help="Serve a live read-only console with SSE updates"
+    )
+    console_serve.add_argument("--workspace")
+    console_serve.add_argument("--plan")
+    console_serve.add_argument("--profile")
+    console_serve.add_argument("--task-root", default=".aceval/tasks")
+    console_serve.add_argument("--host", default="127.0.0.1")
+    console_serve.add_argument("--port", type=int, default=8765)
+    console_serve.set_defaults(handler=_console_serve)
+
+    d2c = commands.add_parser(
+        "d2c", help="Check and run deterministic local-browser validation"
+    )
+    d2c_commands = d2c.add_subparsers(dest="d2c_command", required=True)
+    d2c_check = d2c_commands.add_parser(
+        "check", help="Check Chrome, Node, driver, and environment fingerprint"
+    )
+    d2c_check.add_argument("--profile", required=True)
+    d2c_check.set_defaults(handler=_d2c_check)
+    d2c_validate = d2c_commands.add_parser(
+        "validate", help="Capture deterministic browser evidence for one D2C case"
+    )
+    d2c_validate.add_argument("--profile", required=True)
+    d2c_validate.add_argument("--request", required=True)
+    d2c_validate.add_argument("--output", required=True)
+    d2c_validate.add_argument("--task-root", default=".aceval/tasks")
+    d2c_validate.add_argument("--task-id")
+    d2c_validate.add_argument("--iteration", type=int, default=0)
+    d2c_validate.set_defaults(handler=_d2c_validate)
+
+    kernel = commands.add_parser("kernel", help="Run the recoverable low-token Skill evaluation/iteration workflow")
+    kernel_commands = kernel.add_subparsers(dest="kernel_command", required=True)
+    kernel_create = kernel_commands.add_parser("create", help="Create a Kernel task from configuration and user intent")
+    kernel_create.add_argument("--config", required=True)
+    kernel_create.add_argument("--input", required=True)
+    kernel_create.add_argument("--task-root", default=".aceval/tasks")
+    kernel_create.add_argument("--id")
+    kernel_create.set_defaults(handler=_kernel_create)
+    kernel_status = kernel_commands.add_parser("status", help="Read one Kernel task state")
+    kernel_status.add_argument("task_id")
+    kernel_status.add_argument("--task-root", default=".aceval/tasks")
+    kernel_status.set_defaults(handler=_kernel_status)
+    kernel_log = kernel_commands.add_parser("log", help="Read one complete persisted remote session log")
+    kernel_log.add_argument("task_id")
+    kernel_log.add_argument("--task-root", default=".aceval/tasks")
+    kernel_log.add_argument("--iteration", type=int, required=True)
+    kernel_log.add_argument("--purpose", choices=("evaluation", "pass-verification", "without-skill-baseline"), required=True)
+    kernel_log.add_argument("--case", required=True)
+    kernel_log.set_defaults(handler=_kernel_log)
+    kernel_compile = kernel_commands.add_parser("compile", help="Generate/reuse EvalPack, cases, and execution paths")
+    kernel_compile.add_argument("task_id")
+    kernel_compile.add_argument("--task-root", default=".aceval/tasks")
+    kernel_compile.set_defaults(handler=_kernel_compile)
+    kernel_dispatch = kernel_commands.add_parser("dispatch", help="Create all selected remote evaluation sessions")
+    kernel_dispatch.add_argument("task_id")
+    kernel_dispatch.add_argument("--task-root", default=".aceval/tasks")
+    kernel_dispatch.add_argument("--purpose", default="evaluation")
+    kernel_dispatch.add_argument("--case", action="append", default=[])
+    kernel_dispatch.set_defaults(handler=_kernel_dispatch)
+    kernel_collect = kernel_commands.add_parser("collect", help="Poll and recover complete logs for an active batch")
+    kernel_collect.add_argument("task_id")
+    kernel_collect.add_argument("--task-root", default=".aceval/tasks")
+    kernel_collect.add_argument("--wait", action="store_true")
+    kernel_collect.set_defaults(handler=_kernel_collect)
+    kernel_analyze = kernel_commands.add_parser("analyze", help="Run one token-bounded cross-case local analysis")
+    kernel_analyze.add_argument("task_id")
+    kernel_analyze.add_argument("--task-root", default=".aceval/tasks")
+    kernel_analyze.set_defaults(handler=_kernel_analyze)
+    kernel_advance = kernel_commands.add_parser("advance", help="Perform the next automatic step and stop at a gate")
+    kernel_advance.add_argument("task_id")
+    kernel_advance.add_argument("--task-root", default=".aceval/tasks")
+    kernel_advance.add_argument("--wait", action="store_true")
+    kernel_advance.set_defaults(handler=_kernel_advance)
+    kernel_run = kernel_commands.add_parser("run", help="Run automatically until confirmation, evidence, or convergence")
+    kernel_run.add_argument("task_id")
+    kernel_run.add_argument("--task-root", default=".aceval/tasks")
+    kernel_run.add_argument("--max-steps", type=int, default=200)
+    kernel_run.set_defaults(handler=_kernel_run)
+    kernel_confirm = kernel_commands.add_parser("confirm", help="Approve optimization scope, reject it, or supplement intent")
+    kernel_confirm.add_argument("task_id")
+    kernel_confirm.add_argument("--task-root", default=".aceval/tasks")
+    kernel_confirm_choice = kernel_confirm.add_mutually_exclusive_group(required=True)
+    kernel_confirm_choice.add_argument("--approve", action="store_true")
+    kernel_confirm_choice.add_argument("--reject", action="store_true")
+    kernel_confirm_choice.add_argument("--supplement", help="Replacement KernelInput JSON")
+    kernel_confirm.add_argument("--select-capability", action="append", default=[], help="Capability proposal id to approve; repeat for multiple discovery proposals")
+    kernel_confirm.add_argument("--select-change", action="append", default=[], help="Optimization proposal id to approve; repeat for multiple proposals")
+    kernel_confirm.add_argument("--feedback", help="Additional optimization guidance supplied at the approval gate")
+    kernel_confirm.set_defaults(handler=_kernel_confirm)
+    kernel_optimize = kernel_commands.add_parser("optimize", help="Generate a constrained candidate after approval")
+    kernel_optimize.add_argument("task_id")
+    kernel_optimize.add_argument("--task-root", default=".aceval/tasks")
+    kernel_optimize.set_defaults(handler=_kernel_optimize)
+    kernel_publish = kernel_commands.add_parser("publish", help="Commit/push an approved candidate and start its iteration")
+    kernel_publish.add_argument("task_id")
+    kernel_publish.add_argument("--task-root", default=".aceval/tasks")
+    kernel_publish.set_defaults(handler=_kernel_publish)
+
+    task = commands.add_parser("task", help="Create and inspect Skill evaluation tasks")
+    task_commands = task.add_subparsers(dest="task_command", required=True)
+    task_create = task_commands.add_parser(
+        "create", help="Create a task with automatic or custom evaluation design"
+    )
+    task_create.add_argument("--root", default=".aceval/tasks")
+    task_create.add_argument("--id")
+    task_create.add_argument("--skill-name", required=True)
+    task_create.add_argument("--skill-source", required=True)
+    task_create.add_argument("--scenario", required=True)
+    task_create.add_argument("--goal", required=True)
+    task_create.add_argument("--standard", action="append", required=True)
+    task_create.add_argument("--cases", help="Optional JSON array of user-provided cases")
+    task_create.add_argument("--evaluation-spec", help="Optional custom evaluation JSON object")
+    task_create.add_argument("--environment", help="Optional environment binding JSON object")
+    task_create.set_defaults(handler=_task_create)
+    task_list = task_commands.add_parser("list", help="List all evaluation tasks")
+    task_list.add_argument("--root", default=".aceval/tasks")
+    task_list.set_defaults(handler=_task_list)
+    task_show = task_commands.add_parser("show", help="Show one task and its event timeline")
+    task_show.add_argument("task_id")
+    task_show.add_argument("--root", default=".aceval/tasks")
+    task_show.set_defaults(handler=_task_show)
+    task_event = task_commands.add_parser("event", help="Append a typed automatic iteration event")
+    task_event.add_argument("task_id")
+    task_event.add_argument("--root", default=".aceval/tasks")
+    task_event.add_argument("--type", required=True)
+    task_event.add_argument("--payload", default="{}", help="JSON object or @FILE")
+    task_event.add_argument("--iteration", type=int)
+    task_event.add_argument("--case-id")
+    task_event.add_argument("--run-id")
+    task_event.set_defaults(handler=_task_event)
+    task_iterate = task_commands.add_parser("iterate", help="Plan the next optimization iteration and emit its event")
+    task_iterate.add_argument("task_id")
+    task_iterate.add_argument("--root", default=".aceval/tasks")
+    task_iterate.add_argument("--hypothesis", required=True)
+    task_iterate.add_argument("--change", action="append", required=True)
+    task_iterate.add_argument("--dimension", action="append", default=[])
+    task_iterate.set_defaults(handler=_task_iterate)
+    task_decide = task_commands.add_parser("decide", help="Record promotion/rejection/convergence for an iteration")
+    task_decide.add_argument("task_id")
+    task_decide.add_argument("--root", default=".aceval/tasks")
+    task_decide.add_argument("--iteration", type=int, required=True)
+    task_decide.add_argument("--decision", choices=("promote", "reject", "continue", "converged", "blocked"), required=True)
+    task_decide.add_argument("--reason", required=True)
+    task_decide.add_argument("--metrics", default="{}")
+    task_decide.set_defaults(handler=_task_decide)
+
+    path = commands.add_parser("path", help="Evaluate Skill execution-path conformance")
+    path_commands = path.add_subparsers(dest="path_command", required=True)
+    path_grade = path_commands.add_parser("grade", help="Grade a complete JSON trace against a path spec")
+    path_grade.add_argument("--spec", required=True)
+    path_grade.add_argument("--trace", required=True)
+    path_grade.add_argument("--trace-incomplete", action="store_true")
+    path_grade.add_argument("--output")
+    path_grade.set_defaults(handler=_path_grade)
 
     environment = commands.add_parser(
         "environment", help="Build, inspect, and run local isolated validators"
@@ -468,6 +681,7 @@ def build_parser() -> argparse.ArgumentParser:
     session_diagnose.add_argument("--output")
     session_diagnose.add_argument("--force", action="store_true")
     session_diagnose.set_defaults(handler=_session_diagnose)
+
     return parser
 
 
@@ -1136,9 +1350,15 @@ def _profile_validate(args: argparse.Namespace) -> int:
                 "agent_id": profile.agent_id_env,
                 "environment_id": profile.environment_id_env,
                 "repository_authorization_token": (
-                    profile.repository.authorization_token_env
-                    if profile.repository is not None
+                    profile.repository_resources[0].authorization_token_env
+                    if profile.repository_resources
                     else None
+                ),
+                "repository_authorization_tokens": sorted(
+                    {
+                        item.authorization_token_env
+                        for item in profile.repository_resources
+                    }
                 ),
                 "stream_api_key": (
                     profile.stream.api_key_env if profile.stream is not None else None
@@ -1153,10 +1373,15 @@ def _profile_validate(args: argparse.Namespace) -> int:
             "repository": (
                 {
                     "configured": True,
-                    "url": profile.repository.url,
-                    "mount_path": profile.repository.mount_path,
+                    "url": profile.repository_resources[0].url,
+                    "mount_path": profile.repository_resources[0].mount_path,
+                    "count": len(profile.repository_resources),
+                    "resources": [
+                        {"url": item.url, "mount_path": item.mount_path}
+                        for item in profile.repository_resources
+                    ],
                 }
-                if profile.repository is not None
+                if profile.repository_resources
                 else {"configured": False}
             ),
             "secret_loaded": False,
@@ -1287,6 +1512,283 @@ def _code_review_grade(args: argparse.Namespace) -> int:
     payload = as_primitive(result)
     print(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True))
     return 0 if result.status == GradeStatus.PASS else 1
+
+
+def _code_review_online_run(args: argparse.Namespace) -> int:
+    profile = _load_online_profile(args.profile)
+    if not isinstance(profile, CatxAgentProfile):
+        raise ValueError("code-review online-run requires a CATX profile")
+    stacks = tuple(
+        args.stack
+        or ("typescript-web", "react-native", "wechat-miniprogram")
+    )
+    execution_path = None
+    if args.execution_path:
+        execution_path = ExecutionPathSpec.from_mapping(
+            _json_value("@" + args.execution_path, "execution path")
+        )
+    store = TaskStore(args.task_root) if args.task_id else None
+    summary = run_online_review_suite(
+        profile,
+        lab_root=args.lab,
+        skill_ref=args.skill_ref,
+        skill_commit=args.skill_commit,
+        workspace=args.workspace,
+        configuration=args.configuration,
+        stacks=stacks,
+        case_ids=tuple(args.case or ()),
+        task_store=store,
+        task_id=args.task_id,
+        iteration=args.iteration,
+        execution_path=execution_path,
+    )
+    print(json.dumps(summary, ensure_ascii=False, indent=2, sort_keys=True))
+    return 0
+
+
+def _code_review_online_report(args: argparse.Namespace) -> int:
+    benchmark = write_online_review_benchmark(
+        args.workspace,
+        skill_name=args.skill_name,
+        skill_path=args.skill_path,
+    )
+    print(json.dumps(benchmark["run_summary"], ensure_ascii=False, indent=2, sort_keys=True))
+    return 0
+
+
+def _console_build(args: argparse.Namespace) -> int:
+    result = build_console(
+        args.workspace,
+        args.output,
+        plan_path=args.plan,
+        profile_path=args.profile,
+        task_root=args.task_root,
+    )
+    print(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True))
+    return 0
+
+
+def _console_serve(args: argparse.Namespace) -> int:
+    print(
+        "Skill Optimization Cockpit: http://%s:%d" % (args.host, args.port),
+        file=sys.stderr,
+        flush=True,
+    )
+    serve_console(
+        args.workspace,
+        plan_path=args.plan,
+        profile_path=args.profile,
+        task_root=args.task_root,
+        host=args.host,
+        port=args.port,
+    )
+    return 0
+
+
+def _d2c_check(args: argparse.Namespace) -> int:
+    report = check_d2c_profile(D2CBrowserProfile.load(args.profile))
+    print(json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True))
+    return 0 if report["ready"] else 1
+
+
+def _d2c_validate(args: argparse.Namespace) -> int:
+    request = D2CValidationRequest.load(args.request)
+    store = TaskStore(args.task_root) if args.task_id else None
+    if store and args.task_id:
+        current = int(store.load(args.task_id).get("current_iteration", 0))
+        store.update(args.task_id, status="running", current_iteration=max(current, args.iteration))
+        store.append_event(args.task_id, "case_run.started", {"provider": "local-browser", "url": request.url}, iteration=args.iteration, case_id=request.case_id, run_id="browser-1")
+    try:
+        receipt = validate_d2c(D2CBrowserProfile.load(args.profile), request, args.output)
+    except Exception as exc:
+        if store and args.task_id:
+            store.append_event(args.task_id, "case_run.failed", {"provider": "local-browser", "error": str(exc)}, iteration=args.iteration, case_id=request.case_id, run_id="browser-1")
+            store.update(args.task_id, status="blocked")
+        raise
+    if store and args.task_id:
+        store.append_event(
+            args.task_id,
+            "case_run.completed",
+            {"provider": "local-browser", "status": receipt["status"], "receipt": str(Path(args.output).expanduser().resolve() / "receipt.json"), "artifacts": receipt["artifacts"]},
+            iteration=args.iteration,
+            case_id=request.case_id,
+            run_id="browser-1",
+        )
+        store.update(args.task_id, status="ready")
+    print(json.dumps(receipt, ensure_ascii=False, indent=2, sort_keys=True))
+    return 0 if receipt["status"] == ValidationStatus.SUCCEEDED.value else 1
+
+
+def _kernel(args: argparse.Namespace) -> IterationKernel:
+    return IterationKernel(args.task_root)
+
+
+def _kernel_create(args: argparse.Namespace) -> int:
+    result = _kernel(args).create_task(KernelConfig.load(args.config), KernelInput.load(args.input), task_id=args.id)
+    print(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True))
+    return 0
+
+
+def _kernel_status(args: argparse.Namespace) -> int:
+    value = _kernel(args)
+    print(json.dumps(value.snapshot(args.task_id), ensure_ascii=False, indent=2, sort_keys=True))
+    return 0
+
+
+def _kernel_log(args: argparse.Namespace) -> int:
+    value = _kernel(args).session_log(args.task_id, args.iteration, args.purpose, args.case)
+    print(json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True))
+    return 0
+
+
+def _kernel_compile(args: argparse.Namespace) -> int:
+    print(json.dumps(_kernel(args).compile_design(args.task_id), ensure_ascii=False, indent=2, sort_keys=True))
+    return 0
+
+
+def _kernel_dispatch(args: argparse.Namespace) -> int:
+    print(json.dumps(_kernel(args).dispatch(args.task_id, purpose=args.purpose, case_ids=tuple(args.case)), ensure_ascii=False, indent=2, sort_keys=True))
+    return 0
+
+
+def _kernel_collect(args: argparse.Namespace) -> int:
+    print(json.dumps(_kernel(args).collect(args.task_id, wait=bool(args.wait)), ensure_ascii=False, indent=2, sort_keys=True))
+    return 0
+
+
+def _kernel_analyze(args: argparse.Namespace) -> int:
+    print(json.dumps(_kernel(args).analyze(args.task_id), ensure_ascii=False, indent=2, sort_keys=True))
+    return 0
+
+
+def _kernel_advance(args: argparse.Namespace) -> int:
+    print(json.dumps(_kernel(args).advance(args.task_id, wait=bool(args.wait)), ensure_ascii=False, indent=2, sort_keys=True))
+    return 0
+
+
+def _kernel_run(args: argparse.Namespace) -> int:
+    print(json.dumps(_kernel(args).run_until_gate(args.task_id, max_steps=args.max_steps), ensure_ascii=False, indent=2, sort_keys=True))
+    return 0
+
+
+def _kernel_confirm(args: argparse.Namespace) -> int:
+    if args.supplement:
+        supplement = KernelInput.load(args.supplement)
+        approve = False
+    else:
+        supplement = None
+        approve = bool(args.approve) and not bool(args.reject)
+    print(json.dumps(_kernel(args).confirm(
+        args.task_id,
+        approve=approve,
+        supplement=supplement,
+        selected_capability_ids=tuple(args.select_capability),
+        selected_change_ids=tuple(args.select_change),
+        user_feedback=args.feedback,
+    ), ensure_ascii=False, indent=2, sort_keys=True))
+    return 0
+
+
+def _kernel_optimize(args: argparse.Namespace) -> int:
+    print(json.dumps(_kernel(args).optimize(args.task_id), ensure_ascii=False, indent=2, sort_keys=True))
+    return 0
+
+
+def _kernel_publish(args: argparse.Namespace) -> int:
+    print(json.dumps(_kernel(args).publish_candidate(args.task_id), ensure_ascii=False, indent=2, sort_keys=True))
+    return 0
+
+
+def _optional_json(value: Optional[str], label: str, default: Any) -> Any:
+    if not value:
+        return default
+    return _json_value(value, label)
+
+
+def _task_create(args: argparse.Namespace) -> int:
+    cases = _optional_json(args.cases, "cases", [])
+    if not isinstance(cases, list):
+        raise ValueError("cases must be a JSON array")
+    evaluation = _optional_json(args.evaluation_spec, "evaluation_spec", None)
+    if evaluation is not None and not isinstance(evaluation, Mapping):
+        raise ValueError("evaluation_spec must be a JSON object")
+    environment = _optional_json(args.environment, "environment", {})
+    if not isinstance(environment, Mapping):
+        raise ValueError("environment must be a JSON object")
+    task = TaskStore(args.root).create(
+        task_id=args.id,
+        skill_name=args.skill_name,
+        skill_source=args.skill_source,
+        scenario=args.scenario,
+        goal=args.goal,
+        standards=tuple(args.standard),
+        cases=tuple(cases),
+        evaluation_spec=evaluation,
+        environment=environment,
+    )
+    print(json.dumps(task, ensure_ascii=False, indent=2, sort_keys=True))
+    return 0
+
+
+def _task_list(args: argparse.Namespace) -> int:
+    print(json.dumps({"tasks": TaskStore(args.root).list()}, ensure_ascii=False, indent=2, sort_keys=True))
+    return 0
+
+
+def _task_show(args: argparse.Namespace) -> int:
+    store = TaskStore(args.root)
+    print(json.dumps({"task": store.load(args.task_id), "events": store.events(args.task_id)}, ensure_ascii=False, indent=2, sort_keys=True))
+    return 0
+
+
+def _task_event(args: argparse.Namespace) -> int:
+    payload = _json_value(args.payload, "event payload")
+    if not isinstance(payload, Mapping):
+        raise ValueError("event payload must be a JSON object")
+    event = TaskStore(args.root).append_event(
+        args.task_id, args.type, payload,
+        iteration=args.iteration, case_id=args.case_id, run_id=args.run_id,
+    )
+    print(json.dumps(event, ensure_ascii=False, indent=2, sort_keys=True))
+    return 0
+
+
+def _task_iterate(args: argparse.Namespace) -> int:
+    event = TaskStore(args.root).begin_iteration(
+        args.task_id,
+        hypothesis=args.hypothesis,
+        planned_changes=tuple(args.change),
+        target_dimensions=tuple(args.dimension),
+    )
+    print(json.dumps(event, ensure_ascii=False, indent=2, sort_keys=True))
+    return 0
+
+
+def _task_decide(args: argparse.Namespace) -> int:
+    metrics = _json_value(args.metrics, "metrics")
+    if not isinstance(metrics, Mapping):
+        raise ValueError("metrics must be a JSON object")
+    event = TaskStore(args.root).record_decision(
+        args.task_id,
+        iteration=args.iteration,
+        decision=args.decision,
+        reason=args.reason,
+        metrics=metrics,
+    )
+    print(json.dumps(event, ensure_ascii=False, indent=2, sort_keys=True))
+    return 0
+
+
+def _path_grade(args: argparse.Namespace) -> int:
+    spec = ExecutionPathSpec.from_mapping(_json_value("@" + args.spec, "path spec"))
+    trace = _json_value("@" + args.trace, "trace")
+    if not isinstance(trace, list) or not all(isinstance(item, Mapping) for item in trace):
+        raise ValueError("trace must be a JSON array of objects")
+    result = evaluate_trace_conformance(spec, trace, trace_complete=not args.trace_incomplete)
+    if args.output:
+        _write_json_output(args.output, result, False)
+    print(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True))
+    return 0 if result["status"] == "pass" else 1
 
 
 def _repository_verify_context(value: Optional[str]) -> Path:

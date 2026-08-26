@@ -1,0 +1,34 @@
+{
+  "api_version": "aceval.kernel-input/v1",
+  "skill_name": "frontend-code-reviewer",
+  "goal": "稳定发现高价值前端缺陷，并给出可定位、可执行、不过度猜测的评审意见",
+  "standards": [
+    "覆盖用户提供的关键缺陷，结论与代码证据一致",
+    "严格执行 Skill 声明的关键步骤",
+    "不制造无证据问题，不泄漏评测实现细节"
+  ],
+  "cases": [
+    {
+      "id": "react-effect-cleanup",
+      "prompt": "评审当前测试分支相对 master 的改动",
+      "expected_output": {
+        "required_finding_ids": [
+          "effect-cleanup-missing"
+        ],
+        "forbidden_finding_ids": []
+      },
+      "metadata": {
+        "fixture_branch": "case/react-effect-cleanup",
+        "expectation_mode": "semantic"
+      }
+    },
+    {
+      "id": "miniprogram-request-race",
+      "prompt": "评审当前测试分支相对 master 的改动",
+      "metadata": {
+        "fixture_branch": "case/miniprogram-request-race"
+      }
+    }
+  ],
+  "notes": "expected_output 可省略；省略时由本地分析 Agent 基于标准和证据判断。"
+}

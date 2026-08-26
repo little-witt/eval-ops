@@ -1,0 +1,158 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>ACEval Task Center</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' fill='%2311130f'/%3E%3Cpath d='M7 23V9h5v14zm7 0V14h5v9zm7 0V6h5v17z' fill='%23c9ff45'/%3E%3C/svg%3E">
+  <link rel="stylesheet" href="./styles.css">
+</head>
+<body>
+  <div class="grain" aria-hidden="true"></div>
+  <header class="masthead">
+    <div class="brand-lockup">
+      <div class="brand-mark" aria-hidden="true"><span></span><span></span><span></span></div>
+      <div>
+        <p class="eyebrow">ACEVAL / TASK CONTROL ROOM</p>
+        <h1>Skill Evaluation & Iteration Platform</h1>
+      </div>
+    </div>
+    <div class="run-signal">
+      <span id="live-dot" class="live-dot"></span>
+      <div>
+        <small id="connection-label">STATIC SNAPSHOT</small>
+        <strong id="generated-at">—</strong>
+      </div>
+    </div>
+  </header>
+
+  <main>
+    <section class="verdict-strip" aria-labelledby="run-title">
+      <div class="verdict-copy">
+        <p id="run-kicker" class="eyebrow">OPTIMIZATION RUN</p>
+        <h2 id="run-title">Loading workspace…</h2>
+        <p id="run-goal" class="run-goal"></p>
+      </div>
+      <div class="verdict-stamps">
+        <div class="stamp"><span>DECISION</span><strong id="decision-value">—</strong></div>
+        <div class="stamp"><span>CURRENT BEST</span><strong id="best-value">—</strong></div>
+        <div class="stamp"><span>CONFIDENCE</span><strong id="confidence-value">—</strong></div>
+      </div>
+    </section>
+
+    <nav class="phase-rail" aria-label="优化阶段">
+      <button data-view="tree" class="phase active"><span>01</span>输入与标准</button>
+      <button data-view="tree" class="phase"><span>02</span>Case 与评分</button>
+      <button data-view="tree" class="phase"><span>03</span>Baseline</button>
+      <button data-view="tree" class="phase"><span>04</span>迭代路径</button>
+      <button data-view="tree" class="phase"><span>05</span>收敛决策</button>
+    </nav>
+
+    <div class="workspace-grid">
+      <aside class="side-panel">
+        <section class="panel-section">
+          <div class="section-heading"><span>INPUT CONTRACT</span><b>冻结</b></div>
+          <dl id="input-contract" class="compact-list"></dl>
+        </section>
+        <section class="panel-section">
+          <div class="section-heading"><span>SUCCESS CRITERIA</span><b id="criteria-count">0</b></div>
+          <ol id="criteria-list" class="criteria-list"></ol>
+        </section>
+        <section class="panel-section attention">
+          <div class="section-heading"><span>BLOCKERS</span><b id="blocker-count">0</b></div>
+          <ul id="blocker-list" class="blocker-list"></ul>
+        </section>
+      </aside>
+
+      <section class="main-stage">
+        <div class="stage-toolbar">
+          <div class="view-tabs" role="tablist">
+            <button class="view-tab" data-view="tasks">任务中心</button>
+            <button class="view-tab active" data-view="tree">优化树</button>
+            <button class="view-tab" data-view="dimensions">维度诊断</button>
+            <button class="view-tab" data-view="cases">Case 矩阵</button>
+            <button class="view-tab" data-view="configuration">环境配置</button>
+          </div>
+          <p id="stage-caption">每个节点都必须回答：为什么、改什么、效果、决策、下一步。</p>
+        </div>
+
+        <section id="tasks-view" class="view" aria-label="任务中心">
+          <div class="view-intro task-intro">
+            <p class="eyebrow">TASK CENTER</p>
+            <h3>所有 Skill 的评测与迭代任务</h3>
+            <p>自动生成或自定义评测契约；每次运行、完整会话日志、路径符合度和收敛决策按事件顺序保留。</p>
+          </div>
+          <div class="task-center-grid">
+            <div id="task-list" class="task-list"></div>
+            <article id="task-detail" class="task-detail">
+              <p class="empty-state">暂无任务。使用 <code>aceval task create</code> 创建第一个任务。</p>
+            </article>
+          </div>
+        </section>
+
+        <section id="tree-view" class="view active" aria-label="优化树">
+          <div id="optimization-tree" class="optimization-tree"></div>
+        </section>
+
+        <section id="dimensions-view" class="view" aria-label="维度诊断">
+          <div class="view-intro">
+            <p class="eyebrow">DIMENSION BOARD</p>
+            <h3>不要让总分掩盖失败类型</h3>
+            <p>候选与冻结基线逐维比较；红色表示回退，青色表示改善，灰色表示未测量。</p>
+          </div>
+          <div id="dimension-board" class="dimension-board"></div>
+        </section>
+
+        <section id="cases-view" class="view" aria-label="Case 矩阵">
+          <div class="view-intro">
+            <p class="eyebrow">FROZEN EVALUATION PATH</p>
+            <h3>自动 Case、控制组与评分证据</h3>
+          </div>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>Case</th><th>Stack</th><th>类型</th><th>Baseline</th><th>Candidate</th><th>Binding</th></tr></thead>
+              <tbody id="case-table"></tbody>
+            </table>
+          </div>
+        </section>
+
+        <section id="configuration-view" class="view" aria-label="环境配置">
+          <div class="view-intro">
+            <p class="eyebrow">SAFE CONFIGURATION VIEW</p>
+            <h3>只展示运行拓扑，不展示凭据值</h3>
+            <p>API Key、PAT、authorization token 和 credentials file 内容永不进入 Console graph。</p>
+          </div>
+          <div id="configuration-board" class="configuration-board"></div>
+        </section>
+      </section>
+
+      <aside id="inspector" class="inspector" aria-live="polite">
+        <div class="inspector-head">
+          <div>
+            <p id="node-kind" class="eyebrow">SELECTED NODE</p>
+            <h3 id="node-title">选择一个优化节点</h3>
+          </div>
+          <span id="node-status" class="status-chip">—</span>
+        </div>
+        <p id="node-summary" class="node-summary">点击树中的节点查看决策证据。</p>
+        <div id="node-metrics" class="node-metrics"></div>
+        <section class="inspector-section"><h4>为什么</h4><p id="node-why">—</p></section>
+        <section class="inspector-section"><h4>计划与修改</h4><ul id="node-plan"></ul></section>
+        <section class="inspector-section"><h4>决策</h4><p id="node-decision">—</p></section>
+        <section class="inspector-section"><h4>下一步</h4><ul id="node-next"></ul></section>
+        <section class="inspector-section evidence"><h4>证据路径</h4><ul id="node-evidence"></ul></section>
+      </aside>
+    </div>
+  </main>
+
+  <footer>
+    <span>READ-ONLY LOCAL CONSOLE</span>
+    <span id="footer-version">aceval.optimization-graph/v1</span>
+  </footer>
+
+  <script src="./optimization-graph.js"></script>
+  <script src="./task-center.js"></script>
+  <script src="./app.js"></script>
+</body>
+</html>

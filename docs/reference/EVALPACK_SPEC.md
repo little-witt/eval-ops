@@ -173,7 +173,7 @@ Coverage 当前分为 planned、executable、oracle-ready 和 observed。`observ
 
 当前 `mutation_score` 仅作为可选 provenance 数值校验；系统尚未生成 mutant，也没有 known-good/known-bad、mutation detection 或 evaluator flake 校准。这些属于 D40 的高级 Pack Quality。
 
-完整技术方案见 [COMPLEX_SKILL_EVAL_AND_DIAGNOSIS_DESIGN.md](./COMPLEX_SKILL_EVAL_AND_DIAGNOSIS_DESIGN.md)。
+历史技术方案见 [COMPLEX_SKILL_EVAL_AND_DIAGNOSIS_DESIGN.md](../archive/2026-08-pre-v2/plans/COMPLEX_SKILL_EVAL_AND_DIAGNOSIS_DESIGN.md)；当前系统基线以 [`FINAL_SYSTEM_ARCHITECTURE.md`](../current/FINAL_SYSTEM_ARCHITECTURE.md) 为准。
 
 ## 5. Manifest
 
@@ -758,7 +758,7 @@ MVP 已证明第一种路径可以跨安全审查和 CSV artifact 两类任务�
 
 ## 16. D40 规划（Planned）
 
-本节只保留 EvalPack 相关 backlog；跨模块的最新路线图、优先级和完成定义见 [ROADMAP.md](./ROADMAP.md)，复杂 Skill 规划与归因见 [COMPLEX_SKILL_EVAL_AND_DIAGNOSIS_DESIGN.md](./COMPLEX_SKILL_EVAL_AND_DIAGNOSIS_DESIGN.md)，可视化 Pack 校准方案见 [VISUAL_CONSOLE_DESIGN.md](./VISUAL_CONSOLE_DESIGN.md)。
+本节只保留 EvalPack 兼容 backlog；旧路线图、复杂 Skill 规划与可视化校准方案已归档到 [`docs/archive/2026-08-pre-v2`](../archive/2026-08-pre-v2/README.md)。当前优先级和完成定义见 [`FINAL_SYSTEM_ARCHITECTURE.md`](../current/FINAL_SYSTEM_ARCHITECTURE.md)。
 
 1. 扩大 `v1alpha1` legacy repair 与 `v1alpha2` repair/tune 的兼容性测试；
 2. 在现有 `design/` Sidecar 与 cross-reference freeze gate 上增加 schema migration 和 Pack revision diff；

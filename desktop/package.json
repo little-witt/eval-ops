@@ -1,0 +1,47 @@
+{
+  "name": "aceval-desktop",
+  "version": "0.2.1",
+  "private": true,
+  "author": "ACEval Contributors",
+  "engines": {
+    "node": ">=20.19.0"
+  },
+  "description": "FORGE · product desktop for the aceval Skill Harness",
+  "main": "electron/main.cjs",
+  "scripts": {
+    "start": "electron .",
+    "smoke": "electron . --smoke-test",
+    "test:renderer": "node tests/renderer-contract.test.mjs",
+    "build:kernel": "node scripts/build-kernel.cjs",
+    "dist:mac": "npm run build:kernel && electron-builder --mac dir"
+  },
+  "devDependencies": {
+    "electron": "^37.2.6",
+    "electron-builder": "^26.0.12"
+  },
+  "build": {
+    "appId": "com.aceval.forge",
+    "productName": "FORGE Skill Evolution Studio",
+    "asar": true,
+    "files": [
+      "electron/**/*",
+      "renderer/**/*",
+      "package.json"
+    ],
+    "extraResources": [
+      {
+        "from": "build/forge-kernel",
+        "to": "forge-kernel"
+      }
+    ],
+    "mac": {
+      "category": "public.app-category.developer-tools",
+      "icon": "build-resources/icon.png",
+      "target": [
+        "dir"
+      ],
+      "hardenedRuntime": true,
+      "gatekeeperAssess": false
+    }
+  }
+}

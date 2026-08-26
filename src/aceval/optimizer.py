@@ -61,6 +61,9 @@ class MaterializedCandidateSnapshot:
     patch: str
     rationale: str
     usage: Mapping[str, Any] = None
+    changed_paths: Tuple[str, ...] = ()
+    created_paths: Tuple[str, ...] = ()
+    validation: Tuple[Mapping[str, Any], ...] = ()
 
 
 @dataclass(frozen=True)

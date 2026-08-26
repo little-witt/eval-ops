@@ -381,6 +381,7 @@ class CatxAgentProfile:
     credentials_file: Optional[str] = None
     stream: Optional[SupabaseSSEProfile] = None
     repository: Optional[CatxRepositoryResourceProfile] = None
+    repositories: Tuple[CatxRepositoryResourceProfile, ...] = ()
 
     def __post_init__(self) -> None:
         if self.api_version != CATX_PROFILE_API_VERSION:
@@ -419,6 +420,28 @@ class CatxAgentProfile:
             self.repository, CatxRepositoryResourceProfile
         ):
             raise CatxProfileError("repository must be a CatxRepositoryResourceProfile")
+        repositories = tuple(self.repositories)
+        if any(
+            not isinstance(item, CatxRepositoryResourceProfile)
+            for item in repositories
+        ):
+            raise CatxProfileError(
+                "repositories must contain CatxRepositoryResourceProfile values"
+            )
+        if self.repository is not None and repositories:
+            raise CatxProfileError(
+                "CATX profile cannot configure both repository and repositories"
+            )
+        mount_paths = [item.mount_path for item in repositories]
+        if len(mount_paths) != len(set(mount_paths)):
+            raise CatxProfileError("repositories must use unique mount_path values")
+        object.__setattr__(self, "repositories", repositories)
+
+    @property
+    def repository_resources(self) -> Tuple[CatxRepositoryResourceProfile, ...]:
+        if self.repositories:
+            return self.repositories
+        return (self.repository,) if self.repository is not None else ()
 
     @classmethod
     def from_mapping(cls, value: Any) -> "CatxAgentProfile":
@@ -429,12 +452,17 @@ class CatxAgentProfile:
                 "api_version", "name", "base_url", "api_key_env", "user_mis_id_env",
                 "agent_id_env", "environment_id_env", "vault_ids", "default_title",
                 "timeout_seconds", "max_response_bytes", "events_limit", "stream",
-                "repository", "credentials_file",
+                "repository", "repositories", "credentials_file",
             ),
             "CATX profile",
         )
         stream = mapping.get("stream")
         repository = mapping.get("repository")
+        repositories = mapping.get("repositories", ())
+        if isinstance(repositories, (str, bytes)) or not isinstance(
+            repositories, Sequence
+        ):
+            raise CatxProfileError("repositories must be an array")
         vault_ids = mapping.get("vault_ids")
         if isinstance(vault_ids, (str, bytes)) or not isinstance(vault_ids, Sequence):
             raise CatxProfileError("vault_ids must be an array")
@@ -457,6 +485,10 @@ class CatxAgentProfile:
                 CatxRepositoryResourceProfile.from_mapping(repository)
                 if repository is not None
                 else None
+            ),
+            repositories=tuple(
+                CatxRepositoryResourceProfile.from_mapping(item)
+                for item in repositories
             ),
         )
 
@@ -753,8 +785,8 @@ class CatxAgentClient:
             profile.agent_id_env,
             profile.environment_id_env,
         }
-        if profile.repository is not None:
-            allowed_names.add(profile.repository.authorization_token_env)
+        for repository in profile.repository_resources:
+            allowed_names.add(repository.authorization_token_env)
         if profile.stream is not None:
             allowed_names.add(profile.stream.api_key_env)
             if profile.stream.bearer_env is not None:
@@ -797,7 +829,12 @@ class CatxAgentClient:
             "user-mis-id": _environment_value(self._environment, self.profile.user_mis_id_env, "CATX user MIS"),
         }
 
-    def _request_json(self, method: str, path: str, payload: Optional[Mapping[str, Any]] = None) -> Mapping[str, Any]:
+    def _request_document(
+        self,
+        method: str,
+        path: str,
+        payload: Optional[Mapping[str, Any]] = None,
+    ) -> Any:
         body = None
         if payload is not None:
             try:
@@ -822,12 +859,44 @@ class CatxAgentClient:
         if not isinstance(response, HTTPResponse):
             raise CompanyApiRequestError("CATX API transport returned an invalid response")
         if not 200 <= response.status_code < 300:
-            raise CompanyApiRequestError("CATX API returned HTTP status %d" % response.status_code)
+            detail = ""
+            try:
+                error_document = _strict_json(
+                    response.body,
+                    "CATX API error response",
+                    self.profile.max_response_bytes,
+                )
+                redacted = _redact_sensitive(error_document, self._sensitive_values)
+                if isinstance(redacted, Mapping):
+                    candidate = (
+                        redacted.get("message")
+                        or redacted.get("detail")
+                        or redacted.get("error")
+                    )
+                    if isinstance(candidate, Mapping):
+                        candidate = candidate.get("message") or candidate.get("detail")
+                    if isinstance(candidate, str) and candidate.strip():
+                        detail = ": " + candidate.strip()[:1000]
+                elif isinstance(redacted, str) and redacted.strip():
+                    detail = ": " + redacted.strip()[:1000]
+            except ValueError:
+                pass
+            raise CompanyApiRequestError(
+                "CATX API returned HTTP status %d%s"
+                % (response.status_code, detail)
+            )
         try:
             value = _strict_json(response.body, "CATX API response", self.profile.max_response_bytes)
         except ValueError as exc:
             raise CompanyApiRequestError(str(exc)) from exc
-        return _mapping(value, "CATX API response", CompanyApiRequestError)
+        return value
+
+    def _request_json(self, method: str, path: str, payload: Optional[Mapping[str, Any]] = None) -> Mapping[str, Any]:
+        return _mapping(
+            self._request_document(method, path, payload),
+            "CATX API response",
+            CompanyApiRequestError,
+        )
 
     def start_session(
         self,
@@ -856,16 +925,18 @@ class CatxAgentClient:
             "environment_id": _environment_value(self._environment, self.profile.environment_id_env, "CATX Environment ID"),
             "vault_ids": list(self.profile.vault_ids),
         }
-        if self.profile.repository is not None:
+        if self.profile.repository_resources:
             create_payload["resources"] = [
-                self.profile.repository.request_resource(self._environment)
+                repository.request_resource(self._environment)
+                for repository in self.profile.repository_resources
             ]
         if binding is not None:
             if not isinstance(binding, CatxExecutionBinding):
                 raise TypeError("binding must be a CatxExecutionBinding")
             if (
-                self.profile.repository is not None
-                and binding.repository_ref != self.profile.repository.url
+                self.profile.repository_resources
+                and binding.repository_ref
+                not in {item.url for item in self.profile.repository_resources}
             ):
                 raise CompanyApiRequestError(
                     "CATX binding repository_ref does not match configured repository.url"
@@ -943,9 +1014,51 @@ class CatxAgentClient:
         if status in ("running", "rescheduling"):
             return {"status": "RUNNING", "round_count": 0, "message": None, "usage": status_document.get("usage")}
         if status in ("idle", "terminated"):
-            events = self.fetch_events(session_id, event_type="agent.message")
+            events = self.fetch_events(session_id)
             message = last_effective_agent_message(events)
-            if status == "terminated" and not message:
+            latest_user_index = max(
+                (
+                    index
+                    for index, event in enumerate(events)
+                    if event.get("type") == "user.message"
+                ),
+                default=-1,
+            )
+            latest_terminal_index = max(
+                (
+                    index
+                    for index, event in enumerate(events)
+                    if event.get("type")
+                    in ("session.status_idle", "session.error")
+                ),
+                default=-1,
+            )
+            session_error = None
+            for event in reversed(events):
+                if event.get("type") != "session.error":
+                    continue
+                raw_error = event.get("error")
+                if isinstance(raw_error, Mapping):
+                    session_error = raw_error.get("message") or raw_error.get("type")
+                elif isinstance(raw_error, str):
+                    session_error = raw_error
+                session_error = str(session_error or "CATX session error")
+                break
+            if (
+                status == "idle"
+                and not message
+                and latest_user_index >= 0
+                and latest_terminal_index < latest_user_index
+            ):
+                return {
+                    "status": "RUNNING",
+                    "round_count": 0,
+                    "message": None,
+                    "error": None,
+                    "usage": status_document.get("usage"),
+                    "catx_status": status,
+                }
+            if session_error is not None or (status == "terminated" and not message):
                 mapped = "FAILED"
             else:
                 mapped = "COMPLETED"
@@ -953,6 +1066,7 @@ class CatxAgentClient:
                 "status": mapped,
                 "round_count": 1 if message else 0,
                 "message": message or None,
+                "error": session_error,
                 "usage": status_document.get("usage"),
                 "catx_status": status,
             }

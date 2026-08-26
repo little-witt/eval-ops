@@ -190,6 +190,32 @@ class CatxProfileTest(unittest.TestCase):
                     "mount_path": "../repo",
                 }
             },
+            {
+                "repository": {
+                    "url": "ssh://git@git.sankuai.com/org/repo.git",
+                    "authorization_token_env": "REPO_TOKEN",
+                },
+                "repositories": [
+                    {
+                        "url": "ssh://git@git.sankuai.com/org/other.git",
+                        "authorization_token_env": "REPO_TOKEN",
+                    }
+                ],
+            },
+            {
+                "repositories": [
+                    {
+                        "url": "ssh://git@git.sankuai.com/org/one.git",
+                        "authorization_token_env": "REPO_TOKEN",
+                        "mount_path": "/workspace/repo",
+                    },
+                    {
+                        "url": "ssh://git@git.sankuai.com/org/two.git",
+                        "authorization_token_env": "REPO_TOKEN",
+                        "mount_path": "/workspace/repo",
+                    },
+                ]
+            },
         )
         for override in invalid:
             with self.subTest(override=override), self.assertRaises(CatxProfileError):
@@ -197,6 +223,40 @@ class CatxProfileTest(unittest.TestCase):
 
 
 class CatxAgentClientTest(unittest.TestCase):
+    def test_multiple_repository_resources_share_token_and_keep_mounts(self):
+        transport = FakeTransport(
+            [response({"id": "session_multi"}), response({"ok": True})]
+        )
+        environment = dict(ENVIRONMENT, CATX_REPOSITORY_TOKEN="pat_secret")
+        client = CatxAgentClient(
+            profile(
+                repositories=[
+                    {
+                        "url": "ssh://git@git.sankuai.com/org/skill.git",
+                        "authorization_token_env": "CATX_REPOSITORY_TOKEN",
+                        "mount_path": "/workspace/skills/reviewer",
+                    },
+                    {
+                        "url": "ssh://git@git.sankuai.com/org/fixture.git",
+                        "authorization_token_env": "CATX_REPOSITORY_TOKEN",
+                        "mount_path": "/workspace/repo",
+                    },
+                ]
+            ),
+            transport=transport,
+            environment=environment,
+        )
+
+        client.start_session({"prompt": "review"})
+
+        resources = json.loads(transport.calls[0]["body"])["resources"]
+        self.assertEqual(2, len(resources))
+        self.assertEqual(
+            ["/workspace/skills/reviewer", "/workspace/repo"],
+            [item["mount_path"] for item in resources],
+        )
+        self.assertEqual(["pat_secret", "pat_secret"], [item["authorization_token"] for item in resources])
+
     def test_credentials_file_supplies_values_and_environment_overrides_it(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             credentials = Path(temp_dir, "credentials.json")
@@ -393,6 +453,25 @@ class CatxAgentClientTest(unittest.TestCase):
         with self.assertRaisesRegex(CompanyApiRequestError, "CATX API key"):
             client.start_session({"prompt": "hello"})
 
+    def test_http_error_detail_is_redacted(self):
+        client = CatxAgentClient(
+            profile(),
+            transport=FakeTransport(
+                [
+                    response(
+                        {"message": "clone failed for token catx-secret"},
+                        status=400,
+                    )
+                ]
+            ),
+            environment=ENVIRONMENT,
+        )
+        with self.assertRaises(CompanyApiRequestError) as captured:
+            client.get_status("session_error")
+        message = str(captured.exception)
+        self.assertIn("clone failed", message)
+        self.assertNotIn("catx-secret", message)
+
     def test_polls_status_and_uses_last_effective_message(self):
         events = [
             {"type": "agent.message", "content": [{"type": "text", "text": "draft"}]},
@@ -410,6 +489,58 @@ class CatxAgentClientTest(unittest.TestCase):
         self.assertEqual("final", result["message"])
         self.assertIn("session%2F1/events", transport.calls[1]["url"])
         self.assertEqual("final", last_effective_agent_message(events))
+
+    def test_idle_session_with_error_maps_to_failed(self):
+        transport = FakeTransport(
+            [
+                response({"status": "idle", "usage": {"output_tokens": 8}}),
+                response(
+                    {
+                        "data": [
+                            {
+                                "type": "session.error",
+                                "error": {
+                                    "type": "model_rate_limited_error",
+                                    "message": "模型请求频率限制",
+                                },
+                            },
+                            {
+                                "type": "session.status_idle",
+                                "stop_reason": {"type": "retries_exhausted"},
+                            },
+                        ]
+                    }
+                ),
+            ]
+        )
+        client = CatxAgentClient(profile(), transport=transport, environment=ENVIRONMENT)
+
+        result = client.poll_session("session_failed")
+
+        self.assertEqual("FAILED", result["status"])
+        self.assertEqual("模型请求频率限制", result["error"])
+
+    def test_idle_with_unprocessed_user_message_remains_running(self):
+        transport = FakeTransport(
+            [
+                response({"status": "idle", "usage": {}}),
+                response(
+                    {
+                        "data": [
+                            {
+                                "type": "user.message",
+                                "content": [{"type": "text", "text": "review"}],
+                            }
+                        ]
+                    }
+                ),
+            ]
+        )
+        client = CatxAgentClient(profile(), transport=transport, environment=ENVIRONMENT)
+
+        result = client.poll_session("session_pending")
+
+        self.assertEqual("RUNNING", result["status"])
 
     def test_fetches_complete_event_types_into_imported_bundle(self):
         events = [

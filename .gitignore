@@ -10,6 +10,8 @@
 
 # Python
 .venv/
+.venv-desktop-build/
+.venv-desktop-build-arm64/
 __pycache__/
 *.py[cod]
 .pytest_cache/
@@ -19,6 +21,9 @@ __pycache__/
 htmlcov/
 dist/
 build/
+.pyinstaller-work/
+.pyinstaller-spec/
+.pyinstaller-cache/
 *.egg-info/
 
 # JavaScript, if a UI is added later

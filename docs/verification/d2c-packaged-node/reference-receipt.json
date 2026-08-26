@@ -1,0 +1,116 @@
+{
+  "api_version": "aceval.d2c-validation-receipt/v1",
+  "artifacts": {
+    "console.json": {
+      "bytes": 3,
+      "path": "console.json",
+      "sha256": "sha256:37517e5f3dc66819f61f5a7bb8ace1921282415f10551d2defa5c3eb0985b570"
+    },
+    "dom.html": {
+      "bytes": 1539,
+      "path": "dom.html",
+      "sha256": "sha256:53ce83ec885b5ab2f93fd44fd1c6a0a0ffa0034115e591c8171cbee51203f5a3"
+    },
+    "driver-result.json": {
+      "bytes": 2317,
+      "path": "driver-result.json",
+      "sha256": "sha256:b4973b11a6ab843bc8cd7e5c53b71e816595aaa066de60d3b285b02c018594d3"
+    },
+    "network.json": {
+      "bytes": 306,
+      "path": "network.json",
+      "sha256": "sha256:6c6ffe5762f0fe5a7d1d053f3cd4449ead184d40ab592d06fcb39a6abba12471"
+    },
+    "screenshot.png": {
+      "bytes": 51617,
+      "path": "screenshot.png",
+      "sha256": "sha256:bafc125a722c5c69d4a393f1d462af1f61fa35a30bd5784648010631da08dcdf"
+    }
+  },
+  "candidate_commit": "cccccccccccccccccccccccccccccccccccccccc",
+  "case_id": "real-browser-smoke",
+  "driver_summary": {
+    "api_version": "aceval.d2c-browser-driver/v1",
+    "chrome_stderr_tail": "\nDevTools listening on ws://127.0.0.1:50231/devtools/browser/ba5d99c6-6802-4cfa-a017-dac8ac07dfb9\nTrying to load the allocator multiple times. This is *not* supported.\n",
+    "console_errors": 0,
+    "console_events": 0,
+    "failure": null,
+    "final_url": "http://127.0.0.1:8898/",
+    "metrics": {
+      "devicePixelRatio": 1,
+      "height": 900,
+      "navigation": {
+        "activationStart": 0,
+        "confidence": {},
+        "connectEnd": 0.5,
+        "connectStart": 0.5,
+        "contentEncoding": "",
+        "contentType": "text/html",
+        "criticalCHRestart": 0,
+        "decodedBodySize": 1414,
+        "deliveryType": "",
+        "domComplete": 49.5,
+        "domContentLoadedEventEnd": 49.30000001192093,
+        "domContentLoadedEventStart": 49.30000001192093,
+        "domInteractive": 49.30000001192093,
+        "domainLookupEnd": 0.5,
+        "domainLookupStart": 0.5,
+        "duration": 49.5,
+        "encodedBodySize": 1414,
+        "entryType": "navigation",
+        "fetchStart": 0.5,
+        "finalResponseHeadersStart": 14.199999988079071,
+        "firstInterimResponseStart": 0,
+        "initiatorType": "navigation",
+        "loadEventEnd": 49.5,
+        "loadEventStart": 49.5,
+        "name": "http://127.0.0.1:8898/",
+        "navigationId": 9221,
+        "nextHopProtocol": "http/1.0",
+        "notRestoredReasons": null,
+        "redirectCount": 0,
+        "redirectEnd": 0,
+        "redirectStart": 0,
+        "renderBlockingStatus": "non-blocking",
+        "requestStart": 1.9000000059604645,
+        "responseEnd": 14.599999994039536,
+        "responseStart": 14.199999988079071,
+        "responseStatus": 200,
+        "secureConnectionStart": 0,
+        "serverTiming": [],
+        "startTime": 0,
+        "transferSize": 1714,
+        "type": "navigate",
+        "unloadEventEnd": 0,
+        "unloadEventStart": 0,
+        "workerCacheLookupStart": 0,
+        "workerFinalSourceType": "",
+        "workerMatchedSourceType": "",
+        "workerRouterEvaluationStart": 0,
+        "workerStart": 0
+      },
+      "title": "FORGE D2C Fixture",
+      "url": "http://127.0.0.1:8898/",
+      "width": 1440
+    },
+    "network_events": 2,
+    "success": true,
+    "title": "FORGE D2C Fixture",
+    "title_matched": true,
+    "viewport": {
+      "device_scale_factor": 1,
+      "height": 900,
+      "width": 1440
+    },
+    "visual": null
+  },
+  "duration_ms": 3575.207,
+  "environment_fingerprint": "sha256:2c97133d06356c310ea0a993693a59013bbb9143d5963c9fd26181ba2f8fb150",
+  "finished_at": "2026-08-26T04:47:38.312307+00:00",
+  "infrastructure_errors": [],
+  "profile": "real-local-chrome-smoke",
+  "receipt_hash": "sha256:82d4310204c4e0a9f58e2969e4e7d6bcd01e9706634698b7ce7d7a8f4b77643c",
+  "request_hash": "sha256:2e70f72cfcd6430d8a27e35e25dd96f8a740fbdae6289b165ac41646b1d8f5dc",
+  "started_at": "2026-08-26T04:47:34.736765+00:00",
+  "status": "succeeded"
+}

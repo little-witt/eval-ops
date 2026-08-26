@@ -37,9 +37,10 @@ CATX 输出按“从后向前寻找最后一条有效 `agent.message`”提取�
 - `*_env`：环境变量名称，不是实际值；
 - `credentials_file`：可选本地凭据 JSON 路径；相对路径按 Profile 所在目录解析；
 - `vault_ids`：会话可访问的 Vault ID；
-- `repository.url`：CATX 可以拉取的远程 Git URL，不能填写本机目录；
-- `repository.authorization_token_env`：仓库 PAT 所在环境变量名，Profile 中不保存 PAT；
-- `repository.mount_path`：仓库在 Agent 沙箱中的绝对路径，默认 `/workspace/repo`；
+- `repositories[]`：一个会话可以挂载多个远程 Git 仓库；旧的单个 `repository` 字段仍兼容，但不能与 `repositories` 同时配置；
+- `repositories[].url`：CATX 可以拉取的远程 Git URL，不能填写本机目录；
+- `repositories[].authorization_token_env`：仓库 PAT 所在环境变量名；多个仓库可以引用同一个变量；
+- `repositories[].mount_path`：仓库在 Agent 沙箱中的唯一绝对路径；
 - `events_limit`：单次读取事件数，默认 200，最大 1000；
 - `stream.base_url`：Supabase 项目 URL；
 - `stream.path`：Edge Function 路径；
@@ -82,21 +83,28 @@ export SUPABASE_ACCESS_TOKEN='可选的用户 access token'
 
 凭据文件必须加入 Git 忽略规则，不要把值写入 Profile、受版本控制的 JSON、终端历史截图或故障报告。
 
-代码评审使用一个统一 Fixture Lab 仓库。远程仓库必须包含全部
+代码评审会话同时挂载候选 Skill 仓库和统一 Fixture Lab 仓库。Fixture 远程仓库必须包含全部
 `base/<stack>` 和 `case/<case-id>` 分支；每次评测由 Case 元数据指定固定的
-base/head commit，因此 CATX Profile 只需要长期配置一个仓库 URL。
+base/head commit。候选 Skill 仓库固定挂载到 `/workspace/skills/<skill-name>`，Fixture
+仓库固定挂载到 `/workspace/repo`；执行前必须在日志中核对两个仓库的实际 commit。
 
 ## 创建并运行会话
 
-请求文件只允许 `title` 和 `prompt`。如果 Profile 配置了 `repository`，创建会话时
-会自动添加如下资源，`authorization_token` 只在内存中的 HTTP 请求体出现：
+请求文件只允许 `title` 和 `prompt`。如果 Profile 配置了 `repositories`，创建会话时
+会自动添加全部资源，`authorization_token` 只在内存中的 HTTP 请求体出现：
 
 ```json
 {
   "resources": [
     {
       "type": "repository",
-      "url": "ssh://git@git.sankuai.com/org/repo.git",
+      "url": "ssh://git@git.sankuai.com/org/frontend-code-reviewer.git",
+      "authorization_token": "$CATX_REPOSITORY_AUTHORIZATION_TOKEN",
+      "mount_path": "/workspace/skills/frontend-code-reviewer"
+    },
+    {
+      "type": "repository",
+      "url": "ssh://git@git.sankuai.com/org/fixture-lab.git",
       "authorization_token": "$CATX_REPOSITORY_AUTHORIZATION_TOKEN",
       "mount_path": "/workspace/repo"
     }
@@ -178,7 +186,9 @@ SSE 本身只用于等待和实时事件观测。终态结果以 CATX `/sessions
 | CATX 状态 | 有效消息 | aceval 状态 |
 | --- | --- | --- |
 | `running` / `rescheduling` | 不读取 | `RUNNING` |
-| `idle` | 有或无 | `COMPLETED`，无消息时 `round_count=0` |
+| `idle` | 有消息且无 `session.error` | `COMPLETED` |
+| `idle` | 存在 `session.error` | `FAILED` |
+| `idle` | 无消息且无错误 | `COMPLETED`，`round_count=0` |
 | `terminated` | 有 | `COMPLETED` |
 | `terminated` | 无 | `FAILED` |
 | 未知状态 | 不读取 | `RUNNING` |
@@ -187,6 +197,6 @@ SSE 本身只用于等待和实时事件观测。终态结果以 CATX `/sessions
 
 - Events API 文档未提供翻页游标。本实现单次按 `events_limit` 获取；当事件数达到上限时，元数据会标记 `trace_may_be_truncated: true`，不能宣称日志一定无截断。
 - SSE Edge Function 需要与 CATX Session ID 属于同一套线上环境。
-- 仓库 `resources` 创建字段已经接入；当前尚未获得服务端回读实际仓库 commit/tree
-  与精确候选 Skill hash 的字段，因此可以做挂载冒烟，但正式评分仍保持 fail closed。
+- 多仓库 `resources` 创建字段已经接入。正式评分前，Agent 必须只读执行 `git rev-parse HEAD`
+  核对候选 Skill commit 和 Fixture base/head；任何缺失或漂移都 fail closed。
 - 原始 Events 可能包含 Prompt、工具参数或敏感上下文，输出目录应按敏感数据管理，不能直接上传或公开。

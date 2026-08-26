@@ -1,0 +1,134 @@
+{
+  "api_version": "aceval.d2c-validation-receipt/v1",
+  "artifacts": {
+    "console.json": {
+      "bytes": 3,
+      "path": "console.json",
+      "sha256": "sha256:37517e5f3dc66819f61f5a7bb8ace1921282415f10551d2defa5c3eb0985b570"
+    },
+    "dom.html": {
+      "bytes": 1539,
+      "path": "dom.html",
+      "sha256": "sha256:53ce83ec885b5ab2f93fd44fd1c6a0a0ffa0034115e591c8171cbee51203f5a3"
+    },
+    "driver-result.json": {
+      "bytes": 2799,
+      "path": "driver-result.json",
+      "sha256": "sha256:ef3eaa8eae470430e94d5fc858fbb4e3aef940d88814ff60564eeade1b9a30be"
+    },
+    "network.json": {
+      "bytes": 306,
+      "path": "network.json",
+      "sha256": "sha256:6c6ffe5762f0fe5a7d1d053f3cd4449ead184d40ab592d06fcb39a6abba12471"
+    },
+    "screenshot.png": {
+      "bytes": 51617,
+      "path": "screenshot.png",
+      "sha256": "sha256:bafc125a722c5c69d4a393f1d462af1f61fa35a30bd5784648010631da08dcdf"
+    },
+    "visual-diff.png": {
+      "bytes": 69816,
+      "path": "visual-diff.png",
+      "sha256": "sha256:4ee3d628dcb0df3aaaa576d6752bfbaf5a29018f36e41633602b6c4a5b17a640"
+    }
+  },
+  "candidate_commit": "cccccccccccccccccccccccccccccccccccccccc",
+  "case_id": "real-browser-smoke",
+  "driver_summary": {
+    "api_version": "aceval.d2c-browser-driver/v1",
+    "chrome_stderr_tail": "\nDevTools listening on ws://127.0.0.1:50316/devtools/browser/f27b1432-c7d7-489f-a66d-2b82fa1e6b94\nTrying to load the allocator multiple times. This is *not* supported.\n",
+    "console_errors": 0,
+    "console_events": 0,
+    "failure": null,
+    "final_url": "http://127.0.0.1:8898/",
+    "metrics": {
+      "devicePixelRatio": 1,
+      "height": 900,
+      "navigation": {
+        "activationStart": 0,
+        "confidence": {},
+        "connectEnd": 0.5999999940395355,
+        "connectStart": 0.5999999940395355,
+        "contentEncoding": "",
+        "contentType": "text/html",
+        "criticalCHRestart": 0,
+        "decodedBodySize": 1414,
+        "deliveryType": "",
+        "domComplete": 50.599999994039536,
+        "domContentLoadedEventEnd": 50.400000005960464,
+        "domContentLoadedEventStart": 50.400000005960464,
+        "domInteractive": 50.29999998211861,
+        "domainLookupEnd": 0.5999999940395355,
+        "domainLookupStart": 0.5999999940395355,
+        "duration": 50.599999994039536,
+        "encodedBodySize": 1414,
+        "entryType": "navigation",
+        "fetchStart": 0.5999999940395355,
+        "finalResponseHeadersStart": 7,
+        "firstInterimResponseStart": 0,
+        "initiatorType": "navigation",
+        "loadEventEnd": 50.599999994039536,
+        "loadEventStart": 50.599999994039536,
+        "name": "http://127.0.0.1:8898/",
+        "navigationId": 8181,
+        "nextHopProtocol": "http/1.0",
+        "notRestoredReasons": null,
+        "redirectCount": 0,
+        "redirectEnd": 0,
+        "redirectStart": 0,
+        "renderBlockingStatus": "non-blocking",
+        "requestStart": 1.0999999940395355,
+        "responseEnd": 7.299999982118607,
+        "responseStart": 7,
+        "responseStatus": 200,
+        "secureConnectionStart": 0,
+        "serverTiming": [],
+        "startTime": 0,
+        "transferSize": 1714,
+        "type": "navigate",
+        "unloadEventEnd": 0,
+        "unloadEventStart": 0,
+        "workerCacheLookupStart": 0,
+        "workerFinalSourceType": "",
+        "workerMatchedSourceType": "",
+        "workerRouterEvaluationStart": 0,
+        "workerStart": 0
+      },
+      "title": "FORGE D2C Fixture",
+      "url": "http://127.0.0.1:8898/",
+      "width": 1440
+    },
+    "network_events": 2,
+    "success": true,
+    "title": "FORGE D2C Fixture",
+    "title_matched": true,
+    "viewport": {
+      "device_scale_factor": 1,
+      "height": 900,
+      "width": 1440
+    },
+    "visual": {
+      "actual_height": 900,
+      "actual_width": 1440,
+      "diff_ratio": 0,
+      "differing_pixels": 0,
+      "dimensions_match": true,
+      "expected_height": 900,
+      "expected_width": 1440,
+      "max_channel_delta": 0,
+      "max_diff_ratio": 0,
+      "passed": true,
+      "pixel_threshold": 0,
+      "reference_sha256": "sha256:bafc125a722c5c69d4a393f1d462af1f61fa35a30bd5784648010631da08dcdf"
+    }
+  },
+  "duration_ms": 1998.637,
+  "environment_fingerprint": "sha256:2c97133d06356c310ea0a993693a59013bbb9143d5963c9fd26181ba2f8fb150",
+  "finished_at": "2026-08-26T04:47:40.390760+00:00",
+  "infrastructure_errors": [],
+  "profile": "real-local-chrome-smoke",
+  "receipt_hash": "sha256:bce8f00b6e95866d163339656a7c97b487269e134dcb052fe143d81828100269",
+  "request_hash": "sha256:68643dc00a707c0d7b0fe10dd280c773ba118b024ac4aed1202a0be05624bb7e",
+  "started_at": "2026-08-26T04:47:38.392187+00:00",
+  "status": "succeeded"
+}

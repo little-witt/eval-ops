@@ -4,6 +4,11 @@
 > 日期：2026-08-18  
 > 结论：建设本地单用户 EvalOps Console；暂不建设完整在线 SaaS。
 
+> 2026-08-24 更新：只读动态优化树、工作区编译器、离线 Console、localhost API/SSE
+> 和脱敏配置视图已经实现。新版实践结论、CLI 和验收标准以
+> [OPTIMIZATION_COCKPIT_MVP_V2.md](./OPTIMIZATION_COCKPIT_MVP_V2.md) 为准；新建任务、
+> 配置写入、重复运行统计和桌面壳仍属于后续阶段。
+
 ## 1. 为什么需要 Console
 
 可视化不是单纯的展示包装。当前系统中的以下关系难以通过一条 CLI 输出完整理解：

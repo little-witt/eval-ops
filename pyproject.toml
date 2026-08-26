@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "aceval"
 version = "0.2.1"
-description = "Reference-runtime EvalOps for repairing, tuning, and evaluating Agent Skills."
+description = "Low-token Skill Harness for evaluating, repairing, tuning, extending, discovering, and creating Agent Skills."
 readme = "README.md"
 requires-python = ">=3.9"
 license = "MIT"
@@ -15,6 +15,7 @@ dependencies = []
 [project.optional-dependencies]
 yaml = ["PyYAML>=6.0"]
 dev = ["pytest>=7.4"]
+desktop-build = ["pyinstaller>=6.16,<7"]
 
 [project.scripts]
 aceval = "aceval.cli:main"
@@ -24,3 +25,6 @@ package-dir = {"" = "src"}
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+aceval = ["console_assets/*.html", "console_assets/*.css", "console_assets/*.js", "d2c_driver/*.mjs"]

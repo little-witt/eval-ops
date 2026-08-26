@@ -1,648 +1,147 @@
-# Skill Doctor
+# FORGE / ACEval
 
-> Agent Capability EvalOps: 在一个可控的参考 Agent 环境中，对 Skill 做可复现评测、成对比较和受控迭代。
+FORGE 是一个本地优先的 Skill 评测与进化桌面工具；ACEval 是它的确定性 Kernel。
 
-当前状态：仓库已经包含可运行的 `aceval 0.2.1` 参考实现、两个手写 EvalPack、复杂 Skill 规划与覆盖链路、Pack Builder/Quality Gate、Failure Attribution、公司 Session 导入与离线诊断、示例 Skill、命令行工具和自动测试。仓库中的 FakeRuntime 结果是确定性模拟，只用于验证 Kernel、Pack、Grader 和门禁流程；它们不是实际模型效果或提升数据。
+用户提供 Skill 仓库、目标/标准、可选 Case 和运行环境，系统会自动生成或复用
+EvalPack，补齐 Case 与语义评测路径，在真实远程 Agent 上并行运行，回收逐 Case
+完整日志，由本地分析 Agent 生成问题簇和修改提案，再由确定性门禁控制多文件候选、
+回归、Champion/Challenger 晋升和收敛。
 
-代码评审场景的 P0 已加入内容寻址环境契约、离线只读 Docker Provider、覆盖
-TypeScript Web、React Native、微信小程序 JS 与 Java 后端的统一分支式 Git
-fixture lab、`repository.verify/v1`、专用 findings Grader，以及 CATX 精确
-Skill/仓库绑定的 fail-closed 适配边界。搭建和 Ready 标准见
-[CODE_REVIEW_P0_RUNBOOK.md](./CODE_REVIEW_P0_RUNBOOK.md)。
+它不是静态报告页，也不是“让一个模型自己出题、自己改 Skill、自己宣布变好”的脚本。
 
-## 一句话介绍
+![任务详情](docs/screenshots/forge-desktop-task-detail.png)
 
-Skill Doctor 把“人工运行 Skill -> 搬运会话日志 -> 请 Agent 分析 -> 修改 Skill -> 手工回归”的过程，收敛为一套受确定性工作流控制的 EvalOps 系统：加载冻结测试契约，在统一 Runtime 中执行 Skill，采集标准 Trace、产物和 usage；baseline 有硬失败时进入 `repair`，baseline 已可用时按明确 Objective 进入 `tune`，再经过 validation 与可选 holdout 门禁输出候选和证据报告。
+## 当前产品能力
 
-## 项目背景
+- repair、tune、extend、discover、create 五类 Skill 生命周期任务；
+- 用户无感 EvalPack 生成/精确复用，也支持自定义 EvalPack 与用户 Case；
+- 测试义务、Case、required/recommended/alternative/forbidden 语义路径；
+- CATX 多会话、双仓库挂载、不可变 Skill commit、轮询/SSE 和完整日志回收；
+- Attempt → Case Aggregate → Candidate Comparison 三层判定；
+- Outcome、Procedure、Grounding、Runtime、可选 Efficiency 与 pass@k/pass^k；
+- 证据有效性、硬路径失败、跨 Case 问题簇、冲突与精确修改范围；
+- `SKILL.md`、`scripts/`、`references/`、模板和配置的受控多文件候选；
+- 用户批准门、Git commit/push、被拒候选的可审计 revert、稳定通过保护；
+- D2C 独立 Chrome Worker、交互预览、受控插件、DOM/网络/控制台/截图/像素差异证据；
+- Skill 与 Agent 共用的 `EvaluationSubject` 控制面契约。
 
-初版 Skill 通常由 Agent 根据 Prompt 直接生成。用户随后建立 Case、运行 Skill、发现失败，再把输出和工具调用日志交给另一个 Agent 分析。这个流程有几个长期问题：
+完整产品与架构基线见
+[最终系统架构](docs/current/FINAL_SYSTEM_ARCHITECTURE.md) 和
+[Kernel V2](docs/current/EVALUATION_SELF_ITERATION_KERNEL_V2.md)。
 
-1. 用户在多个 Agent 和环境之间充当消息中转者；
-2. 测试、失败证据和修复没有自然沉淀为可重复执行的资产；
-3. 模型波动、工具、权限、环境和评测标准问题容易被误判为 Skill 问题；
-4. 修改可能只记住少量 Case，缺少 validation 和 holdout 回归门禁；
-5. 不同任务反复搭建专用脚本，难以复用执行、评分和报告能力。
+## 桌面端使用
 
-Skill Doctor 的目标不是只优化“安全代码审查”这一种 Skill，而是提供稳定的 Reference Agent Runtime、可复用的 EvalOps 生命周期和声明式 EvalPack。安全审查与 CSV 汇总只是两种不同输入输出形态的验证样例。这里的“通用”指 Pack 加载、执行、Observation、评分和门禁状态机不包含领域分支；它不表示当前内置 Subject、Runtime 和 Optimizer 已覆盖任意 Skill 形态。
+当前 macOS arm64 开发构建位于：
 
-## 当前实现
+`desktop/dist/mac-arm64/FORGE Skill Evolution Studio.app`
 
-### Reference Agent Runtime
+该 `.app` 已内置 arm64 Python Kernel 和 Electron Node，不要求最终用户安装 Python 或
+Node。Git 用于仓库操作；D2C 需要本机 Google Chrome/Chromium。应用尚未使用 Apple
+Developer ID 签名/公证，因此它是本地验证构建，不是公开分发安装包。
 
-项目内置自己的最小无头 Agent Runtime，用固定语义执行被测 Skill：
+启动后：
 
-- 通过内置 `skill_markdown_v1` Adapter 加载 UTF-8 `SKILL.md`，目录模式可额外包含 UTF-8 JSON `subject.json`；
-- 将 Skill 指令和 Case Prompt 组成模型消息；
-- 执行有最大步数限制的模型/工具循环；
-- 只向模型暴露 `list_files`、UTF-8 `read_file`、UTF-8 `write_file`；
-- 限制工作区路径逃逸、单次读写字节数和 Trace 事件数；
-- 产生 `model_call`、`tool_call`、`tool_result`、`message` 事件，并由 Adapter 转为 Canonical Trace；
-- 通过 `CommandModelClient` 接入任意符合 JSON stdin/stdout 协议的模型桥接程序。
+1. 在“配置与环境”中完成 Kernel / Git / D2C 体检，并把 API Key/PAT 保存到系统安全存储；
+2. 创建任务，填写 Skill 仓库、分支、目标/标准、可选代码仓库和 Case；
+3. 如有自己的 EvalPack，选择目录；留空时系统自动生成或复用；
+4. 创建后立即进入任务详情，观察 EvalPack、Case/Path、远程会话和日志事件；
+5. 在分析门选择修改提案并补充意见；系统继续生成、发布、复评，直到晋升、拒绝或安全停止。
 
-这个 Runtime 的目的不是复刻某家 Agent 平台，而是给当前支持面内的 Skill 优化提供一个稳定、可审计、可重复控制的实验环境。内置链路不会快照或物化 `scripts/`、`templates/`、`assets/` 等附属目录，也不支持多文件或二进制 Subject，以及 shell、network、browser、multimodal 工具。需要这些能力时，应实现并显式注册新的受信 Subject/Runtime/Optimizer 组件，或在 D40 阶段扩展；不能只靠新增 EvalPack 获得。
+凭据只进入 Electron `safeStorage` 和子进程环境；任务配置持久化的是环境变量名，不是明文。
 
-### 通用 EvalOps Kernel
+桌面开发与构建说明见 [desktop/README.md](desktop/README.md)。
 
-Kernel 通过公共 Contract 和 Registry 组织固定生命周期：
+## 源码运行
 
-```text
-EvalPackLoader + Registry
-          |
-          v
-Subject snapshot/materialize
-          |
-          v
-Driver.prepare -> Runtime.execute -> Driver.collect -> Graders
-          |                                  |
-          |                                  v
-          |                         RunObservation + Canonical Trace
-          v
-baseline / compare / dev candidate search
-          |
-          v
-validation promotion -> optional one-shot holdout -> report
-```
-
-Kernel 负责 Pack 完整性校验、Subject 快照、Runtime capability 检查、工作区生命周期、预算、评分聚合、候选 lineage 和回归门禁。领域评测知识位于 EvalPack 的 Scenario、fixture、Oracle 和 Grader 配置中；优化目标、预算和修改约束位于独立 ExperimentPlan 中。Orchestrator 不包含安全审查或 CSV 的条件分支。
-
-当前内置 Optimizer 只修改 UTF-8 `SKILL.md`，不会覆盖原 Skill。候选受允许路径、最大新增行数、最大候选数、父版本 hash 和测试字面量泄漏检查约束。`repair` 只能接收 dev 的确定性硬失败证据；`tune` 只能接收 dev 的目标与测量值。validation/holdout 从不反馈给 Optimizer。Tune 在 dev、validation 和 holdout 上都保持 hard Grader 非劣，并对 baseline/candidate 做成对 Objective 比较。
-
-每个 Optimizer 除组件 `id` 外还必须声明 `proposal_contract`。Kernel 接受 `aceval.optimizer/candidate-patch-v1`，也接受内置 `aceval.optimizer/skill-markdown-improver-v2`，由 `SkillOptimizerBridge` 转为前一种契约；旧 `skill-markdown-generator-v1` 保留为 repair 兼容面。缺失、未知或与 improvement mode 不匹配的契约会在生成候选前 fail closed。
-
-当前 `candidate-patch-v1` 的可验证格式仍是刻意收窄的：候选目录提供完整文件快照，`content` 必须是 UTF-8 文本，diff 只能修改单个声明的 entrypoint，Kernel 会从冻结 parent/candidate 重新计算 unified diff 并逐项核对。无效 base/path/hash/diff 会计入 rejected proposal 和 usage 后以结构化协议错误停止。多文件或二进制优化不能只注册一个新 Subject Adapter；D40 需要同时定义显式的候选验证扩展契约（例如 `verify_candidate_patch`）及对应安全测试。
-
-两类评测参数和一类实验参数有固定传递边界：`subject_contract.params` 进入 Subject Adapter 的 `snapshot/materialize` 以及候选重验；`driver.params` 只通过 Driver `RunContext.metadata.driver_params` 进入 `prepare`，不会转发给 Runtime；ExperimentPlan 的 `optimization.params` 通过 `PatchConstraints.metadata.optimizer_params` 交给 `candidate-patch-v1` Optimizer。当前内置 Adapter/Driver 不消费这些自定义参数。
-
-### EvalPack
-
-`EvalPack v1alpha1` 保持 legacy repair 兼容；旧 Pack 中的 `optimizer_policy` 仍可由兼容适配器读取，但新 Builder 不再写入该字段。新生成的薄 EvalPack 只定义评测契约；`auto | repair | tune`、自然语言 Goal、单一 Primary Objective、优化器和补丁预算进入相邻的 `ExperimentPlan v1`。Objective 第一版支持 Grader score/metric、Token/成本、场景耗时和工具调用数；所有 hard Grader 始终是正确性与安全 guardrail。仓库内置两个 legacy Pack：
-
-| Pack | 输入与输出 | Case | 主要 Grader |
-|---|---|---:|---|
-| `security-review` | Python 文件 -> JSON findings | 6 dev + 2 validation + 2 holdout | JSON Schema、记录匹配、源码行引用、Trace 工具断言 |
-| `csv-summary-smoke` | CSV 文件 -> `summary.json` | 2 dev + 1 validation | 产物存在、JSON Schema、JSON Path、workspace diff |
-
-接入新任务时，若 UTF-8 `SKILL.md`、固定文件工具和现有 Driver/Grader 已足够，优先用 Pack Builder 从少量 Case 和 Goal 生成 Pack。已支持 `generic`、`csv-summary`、`security-review` 模板；未知类型会安全降级到 `generic` 草稿。出现新的 Subject 文件形态、工具能力、输入输出模态、评分语义或修改表面时，需要实现并显式注册相应受信组件；目标是保持 Kernel 状态机不随领域变化，而不是宣称扩展永远零代码。
-
-生成的 EvalPack 采用独立生命周期，并在 Pack 目录旁生成 `<pack>.experiment.json`：
-
-```text
-draft -> calibrating（可反复改 Case/Oracle/Grader） -> frozen
-                                                        |
-                                                        v
-                                              repair/tune Skill
-```
-
-草稿可以 `lint`、`test` 和人工校准，但不能进入 Skill 优化。显式冻结时会生成 `.aceval-pack-lock.json`；冻结后任何 Case、Oracle、Grader 或 fixture 变化都会使加载失败。ExperimentPlan 可独立调整且不会改变 Pack hash，但必须绑定正确的 Suite hash。需要调整评测器时，应创建新 Pack 版本并重新跑 baseline，不能让模型在同一实验里同时改 EvalPack 和 Skill。
-
-这一职责拆分的完整迭代方案、迁移策略和验收标准见 [SKILL_OPTIMIZATION_DECOUPLING_PLAN.md](./SKILL_OPTIMIZATION_DECOUPLING_PLAN.md)。
-热门研发与工作类 Skill 的评测画像、优先级和复用建议见 [COMMON_SKILL_EVALUATION_STRATEGY.md](./COMMON_SKILL_EVALUATION_STRATEGY.md)。
-
-### FakeRuntime 的定位
-
-FakeRuntime 读取 Scenario 中预注册的 baseline/candidate 输出，用于：
-
-- Pack conformance；
-- CLI、状态机和报告测试；
-- 无模型、无密钥的确定性演示；
-- 验证候选是否按 dev/validation/holdout 顺序经过门禁。
-
-它不执行模型，也不证明示例候选能在真实模型上获得同样结果。所有 FakeRuntime 报告都会包含 `simulated: true`。
-
-## 复杂 Skill 规划与故障归因（Implemented，D20）
-
-当前实现已经在 Kernel 外增加两个正式能力面：
-
-```text
-Skill + 少量种子 Case + Goal
-  -> Capability Graph
-  -> Test Plan + bounded Case drafts
-  -> Coverage Matrix + Runtime gaps
-  -> Pack Quality Gate -> frozen EvalPack
-
-Observation + Trace + Grade
-  -> Failure Cards
-  -> quality / tool / CLI / Runtime / evaluator / evidence-gap 分类
-  -> Patch Authorization
-```
-
-`aceval plan` 会确定性读取冻结的 UTF-8 `SKILL.md`，生成带行号和 quote hash 的 Capability Graph，将显式分支、风险、工具和状态声明编译为风险加权 Test Requirement，把种子 Case 映射到 Requirement，并在 `max_generated_cases` 预算内生成可编辑 Case 草稿。规划产物同时给出 planned、Runtime-executable、Oracle-ready 和显式 observed coverage、Runtime gap 与 Freeze Blocker；它不宣称穷举任意自然语言路径，也不会凭空生成并信任语义 Oracle。
-
-`aceval pack generate --plan ...` 会把规划产物编译进 Pack 的 `design/` Sidecar。`aceval pack quality` 和 `pack freeze --approve` 会校验 Sidecar source-subject/Plan hash 一致性、引用、critical coverage、Oracle trust、Runtime gap、generated holdout 和 Case family 跨 split 泄漏；`doctor` 运行前还会比较实际 Subject hash，除非用户显式允许 drift。当前 Quality Gate 还不包含 known-good/known-bad、mutation detection 或 evaluator flake 校准。
-
-Failure Attribution 已接入 Orchestrator：每个 Scenario 生成版本化 Failure Card 和 Patch Decision，只有授权的 dev hard failure 才会进入 Optimizer。CLI 未安装、权限/认证、网络、Runtime、Driver、Grader、Oracle 或证据缺失默认不会触发 Skill 修改；证据不足保持 `needs_more_evidence`。`aceval session diagnose` 可以读取已经归一化的 Imported Session，做 Trace/执行层离线诊断；它不是 EvalRun/Grader Replay，也不会在公司平台在线重跑 Agent。
-
-当前 Planner 和修改授权路径不依赖 LLM：语义更丰富的模型辅助分析只能作为未来草稿层，不能绕过确定性 source-ref、Quality Gate 或 Patch Authorization。
-
-完整方案和 D20/D40 范围见 [COMPLEX_SKILL_EVAL_AND_DIAGNOSIS_DESIGN.md](./COMPLEX_SKILL_EVAL_AND_DIAGNOSIS_DESIGN.md)。
+要求 Python 3.9+。核心运行时没有强制第三方依赖。
 
 ```bash
-aceval plan \
-  --subject ./my-skill \
-  --cases ./seed-cases.json \
-  --goal '结果正确，失败时不留下部分产物' \
-  --runtime-profile reference \
-  --output .aceval/plans/my-skill
-
-aceval pack generate \
-  --plan .aceval/plans/my-skill \
-  --type generic \
-  --output .aceval/packs/my-skill
-
-aceval pack quality .aceval/packs/my-skill
-```
-
-## 安装
-
-要求 Python 3.9 或更高版本。核心包没有必需的第三方运行时依赖，仓库自带 Pack 使用 JSON-compatible YAML，因此仅用 Python 标准库即可运行。
-
-以下安装步骤以及后文的 EvalPack 示例都应从 clone 后的仓库根目录执行。`evalpacks/` 和 `examples/` 是仓库演示资产，不随 `aceval` 核心 Python 包安装。
-
-```bash
-git clone https://github.com/little-witt/eval-ops.git
-cd eval-ops
 python3 -m venv .venv
 source .venv/bin/activate
-python -m pip install --upgrade pip
-python -m pip install -e .
+python -m pip install -e '.[dev,yaml]'
 aceval --version
 ```
 
-也可以不安装，直接从源码运行：
+启动桌面开发模式：
 
 ```bash
-PYTHONPATH=src python3 -m aceval --version
+cd desktop
+npm install
+npm start
 ```
 
-需要读取非 JSON-compatible 的普通 YAML 时，可选安装 `PyYAML`：
+生成自包含 macOS 应用：
 
 ```bash
-python -m pip install -e '.[yaml]'
+python3 -m pip install -e '.[desktop-build]'
+cd desktop
+npm run dist:mac
 ```
 
-## 快速验证 EvalPack
+构建机器上的 Python 与 Electron 目标架构必须一致；可通过 `ACEVAL_BUILD_PYTHON`
+指定构建 Python。Node.js 要求 >= 20.19。
 
-`pack lint` 检查 Manifest、组件 ID、引用、路径、Case、Oracle 和 hash；它不执行 Runtime。`pack test` 使用 FakeRuntime 在 dev/validation 上检查 Pack、Driver、Grader 和报告链路，是模拟 conformance，不是模型 Benchmark，也不会执行 holdout。以下命令需要在 clone 后的仓库根目录执行。
+## 核心流程
+
+```text
+用户输入 / Skill / 环境
+  → EvalPack 生成或复用
+  → Test Obligation / Case / Path
+  → 真实远程 Session 批量运行
+  → 完整日志和产物回收
+  → 证据有效性与多维 Verdict
+  → 跨 Case Diagnosis Graph
+  → 用户批准 Proposal / Scope
+  → 受控多文件 Candidate
+  → 成对回归与稳定性验证
+  → Promote / Reject / Safe Stop
+```
+
+模型负责语义评分、根因假设和候选内容；Kernel 负责证据资格、硬事实、预算、回归、
+版本比较、晋升和停止。无效或不完整证据返回 `not_evaluable`，不会被误记为 Skill 失败。
+
+## D2C 验证
+
+D2C 分为两个隔离环境：
+
+- 预览窗口允许加载经过 manifest、权限白名单和 SHA-256 校验的本地插件，供人工探索；
+- 评分 Worker 使用临时 Chrome Profile、禁用插件，冻结 viewport/locale/timezone/color scheme，
+  采集 DOM、console、network、title、URL、截图和视觉差异。
+
+设计稿会被冻结路径与 hash；Actual、Reference、Diff 和 receipt 与 Case、Attempt、candidate
+commit 一一关联。执行环境和验证环境可以隔离，通过不可变 Git commit 交接。
+
+## 验证
 
 ```bash
-aceval pack lint evalpacks/security-review
-aceval pack test evalpacks/security-review --runtime fake
-
-aceval pack lint evalpacks/csv-summary-smoke
-aceval pack test evalpacks/csv-summary-smoke --runtime fake
+PYTHONPATH=src python3 -m pytest -q
+cd desktop
+node tests/renderer-contract.test.mjs
 ```
 
-## 从少量 Case 生成 EvalPack
+真实浏览器发布烟测入口为 `tests/run_real_d2c_smoke.py`。测试产物写入 `.aceval/`，不会进入 Git。
 
-已支持类型只需提供 Case JSON 和 Goal；若 Goal 明确包含 Token、成本、工具调用或延迟，Builder 会在独立 ExperimentPlan 中生成一个可测量的单一效率 Objective，EvalPack 内的 hard Grader 只负责正确性约束。示例输入见 `examples/cases/generic-cases.example.json`。
+## 文档
 
-```bash
-aceval pack generate \
-  --type generic \
-  --cases examples/cases/generic-cases.example.json \
-  --goal '保持答案正确并减少 token' \
-  --output .aceval/packs/generic-answer
+- [docs/current/FINAL_SYSTEM_ARCHITECTURE.md](docs/current/FINAL_SYSTEM_ARCHITECTURE.md)：唯一有效的产品与系统架构；
+- [docs/current/EVALUATION_SELF_ITERATION_KERNEL_V2.md](docs/current/EVALUATION_SELF_ITERATION_KERNEL_V2.md)：Case、路径、Verdict、诊断和收敛算法；
+- [design/desktop-v2/PRODUCT_DESIGN_V2.md](design/desktop-v2/PRODUCT_DESIGN_V2.md)：已确认桌面信息架构与视觉基线；
+- [docs/current/PRODUCT_RELEASE_READINESS.md](docs/current/PRODUCT_RELEASE_READINESS.md)：当前实现、验证证据与发布边界；
+- [docs/reference/EVALPACK_SPEC.md](docs/reference/EVALPACK_SPEC.md)：EvalPack 兼容规范；
+- [docs/runbooks](docs/runbooks)：CATX 与代码评审场景操作手册；
+- [docs/archive/2026-08-pre-v2](docs/archive/2026-08-pre-v2)：旧 MVP/V1/未采纳方案，仅作决策记录。
 
-aceval pack calibrate .aceval/packs/generic-answer
-aceval pack lint .aceval/packs/generic-answer
-aceval pack freeze .aceval/packs/generic-answer --approve
-```
+## Agent 复用
 
-生成结果包含 `.aceval/packs/generic-answer/` 和同级的 `.aceval/packs/generic-answer.experiment.json`。普通用户不需要手工传入后者，`doctor` 和 `optimize` 会自动发现；高级用户可用 `--experiment` 显式选择另一份绑定相同 Suite hash 的实验计划。
+Kernel 不把“Skill 文件”写死为唯一被测对象。`EvaluationSubject` 定义不可变 identity、
+revision、resources、execution binding 和 mutation surface；SkillSubject 与 AgentSubject 只在
+Adapter、可变面和运行绑定上不同。Case/Path、Session/Trace、Verdict、Diagnosis、Candidate
+Comparison 与 Convergence Controller 可直接复用，Agent 级别仅需增加版本化 Agent 配置、
+工具集/权限快照和相应候选发布 Adapter。
 
-`--type` 可以传尚未支持的领域名；此时系统会一键生成 `generic` draft，并记录请求类型，但不会允许 `doctor --approve-pack` 直接用它优化 Skill。用户需要先补齐/确认语义 Oracle 和 Grader，再单独冻结。主观“更好”不会被悄悄翻译成模型自己定义、自己打分的标准。
+## 安全说明
 
-## 从复杂 Skill 生成 Test Plan
+不要把真实 API Key、PAT、访问令牌或含敏感会话内容的 `.aceval/` 目录提交到仓库。
+Renderer 无 Shell、Git、远程 Session 或任意文件读取权限；所有副作用经过主进程 IPC
+白名单和 Python Kernel 的版本化命令执行。
 
-当用户只有 Skill、少量种子 Case 和目标时，先运行规划链路。Planner 会输出 Capability Graph、Test Plan、Case 草稿、Coverage、Runtime gap 和生成来源，再将它们作为 `design/` Sidecar 编译进 EvalPack：
-
-```bash
-aceval plan \
-  --subject ./my-skill \
-  --cases ./seed-cases.json \
-  --goal '结果必须准确，并覆盖失败恢复路径' \
-  --runtime-profile reference \
-  --output .aceval/plans/my-skill
-
-aceval pack generate \
-  --plan .aceval/plans/my-skill \
-  --type generic \
-  --output .aceval/packs/my-skill
-
-aceval pack quality .aceval/packs/my-skill
-aceval pack calibrate .aceval/packs/my-skill
-aceval pack freeze .aceval/packs/my-skill --approve
-```
-
-若存在未确认 Oracle、critical coverage 缺口、Runtime 不支持的关键路径、Subject/Plan hash 不一致或 split 泄漏，`pack quality`/`freeze` 会阻断。用户应修订新 Pack 版本或校准草稿，不应通过删除失败 Case 来绕过门禁。自动生成 Case 只进入 dev/validation 草稿，不会成为 sealed holdout。
-
-## 傻瓜式 repair/tune 入口
-
-`doctor` 把评测装配、复用、baseline、自动模式选择和候选门禁串在一起。普通用户不需要提供 Pack 或类型：系统从 Skill 和验收标准推断内部评测画像，按精确签名检索已有冻结 EvalSuite；完全匹配则复用，否则从内部 Blueprint 生成最小草稿。Cases 是可选增强输入。
-
-不提供 Cases 时，可以直接提供一项任务及预期 JSON：
-
-```bash
-aceval doctor \
-  --subject ./my-skill \
-  --standards @acceptance-standards.md \
-  --prompt '处理示例输入并返回结果' \
-  --expected-output @expected-output.json \
-  --approve-evaluation \
-  --runtime reference \
-  --model-command 'python path/to/model_bridge.py'
-```
-
-如果暂时没有可信预期结果，可以只传 `--standards`。系统会返回 `needs_user_input` 和需要补充的预期，不要求用户编辑 EvalPack。D2C、在线文档编辑等超出当前 Runtime 的场景会返回 `runtime_adapter_required`，不会用 generic 评测代替真实视觉或远端状态验证。
-
-```bash
-aceval doctor \
-  --subject ./my-skill \
-  --cases ./cases.json \
-  --type csv-summary \
-  --goal '结果必须准确，并尽量减少工具调用' \
-  --pack-output .aceval/packs/my-csv-pack \
-  --approve-pack \
-  --runtime reference \
-  --model-command 'python path/to/model_bridge.py' \
-  --model-env MODEL_API_KEY
-```
-
-若生成的 Pack 仍需校准，命令会停在 `calibration_required`，不会同时修改评测器和 Skill。
-
-高级入口保持不变：`--cases` 提供完整自定义用例，`--pack` 直接使用指定 EvalPack，`--experiment` 使用自定义优化计划，`--type` 覆盖自动模板选择，`--suite-root` 增加复用搜索目录，`--no-reuse` 强制生成新评测草稿。
-
-希望一次命令先分析复杂 Skill 时，增加 `--auto-plan`；系统仍会在任何规划或质量 blocker 处安全停止：
-
-```bash
-aceval doctor \
-  --subject ./my-skill \
-  --cases ./seed-cases.json \
-  --type generic \
-  --goal '修复错误，并在正确性不回退的前提下减少 token' \
-  --auto-plan \
-  --plan-output .aceval/plans/my-skill \
-  --pack-output .aceval/packs/my-skill \
-  --runtime reference \
-  --model-command 'python path/to/model_bridge.py'
-```
-
-## 公司 Agent API 与 Session 日志
-
-配置示例见 `examples/company-api-profile.example.json`。Profile 只保存密钥所在的环境变量名，不保存 token 值；Execute 和 Session Log 的字段位置通过受限 JSONPath 映射。
-
-```bash
-export COMPANY_AGENT_TOKEN='...'
-
-aceval profile validate examples/company-api-profile.example.json
-
-aceval session fetch \
-  --profile examples/company-api-profile.example.json \
-  --session-id SESSION_ID \
-  --output .aceval/imported/session.json
-
-aceval session import \
-  --profile examples/company-api-profile.example.json \
-  --session-id SESSION_ID \
-  --input downloaded-session.json \
-  --output .aceval/imported/session.json
-
-aceval session diagnose \
-  --input .aceval/imported/session.json \
-  --output .aceval/imported/session-diagnosis.json
-```
-
-导入结果统一为 `RunObservation` 语义：`output + canonical trace + usage + completeness`。离线 `session diagnose` 已能对结构化 Runtime/tool/CLI 错误生成 Failure Card；把导入 Observation 接入 Pack/Scenario、完整 EvalRun、Grader Replay 或公司在线 Runtime 仍是 D40 扩展面。
-
-### CATX 线上 Agent
-
-CATX Profile 示例见 `examples/catx-api-profile.example.json`。连接器支持创建 Session、写入首条 `user.message`、状态查询、全事件日志获取，以及通过 Supabase Edge Function 监听 SSE；SSE 到达终态后会重新读取 CATX 状态与全量事件，并保存为同一种 `ImportedRunBundle`。
-
-本地使用可在 Profile 中配置 `credentials_file`（相对路径按 Profile 所在目录解析），文件内容为环境变量名到凭据值的 JSON 对象，且在 POSIX 系统上权限必须为 `0600`。同名环境变量会覆盖文件值，便于 CI/云端注入；Profile 校验不会加载或输出凭据。
-
-```bash
-export CATX_API_KEY='...'
-export USER_MIS_ID='your-mis'
-export CATX_AGENT_ID='agent_xxx'
-export CATX_ENV_ID='env_xxx'
-export SUPABASE_ANON_KEY='...'
-# 可选；未设置时 Authorization 使用 SUPABASE_ANON_KEY
-export SUPABASE_ACCESS_TOKEN='...'
-
-aceval profile validate examples/catx-api-profile.example.json
-
-aceval session execute \
-  --profile examples/catx-api-profile.example.json \
-  --request examples/catx-session-request.example.json
-
-aceval session status \
-  --profile examples/catx-api-profile.example.json \
-  --session-id SESSION_ID
-
-aceval session listen \
-  --profile examples/catx-api-profile.example.json \
-  --session-id SESSION_ID \
-  --output .aceval/imported/catx-session.json
-```
-
-没有 SSE 代理时可直接用 `session fetch` 获取当前状态和所有事件类型。完整接入说明、安全边界和排障步骤见 [CATX_ONLINE_AGENT.md](./CATX_ONLINE_AGENT.md)。
-
-CATX 精确绑定候选 Skill 和挂载仓库的请求字段尚待正式接口。当前实现已冻结
-`CatxExecutionBinding` 契约和 `CatxRuntimeAdapter`：接入后必须回读实际 Skill /
-仓库 hash 与 base/head commit，证据缺失或漂移不会进入评分。代码评审 P0 的本地
-fixture、隔离验证和评分可独立运行，详见
-[CODE_REVIEW_P0_RUNBOOK.md](./CODE_REVIEW_P0_RUNBOOK.md)。
-
-## 双 Pack 可复制演示
-
-下面所有涉及 Subject 执行的命令都显式选择 `--runtime fake`，避免把模拟误认为真实评测。`run`、`compare` 和 `pack test` 只允许 `dev`、`validation`；面向被测 Subject 的 holdout 只能由 `optimize` 的最终门禁触发。
-
-### Security Review
-
-运行冻结候选：
-
-```bash
-aceval run \
-  --pack evalpacks/security-review \
-  --subject examples/subjects/security-review-skill-candidate \
-  --split dev --split validation \
-  --runtime fake
-```
-
-成对比较 baseline 与 candidate：
-
-```bash
-aceval compare \
-  --pack evalpacks/security-review \
-  --subject examples/subjects/security-review-skill \
-  --candidate examples/subjects/security-review-skill-candidate \
-  --split dev --split validation \
-  --runtime fake
-```
-
-用冻结候选演示 dev、validation、holdout 优化门禁：
-
-```bash
-aceval optimize \
-  --pack evalpacks/security-review \
-  --subject examples/subjects/security-review-skill \
-  --candidate examples/subjects/security-review-skill-candidate \
-  --runtime fake
-```
-
-### CSV Summary
-
-运行冻结候选：
-
-```bash
-aceval run \
-  --pack evalpacks/csv-summary-smoke \
-  --subject examples/subjects/csv-summary-skill-candidate \
-  --split dev --split validation \
-  --runtime fake
-```
-
-成对比较 baseline 与 candidate：
-
-```bash
-aceval compare \
-  --pack evalpacks/csv-summary-smoke \
-  --subject examples/subjects/csv-summary-skill \
-  --candidate examples/subjects/csv-summary-skill-candidate \
-  --split dev --split validation \
-  --runtime fake
-```
-
-用冻结候选演示 dev 和 validation 优化门禁。该 Pack 未声明 holdout：
-
-```bash
-aceval optimize \
-  --pack evalpacks/csv-summary-smoke \
-  --subject examples/subjects/csv-summary-skill \
-  --candidate examples/subjects/csv-summary-skill-candidate \
-  --runtime fake
-```
-
-上述 `optimize --candidate` 不调用模型生成候选，只验证一个预注册候选和完整门禁。真实候选生成需要 Reference Runtime 与模型桥接。
-
-## 接入真实模型
-
-`--runtime reference` 必须同时提供 `--model-command`。CommandModelClient 每个模型步骤启动一次受控命令，把完整请求写到 stdin，并从 stdout 读取一个 JSON 对象；命令不经过 shell。
-
-```bash
-aceval run \
-  --pack evalpacks/security-review \
-  --subject examples/subjects/security-review-skill \
-  --split dev \
-  --runtime reference \
-  --model-command 'python path/to/model_bridge.py' \
-  --model-id 'provider/model-version' \
-  --model-env MODEL_API_KEY \
-  --model-timeout 60 \
-  --max-steps 8
-```
-
-模型桥接收到的请求结构：
-
-```json
-{
-  "messages": [
-    {"role": "system", "content": "...<skill>...</skill>"},
-    {"role": "user", "content": "Review the files in the workspace..."}
-  ],
-  "tools": [
-    {
-      "name": "read_file",
-      "description": "Read a UTF-8 workspace file.",
-      "parameters": {
-        "type": "object",
-        "required": ["path"],
-        "properties": {"path": {"type": "string"}},
-        "additionalProperties": false
-      }
-    }
-  ]
-}
-```
-
-请求工具调用时，桥接程序在 stdout 返回：
-
-```json
-{
-  "content": "",
-  "tool_calls": [
-    {
-      "id": "call_1",
-      "name": "read_file",
-      "arguments": {"path": "target.py"}
-    }
-  ],
-  "usage": {"input_tokens": 320, "output_tokens": 24, "total_tokens": 344}
-}
-```
-
-Runtime 执行工具后，会在下一次请求的 `messages` 中附上 `role: tool` 的结果。任务完成时返回无工具调用的最终回复：
-
-```json
-{
-  "content": "{\"findings\": []}",
-  "tool_calls": [],
-  "usage": {"input_tokens": 510, "output_tokens": 38, "total_tokens": 548}
-}
-```
-
-stdout 必须只包含该 JSON；调试日志应写入 stderr。`--model-env NAME` 可重复使用，只有显式 allowlist 的环境变量和 `PATH` 会传入桥接进程。
-
-`--model-id` 是操作者声明的模型标识，用于报告和 Runtime profile hash；v1 bridge 无法从供应商侧验证该值，也无法证明 temperature、seed、上下文裁剪等实际推理参数。因此 Reference Runtime 的 `profile_complete` 保持 `false`，报告会明确提示该实验尚不能完全复现。模型桥接画像只持久化 executable、argv 数量和 argv SHA-256，不保存原始 argv 或环境变量值，避免把命令行凭证写入报告。
-
-真实生成候选时，不传 `--candidate`。可以用独立的 `--optimizer-command`，未提供时复用 `--model-command`：
-
-```bash
-aceval optimize \
-  --pack evalpacks/security-review \
-  --subject examples/subjects/security-review-skill \
-  --runtime reference \
-  --model-command 'python path/to/model_bridge.py' \
-  --model-id 'provider/model-version' \
-  --optimizer-command 'python path/to/optimizer_bridge.py' \
-  --model-env MODEL_API_KEY \
-  --max-rounds 2
-```
-
-Optimizer 使用同一 JSON envelope，但 `tools` 为空；其最终 `content` 必须是包含完整 `skill_markdown` 和简短 `rationale` 的 JSON 字符串。
-
-## 报告与退出码
-
-默认输出根目录是 `.aceval/runs`，也可通过 `--output-root PATH` 修改。CLI 的 stdout 会给出本次运行的准确路径：
-
-```json
-{
-  "report_json": "/absolute/path/to/project/.aceval/runs/run-<id>/report.json",
-  "report_markdown": "/absolute/path/to/project/.aceval/runs/run-<id>/report.md",
-  "simulated": false
-}
-```
-
-- `run` 报告位于 `<output-root>/run-<id>/`；
-- `compare` 报告位于 `<output-root>/compare-<id>/`；
-- `optimize` 报告位于 `<output-root>/optimize-<id>/`；
-- 优化候选位于 `optimize-<id>/candidates/<candidate-id>/`，包含新的 `SKILL.md`、`candidate.patch` 和 lineage 元数据；
-- 最终选择会独立物化到 `optimize-<id>/selected-candidate/`，报告记录 `selected_candidate_path` 与 `selected_candidate_hash`；该副本带受控 provenance marker，可作为 `aceval run --subject ...` 的 candidate 重新执行，且不依赖可变的 trial 目录；
-- 每个 EvalRun 在 `<run-dir>/frozen-pack/` 保存逐文件 hash 校验后的 Pack 副本；本次 Driver、fixture 和 `schema_ref`/`rubric_ref` 评分都基于这个冻结版本；
-- 原始 Subject 不会被覆盖。
-
-`run/compare` 的质量失败退出码为 `1`，输入、配置、执行错误或不可比较结果通常为 `2`，便于接入 CI。Gate 状态区分 `pass | fail | error | not_evaluable | not_run`；baseline 或 candidate 出现基础设施错误时，compare 不计算 paired uplift，也不会把错误恢复记成 improvement。报告明确记录 Runtime profile 与内容 hash、configured budget、Pack/Subject hash、分层结果、硬回归、usage 的 `measured | partial | not_measured` 状态以及限制项。优化报告还记录 mode、Goal、Objective baseline/candidate 值、signed improvement、逐 Case 回退、所有 validation attempts、proposal/rejected/duplicate 数量和全实验累计 usage。Repair 的 holdout 仍只运行最终候选；Tune 的 validation/holdout 都成对运行 baseline/candidate，并记录 `holdout_pair_count`。单次测量不宣称统计显著。
-
-## 安全与有效性边界
-
-- Reference Runtime 是同机、同用户的受限工作区执行器，不是抵御恶意代码的生产级沙箱；只应运行可信的模型桥接命令。
-- 模型只能通过三种内置文件工具访问 Scenario 工作区，但桥接进程本身仍拥有当前操作系统用户的权限。若桥接程序不可信，需要额外容器或隔离 Worker。
-- 当前三种工具只处理 UTF-8 文本；二进制文件、多模态输入输出、shell、网络和浏览器任务不在内置 Reference Runtime 的能力范围内。
-- 命令使用 argv 启动且不经过 shell；环境变量需要显式 allowlist，但这不等于完整进程沙箱。
-- `--max-tool-calls` 会进入 Reference Agent loop；Token 和费用预算依赖模型 bridge 回报 usage，只能阻止后续 Case/候选，不能撤销已完成的单次模型调用。供应商侧的单调用 Token/费用上限仍应由 bridge 配置。
-- 墙钟预算是 soft deadline：超时后系统会等待受控 bridge worker 完成，或等待模型命令自身的 timeout，以避免后台线程继续修改已进入清理阶段的 workspace；因此进程实际返回时间可能超过墙钟预算。
-- Token 字段必须是非负整数；存在 `total_tokens`/输入输出别名或费用别名时按可观测最大值保守计费，并在报告中标记冲突。
-- Oracle 和 validation/holdout 内容不会进入 Optimizer 请求；本地仓库中的测试文件对有主机文件权限的恶意进程并不构成密码学隐藏。
-- 生成的 Pack 在 draft/calibrating 阶段不能优化 Skill；frozen Pack 受逐文件内容锁保护。修改 Pack 后必须创建新版本并重新跑 baseline，历史 uplift 不可沿用。
-- 自然语言 Goal 只有在能映射到确定性效率指标时才会自动生成 Objective；主观质量需要经人工确认/校准的 Rubric 或 Judge，当前不会让同一模型自定标准并自证成功。
-- Driver 只接收不含 Oracle/Grader 配置的 Scenario view 和 Case 专属 fixture 副本；`PreparedScenario`、Runtime result、Observation 和 Grade 数据在边界处深冻结，避免后序组件修改已采集证据。自定义 Python Driver/Grader 仍是同进程可信计算基（TCB），这不是对恶意组件的隔离承诺。
-- Scenario ID、fixture/artifact 路径都必须是受控相对标识；内存 artifact 与 workspace artifact 统一受文件数、单文件大小和总字节上限约束。
-- 单次运行不能测量模型波动；真实结论需要固定模型参数并重复运行。
-- 在 Reference Runtime 上通过只说明该 Skill 在当前 Runtime profile 下有效。不同平台的 system prompt、模型、工具协议、上下文裁剪和权限可能改变结果，不能推导为跨 Runtime 同等最优。
-- FakeRuntime 的通过、提升率和 accepted 状态只验证预注册模拟数据与工作流，不得写成真实模型 Benchmark 成果。
-
-## 核心价值与可迁移性
-
-- 减少人工中转：统一执行、Trace、评分、候选和回归门禁；
-- 让失败可复现：冻结 Pack、Subject、Case 和 Oracle，并显式记录 Runtime 与 usage；
-- 控制错误优化：repair 只看 dev 硬失败；tune 只看 dev Objective，且 hard gate 不得回退；validation/holdout 保持隔离；
-- 控制成本与风险：限制步骤、时间、Token、费用、工具调用、候选数和补丁范围；
-- 降低受支持范围内的扩展成本：新领域优先通过 EvalPack 接入，超出内置能力时增加显式受信组件；
-- 迁移到完整 Agent：未来可为 system prompt、工具配置、Workflow 或 Agent snapshot 实现新的 `SubjectAdapter`，复用 Driver、Runtime、Trace、Grader、门禁和报告。
-
-即使 Skill 这一封装形态变化，实验控制、Trace 标准化、混合评分、回归门禁、数据隔离和候选 lineage 仍是 Agent 评测与优化的通用工程能力。
-
-## 20 天黑客松路线
-
-当前代码已经提供 Reference Runtime、repair/tune Kernel、复杂 Skill Analyzer/Test Planner/Coverage、Pack Builder/Quality/冻结锁、Failure Attribution、离线 Session diagnose、双 Pack、确定性 Grader、FakeRuntime conformance、受控优化门禁和 JSON/Markdown 报告。D20 剩余重点是把这些能力打磨成可信演示，而不是继续补同层契约：
-
-1. 接入一个真实模型桥接并冻结模型参数，完成双 Pack 的重复实验；
-2. 用一个复杂文件型 Skill 演示 `plan -> pack generate --plan -> pack quality -> freeze`，展示 critical gap、未确认 Oracle 和 Runtime gap；
-3. 演示一张允许 Skill intervention 的 Failure Card，以及一张来自离线 Session 的 CLI/Runtime/Grader 阻断 Card；
-4. 校验候选在 dev、validation、holdout 上的实际表现，不预填提升数字；
-5. 固化 6 分钟演示、失败降级方案、录屏和可复现实验说明；
-6. 展示第二 Pack 的实际接入改动与工时，证明扩展边界而非口头宣称通用。
-
-黑客松提交应把 FakeRuntime 演示标记为 simulation，并将任何实际提升数字绑定到可复现的真实模型报告。
-
-## 40 天完整作品路线
-
-D20 已经前置实现 repair/tune、复杂 Skill 规划/覆盖、基础 Pack Quality、Failure Attribution、Doctor、公司 Profile、Session Import/离线 Diagnosis 和 paired gates。D40 不再重复实现这些契约，而改为：
-
-1. 完成真实模型 repair/tune Benchmark 和重复执行统计；
-2. 用标注集评测并增强 Analyzer/Planner，加入 seed expansion、metamorphic Case 和自动动态覆盖接线；
-3. 将基础 Pack Quality 扩展到 known-good/known-bad、mutation、evaluator flake 和 Pack revision diff；
-4. 将公司 Execute/Session 接成 `CompanyRuntimeAdapter`、EvalRun、Grader Replay 和 Case mining；
-5. 增加受控 argv-only Process Tool 和只读诊断探针；
-6. 抽取 CLI/Web 共用的 Application Service，建设静态 HTML 和本地 Skill Doctor Console；
-7. 用重复统计、主观 Judge Pilot、`FixedAgentTarget`、CI、教程、视频和消融完成完整作品化。
-
-完整排期、完成定义和优先级见 [ROADMAP.md](./ROADMAP.md)。可视化产品与技术方案见 [VISUAL_CONSOLE_DESIGN.md](./VISUAL_CONSOLE_DESIGN.md)。
-
-## 可视化操作与结果平台
-
-项目将建设本地单用户 `Skill Doctor Console`，而不是当前阶段的多租户 SaaS。Console 重点覆盖：
-
-- Capability Graph、Test Plan、Coverage Matrix 和 Runtime gap；
-- EvalPack 生成、质量、校准和冻结确认；
-- baseline -> repair/tune -> validation -> holdout 实时进度；
-- Case、Grader evidence、Trace 时间线和 Failure Card；
-- baseline/candidate 指标、Skill diff 和候选谱系；
-- 公司 Session 导入、completeness、Diagnosis 和 Replay。
-
-实施顺序为：真实实验数据 -> 规划/归因 Benchmark 与高级 Pack Quality -> 公司在线 Replay/Process Tool -> 静态 HTML -> Application Service -> Read-only Console -> Operational Console。当前仓库没有 Web Console；未来 UI 也不重新实现 Gate、Objective、归因授权或 Pack 生命周期语义。
-
-## 开发与测试
-
-零第三方依赖运行完整测试：
-
-```bash
-PYTHONPATH=src python3 -m unittest discover -s tests -v
-PYTHONPYCACHEPREFIX=/tmp/aceval-pyc PYTHONPATH=src python3 -m compileall -q src tests
-git diff --check
-```
-
-## 仓库文档
-
-- [ROADMAP.md](./ROADMAP.md)：更新后的 D20/D40 路线图、已前置能力、待办与完成定义；
-- [SYSTEM_ARCHITECTURE_AND_INDUSTRY_ANALYSIS.md](./SYSTEM_ARCHITECTURE_AND_INDUSTRY_ANALYSIS.md)：总体架构、执行/验证环境分层、业界对标、价值判断、可行度与待办优先级；
-- [COMPLEX_SKILL_EVAL_AND_DIAGNOSIS_DESIGN.md](./COMPLEX_SKILL_EVAL_AND_DIAGNOSIS_DESIGN.md)：复杂 Skill 测试规划、覆盖、Pack Quality、故障归因和 CLI/Session 方案；
-- [SKILL_OPTIMIZATION_DECOUPLING_PLAN.md](./SKILL_OPTIMIZATION_DECOUPLING_PLAN.md)：薄 EvalSuite、独立 ExperimentPlan 和无感 Evaluation Compiler 迭代方案；
-- [COMMON_SKILL_EVALUATION_STRATEGY.md](./COMMON_SKILL_EVALUATION_STRATEGY.md)：常用 Skill 场景的评测画像、实施优先级和复用边界；
-- [VISUAL_CONSOLE_DESIGN.md](./VISUAL_CONSOLE_DESIGN.md)：本地可视化操作台的产品、架构、API、安全和分阶段方案；
-- [EVALPACK_SPEC.md](./EVALPACK_SPEC.md)：EvalPack 边界、Manifest 和公共 Protocol；
-- [TECHNICAL_DESIGN.md](./TECHNICAL_DESIGN.md)：完整技术方案、状态机和验收标准；
-- [SKILL_CATEGORY_AND_ITERATION_DESIGN.md](./SKILL_CATEGORY_AND_ITERATION_DESIGN.md)：Skill 分类、输入输出契约和自迭代设计；
-- [research/skill-ranking](./research/skill-ranking)：公开 Skill 榜单快照和可复算分类脚本；
-- [src/aceval/agent_runtime.py](./src/aceval/agent_runtime.py)：Reference Agent Runtime 与模型桥接协议；
-- [src/aceval/orchestrator.py](./src/aceval/orchestrator.py)：通用执行、比较与优化门禁；
-- [src/aceval/pack_builder.py](./src/aceval/pack_builder.py)：EvalPack 草稿生成、校准和冻结；
-- [src/aceval/connections.py](./src/aceval/connections.py)：公司 API Profile 与 Session 日志归一化；
-- [src/aceval/catx.py](./src/aceval/catx.py)：CATX 会话创建、状态/事件获取与 Supabase SSE 监听；
-- [evalpacks](./evalpacks)：内置双 Pack 与 fixture/Oracle。
-
-## 项目边界
-
-- 不采集或依赖模型隐藏思维链；
-- 不将合成 Case 自动视为真实质量标准；
-- 不把声明能力/风险覆盖描述为任意自然语言的数学全路径覆盖；
-- 不把同源模型生成 Case 伪装为独立 sealed holdout；
-- 不从单次日志宣称 Skill、Agent 或 CLI 的唯一强因果根因；
-- 不允许 Optimizer 修改 Case、Grader、validation、holdout 或 Runner；
-- 不自动覆盖、合并或发布生产 Skill；
-- 不把单 Runtime 的最优结果宣称为所有 Agent 平台上的最优结果；
-- 不把 UTF-8 `SKILL.md` + 固定文件工具的 MVP 描述为已支持多文件、二进制、shell、network、browser 或 multimodal Skill；
-- 当前版本不宣称已经取得任何真实模型提升。
-
-长期定位：以稳定的 Reference Agent Runtime 为实验基准，以通用 Kernel + EvalPack 为扩展核心，逐步覆盖 Skill、能力组件和完整 Agent 的持续评测、故障归因与受控优化。
