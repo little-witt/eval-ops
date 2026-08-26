@@ -1,0 +1,65 @@
+{
+  "api_version": "aceval.research-subject-lock/v1",
+  "created_at": "2026-08-26",
+  "purpose": "PoC-0 public Skill subject provenance. A new upstream revision requires a new lock entry and subject hash.",
+  "subjects": [
+    {
+      "id": "kerberos-ptt-detection",
+      "repository_url": "https://github.com/mukul975/Anthropic-Cybersecurity-Skills.git",
+      "commit": "1b3f6b2286981381a5cc0566551ef3bb6bc38383",
+      "skill_path": "skills/detecting-pass-the-ticket-attacks",
+      "entrypoint": "SKILL.md",
+      "entrypoint_sha256": "d1e2a25878902e2251710791df2c1cf4e2a7ab3179e37e3a3f7e73af68dc28a4",
+      "license": {
+        "spdx": "Apache-2.0",
+        "path": "LICENSE",
+        "sha256": "a941b58ef0ba43a31e24ae7ece1b743a585efed9e37792b9ca063e0798be1cbe"
+      },
+      "study_scope": "Defensive detection analysis using synthetic Windows event fixtures only; no attack execution or credential handling.",
+      "status": "selected"
+    },
+    {
+      "id": "repository-code-agent",
+      "repository_url": "https://github.com/initializ/forge.git",
+      "commit": "4928b7dcd989e8fbe17b97c9e16f303b8c9f70c4",
+      "skill_path": "skills/code-agent",
+      "entrypoint": "SKILL.md",
+      "entrypoint_sha256": "fe25848bd9be9b527a1a1df65cf25a1a00921a68f4c58a7d32bd1501a3e35e97",
+      "license": {
+        "spdx": "Apache-2.0",
+        "path": "LICENSE",
+        "sha256": "c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4"
+      },
+      "study_scope": "Synthetic local repositories only; network egress and project scaffolding are disabled in evaluation fixtures.",
+      "status": "selected"
+    },
+    {
+      "id": "mcp-server-builder",
+      "repository_url": "https://github.com/anthropics/skills.git",
+      "commit": "3b3fad96af16a10759d930941b4520ba0c40edae",
+      "skill_path": "skills/mcp-builder",
+      "entrypoint": "SKILL.md",
+      "entrypoint_sha256": "0f4592dcb53cf2b5d6b7febee6b4152018b565551a1c29e3c612f57b218ab295",
+      "license": {
+        "spdx": "Apache-2.0",
+        "path": "skills/mcp-builder/LICENSE.txt",
+        "sha256": "bc6b3af2f331cbc7fb0da1344efb2cbe5877a31498b4d70dbc7000f3405a1362"
+      },
+      "study_scope": "Offline mock API specifications and local MCP schema fixtures only; no credentialed or remote services.",
+      "status": "selected"
+    }
+  ],
+  "excluded_candidates": [
+    {
+      "id": "reverse-code-audit",
+      "repository_url": "https://github.com/zhaoxuya520/reverse-skill.git",
+      "commit": "914f74ad7d42d18d983d5842f8156440d9068399",
+      "reason": "The repository root is MIT-licensed, but the initial automated license scan selected a nested GPL-3.0 license. Excluded from the primary PoC until per-path provenance is manually resolved."
+    },
+    {
+      "id": "xlsx",
+      "repository_url": "https://github.com/anthropics/skills.git",
+      "reason": "Excluded because the per-skill license is source-available/proprietary rather than an unambiguous open-source redistribution license."
+    }
+  ]
+}

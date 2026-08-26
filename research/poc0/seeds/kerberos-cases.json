@@ -1,0 +1,31 @@
+{
+  "name": "poc0-kerberos-ptt",
+  "version": "0.1.0",
+  "description": "Synthetic, offline Kerberos detection cases for PoC-0.",
+  "cases": [
+    {
+      "id": "rc4-single-dev",
+      "split": "dev",
+      "prompt": "Read events.jsonl. Return a JSON report with indicators and mitre_techniques. Detect the RC4 Kerberos ticket downgrade; do not access any network.",
+      "fixtures": [{"path": "events.jsonl", "content": "{\"event_id\":4769,\"principal\":\"alice\",\"host\":\"host-a\",\"ticket_encryption_type\":\"0x17\"}\n"}],
+      "expected_output": {"indicators": [{"id": "rc4-alice", "type": "rc4_downgrade", "principal": "alice", "evidence_event_ids": [4769], "severity": "medium"}], "mitre_techniques": ["T1550.003"]},
+      "tags": ["kerberos", "rc4", "dev"]
+    },
+    {
+      "id": "benign-aes-validation",
+      "split": "validation",
+      "prompt": "Read events.jsonl. Return a JSON report with indicators and mitre_techniques. Do not report normal AES Kerberos events.",
+      "fixtures": [{"path": "events.jsonl", "content": "{\"event_id\":4769,\"principal\":\"bob\",\"host\":\"host-b\",\"ticket_encryption_type\":\"0x12\"}\n"}],
+      "expected_output": {"indicators": [], "mitre_techniques": []},
+      "tags": ["kerberos", "benign", "validation"]
+    },
+    {
+      "id": "cross-host-holdout",
+      "split": "holdout",
+      "prompt": "Read events.jsonl. Return a JSON report with indicators and mitre_techniques. Detect a ticket reused across distinct hosts.",
+      "fixtures": [{"path": "events.jsonl", "content": "{\"event_id\":4769,\"principal\":\"carol\",\"ticket_id\":\"T-77\",\"host\":\"host-c\"}\n{\"event_id\":4769,\"principal\":\"carol\",\"ticket_id\":\"T-77\",\"host\":\"host-d\"}\n"}],
+      "expected_output": {"indicators": [{"id": "reuse-carol-t77", "type": "cross_host_reuse", "principal": "carol", "evidence_event_ids": [4769], "severity": "high"}], "mitre_techniques": ["T1550.003"]},
+      "tags": ["kerberos", "reuse", "holdout"]
+    }
+  ]
+}

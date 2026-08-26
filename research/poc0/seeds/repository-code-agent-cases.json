@@ -1,0 +1,31 @@
+{
+  "name": "poc0-repository-code-agent",
+  "version": "0.1.0",
+  "description": "Synthetic repository-editing cases for PoC-0.",
+  "cases": [
+    {
+      "id": "rename-python-dev",
+      "split": "dev",
+      "prompt": "Read app.py and rename the function foo to bar and update its local call site. Do not create a new project.",
+      "fixtures": [{"path": "app.py", "content": "def foo(value):\n    return value + 1\n\nprint(foo(2))\n"}],
+      "expected_output": {"changed_paths": ["app.py"], "required_content": "def bar(value):", "forbidden_content": "foo("},
+      "tags": ["repository", "rename", "dev"]
+    },
+    {
+      "id": "config-default-validation",
+      "split": "validation",
+      "prompt": "Read config.json and add a retry_count default of 3 while preserving existing keys. Do not modify any other file.",
+      "fixtures": [{"path": "config.json", "content": "{\"service\": \"demo\", \"timeout\": 10}\n"}],
+      "expected_output": {"changed_paths": ["config.json"], "required_content": "\"retry_count\": 3", "forbidden_content": "new-project"},
+      "tags": ["repository", "config", "validation"]
+    },
+    {
+      "id": "none-boundary-holdout",
+      "split": "holdout",
+      "prompt": "Read normalize.py and make normalize return an empty string when its value argument is None. Preserve behavior for strings.",
+      "fixtures": [{"path": "normalize.py", "content": "def normalize(value):\n    return value.strip()\n"}],
+      "expected_output": {"changed_paths": ["normalize.py"], "required_content": "if value is None:", "forbidden_content": "pip install"},
+      "tags": ["repository", "validation", "holdout"]
+    }
+  ]
+}

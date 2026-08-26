@@ -1,0 +1,31 @@
+{
+  "name": "poc0-mcp-server-builder",
+  "version": "0.1.0",
+  "description": "Offline mock API schema cases for PoC-0.",
+  "cases": [
+    {
+      "id": "read-only-dev",
+      "split": "dev",
+      "prompt": "Read api.json and return a JSON tools manifest for its GET operation. Include tool name, input_schema, and annotations. Do not access the network.",
+      "fixtures": [{"path": "api.json", "content": "{\"paths\": {\"/items/{id}\": {\"get\": {\"operationId\": \"getItem\", \"parameters\": [{\"name\": \"id\", \"in\": \"path\", \"required\": true, \"schema\": {\"type\": \"string\"}}]}}}}\n"}],
+      "expected_output": {"tools": [{"name": "getItem", "readOnlyHint": true, "destructiveHint": false, "required_inputs": ["id"]}]},
+      "tags": ["mcp", "get", "dev"]
+    },
+    {
+      "id": "delete-validation",
+      "split": "validation",
+      "prompt": "Read api.json and return a JSON tools manifest for its DELETE operation. Include safe annotations and the required path parameter.",
+      "fixtures": [{"path": "api.json", "content": "{\"paths\": {\"/items/{id}\": {\"delete\": {\"operationId\": \"deleteItem\", \"parameters\": [{\"name\": \"id\", \"in\": \"path\", \"required\": true, \"schema\": {\"type\": \"string\"}}]}}}}\n"}],
+      "expected_output": {"tools": [{"name": "deleteItem", "readOnlyHint": false, "destructiveHint": true, "required_inputs": ["id"]}]},
+      "tags": ["mcp", "delete", "validation"]
+    },
+    {
+      "id": "pagination-holdout",
+      "split": "holdout",
+      "prompt": "Read api.json and return a JSON tools manifest for its paginated list operation. Include all required query inputs and read-only annotation.",
+      "fixtures": [{"path": "api.json", "content": "{\"paths\": {\"/items\": {\"get\": {\"operationId\": \"listItems\", \"parameters\": [{\"name\": \"cursor\", \"in\": \"query\", \"required\": false, \"schema\": {\"type\": \"string\"}}, {\"name\": \"limit\", \"in\": \"query\", \"required\": true, \"schema\": {\"type\": \"integer\"}}]}}}}\n"}],
+      "expected_output": {"tools": [{"name": "listItems", "readOnlyHint": true, "destructiveHint": false, "required_inputs": ["limit"]}]},
+      "tags": ["mcp", "pagination", "holdout"]
+    }
+  ]
+}

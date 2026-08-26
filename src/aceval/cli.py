@@ -56,6 +56,7 @@ from .environment_contracts import (
     write_contract,
 )
 from .environments import LocalDockerProvider, build_repository_verify_image
+from .divergence_predictor import analyze_divergence
 from .execution_path import ExecutionPathSpec, evaluate_trace_conformance
 from .iteration_kernel import IterationKernel
 from .kernel_contracts import KernelConfig, KernelInput
@@ -576,6 +577,12 @@ def build_parser() -> argparse.ArgumentParser:
     path_grade.add_argument("--trace-incomplete", action="store_true")
     path_grade.add_argument("--output")
     path_grade.set_defaults(handler=_path_grade)
+    path_divergence = path_commands.add_parser("divergence", help="Analyze divergence across independent JSON traces")
+    path_divergence.add_argument("--case-id", required=True)
+    path_divergence.add_argument("--attempts", required=True, help="JSON array or @FILE with attempt_id, trace, outcome, and optional usage")
+    path_divergence.add_argument("--spec", help="Optional execution-path spec JSON file")
+    path_divergence.add_argument("--output")
+    path_divergence.set_defaults(handler=_path_divergence)
 
     environment = commands.add_parser(
         "environment", help="Build, inspect, and run local isolated validators"
@@ -1789,6 +1796,20 @@ def _path_grade(args: argparse.Namespace) -> int:
         _write_json_output(args.output, result, False)
     print(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True))
     return 0 if result["status"] == "pass" else 1
+
+
+def _path_divergence(args: argparse.Namespace) -> int:
+    attempts = _json_value(args.attempts, "attempts")
+    if not isinstance(attempts, list) or not all(isinstance(item, Mapping) for item in attempts):
+        raise ValueError("attempts must be a JSON array of objects")
+    spec = None
+    if args.spec:
+        spec = ExecutionPathSpec.from_mapping(_json_value("@" + args.spec, "path spec"))
+    result = analyze_divergence(args.case_id, attempts, path_spec=spec).to_dict()
+    if args.output:
+        _write_json_output(args.output, result, False)
+    print(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True))
+    return 0
 
 
 def _repository_verify_context(value: Optional[str]) -> Path:
