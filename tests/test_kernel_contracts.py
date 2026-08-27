@@ -45,6 +45,32 @@ class KernelContractTests(unittest.TestCase):
         self.assertEqual("REPOSITORY_PAT", round_trip.code_repository.authorization_token_env)
         self.assertNotIn("authorization_token\"", str(round_trip.to_dict()))
 
+    def test_role_oriented_executors_round_trip_without_legacy_ambiguity(self):
+        payload = config_payload()
+        payload.pop("remote_agent")
+        payload["trial_executor"] = {
+            "provider": "catx",
+            "profile_path": "/tmp/catx-profile.json",
+        }
+        payload["analysis_executor"] = {"provider": "local-forge"}
+        config = KernelConfig.from_mapping(payload)
+        saved = config.to_dict()
+        self.assertNotIn("remote_agent", saved)
+        self.assertEqual("catx", saved["trial_executor"]["provider"])
+        self.assertEqual("local-forge", saved["analysis_executor"]["provider"])
+        self.assertEqual(config, KernelConfig.from_mapping(saved))
+
+    def test_executor_schema_conflicts_and_unsupported_trial_provider_fail_closed(self):
+        conflict = config_payload()
+        conflict["trial_executor"] = {"provider": "catx", "profile_path": "/tmp/catx-profile.json"}
+        with self.assertRaisesRegex(KernelContractError, "cannot be configured together"):
+            KernelConfig.from_mapping(conflict)
+        unsupported = config_payload()
+        unsupported.pop("remote_agent")
+        unsupported["trial_executor"] = {"provider": "local", "profile_path": "/tmp/local.json"}
+        with self.assertRaisesRegex(KernelContractError, "P0 requires catx"):
+            KernelConfig.from_mapping(unsupported)
+
     def test_rejects_raw_credentials_and_non_ssh_repository(self):
         for mutation in (
             {"authorization_token": "secret"},

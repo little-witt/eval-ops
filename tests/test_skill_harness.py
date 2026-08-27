@@ -246,6 +246,7 @@ class SkillHarnessTests(unittest.TestCase):
         design = kernel.advance("create-task")
         self.assertIn("capability-one-positive", design["case_ids"])
         self.assertTrue((skill / "SKILL.md").is_file())
+        kernel.confirm("create-task", approve=True, selected_case_ids=tuple(design["case_ids"]))
         baseline = kernel.advance("create-task")
         self.assertEqual("without-skill-baseline", baseline["purpose"])
         self.assertEqual("baseline_running", kernel.state("create-task")["phase"])

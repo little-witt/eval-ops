@@ -1,8 +1,9 @@
 const { app, BrowserWindow, dialog, ipcMain, safeStorage, session } = require("electron");
-const { spawn } = require("node:child_process");
+const { spawn, spawnSync } = require("node:child_process");
 const crypto = require("node:crypto");
 const fs = require("node:fs");
 const fsp = require("node:fs/promises");
+const os = require("node:os");
 const path = require("node:path");
 const readline = require("node:readline");
 
@@ -10,7 +11,10 @@ const isDev = !app.isPackaged;
 const projectRoot = isDev ? path.resolve(__dirname, "../..") : process.resourcesPath;
 const rendererRoot = path.resolve(__dirname, "../renderer");
 const taskRoot = path.resolve(process.env.ACEVAL_TASK_ROOT || (isDev ? path.join(projectRoot, ".aceval/tasks") : path.join(app.getPath("userData"), "tasks")));
+const modelProfileRoot = path.resolve(process.env.ACEVAL_MODEL_PROFILE_ROOT || (isDev ? path.join(projectRoot, ".aceval/model-profiles") : path.join(app.getPath("userData"), "model-profiles")));
 const settingsPath = () => path.join(app.getPath("userData"), "secrets.bin");
+const catxSettingsPath = () => path.join(app.getPath("userData"), "catx", "default.json");
+const catxProfileRoot = () => path.join(app.getPath("userData"), "catx", "task-profiles");
 const extensionsPath = () => path.join(app.getPath("userData"), "extensions");
 const ALLOWED_SECRET_NAMES = new Set([
   "CATX_API_KEY", "USER_MIS_ID", "CATX_AGENT_ID", "CATX_ENV_ID",
@@ -25,6 +29,47 @@ let serviceReady;
 let serviceRequestId = 0;
 let isQuitting = false;
 const pending = new Map();
+
+function usableCodexExecutable(candidate) {
+  if (!candidate) return null;
+  const resolved = path.resolve(candidate);
+  try { fs.accessSync(resolved, fs.constants.X_OK); } catch { return null; }
+  const checked = spawnSync(resolved, ["--version"], {
+    encoding: "utf8",
+    timeout: 2000,
+    shell: false,
+    env: {
+      ...process.env,
+      // NVM launchers use `/usr/bin/env node`; make the candidate use its own Node.
+      PATH: `${path.dirname(resolved)}${path.delimiter}${process.env.PATH || ""}`,
+    },
+  });
+  const version = String(checked.stdout || checked.stderr || "").trim();
+  return checked.status === 0 && /^codex-cli\s+\S+/m.test(version) ? resolved : null;
+}
+
+function findCodexExecutable() {
+  const candidates = [process.env.ACEVAL_CODEX_EXECUTABLE];
+  for (const directory of String(process.env.PATH || "").split(path.delimiter)) {
+    if (directory) candidates.push(path.join(directory, process.platform === "win32" ? "codex.exe" : "codex"));
+  }
+  const home = os.homedir();
+  candidates.push(
+    path.join(home, ".local/bin/codex"),
+    "/opt/homebrew/bin/codex",
+    "/usr/local/bin/codex",
+  );
+  const nvmRoot = path.join(home, ".nvm/versions/node");
+  try {
+    const versions = fs.readdirSync(nvmRoot).sort((left, right) => right.localeCompare(left, undefined, { numeric:true, sensitivity:"base" }));
+    for (const version of versions) candidates.push(path.join(nvmRoot, version, "bin/codex"));
+  } catch {}
+  for (const candidate of candidates) {
+    const ready = usableCodexExecutable(candidate);
+    if (ready) return ready;
+  }
+  return null;
+}
 
 function sendToRenderer(channel, payload) {
   if (
@@ -68,6 +113,66 @@ async function writeSecrets(values) {
   return Object.keys(current).sort();
 }
 
+function safeCatxText(value, label, { required = false } = {}) {
+  const text = String(value || "").trim();
+  if (!text && !required) return "";
+  if (!text || text.length > 1024 || /[\x00-\x1f]/.test(text)) throw new Error(`${label} 无效`);
+  return text;
+}
+
+function safeVaultIds(value) {
+  if (!Array.isArray(value)) throw new Error("Vault IDs 必须是数组");
+  const vaultIds = value.map(item => safeCatxText(item, "Vault ID", { required:true }));
+  if (!vaultIds.length || new Set(vaultIds).size !== vaultIds.length) throw new Error("至少配置一个不重复的 Vault ID");
+  return vaultIds;
+}
+
+async function readCatxDefault() {
+  try {
+    const value = JSON.parse(await fsp.readFile(catxSettingsPath(), "utf8"));
+    return { configured:true, vault_ids:safeVaultIds(value?.vault_ids) };
+  } catch { return { configured:false, vault_ids:[] }; }
+}
+
+async function writeCatxDefault(value) {
+  const vaultIds = safeVaultIds(value?.vault_ids);
+  await fsp.mkdir(path.dirname(catxSettingsPath()), { recursive:true });
+  await fsp.writeFile(catxSettingsPath(), JSON.stringify({ vault_ids:vaultIds }, null, 2), { mode:0o600 });
+  return { configured:true, vault_ids:vaultIds };
+}
+
+async function prepareCatxProfile(value) {
+  const defaults = await readCatxDefault();
+  const vaultIds = value?.vault_ids === undefined ? defaults.vault_ids : safeVaultIds(value.vault_ids);
+  if (!vaultIds.length) throw new Error("请先在其他服务配置中填写至少一个 Vault ID");
+  const agentId = safeCatxText(value?.agent_id, "CATX Agent ID");
+  const environmentId = safeCatxText(value?.environment_id, "CATX Environment ID");
+  const output = {
+    api_version:"aceval.catx-profile/v1",
+    name:"forge-catx-default",
+    base_url:"https://api.catx.sankuai.com/api/v1",
+    api_key_env:"CATX_API_KEY",
+    user_mis_id_env:"USER_MIS_ID",
+    agent_id_env:"CATX_AGENT_ID",
+    environment_id_env:"CATX_ENV_ID",
+    vault_ids:vaultIds,
+    default_title:"FORGE Skill evaluation",
+  };
+  const credentials = {};
+  if (agentId) { output.agent_id_env = "FORGE_CATX_TASK_AGENT_ID"; credentials.FORGE_CATX_TASK_AGENT_ID = agentId; }
+  if (environmentId) { output.environment_id_env = "FORGE_CATX_TASK_ENV_ID"; credentials.FORGE_CATX_TASK_ENV_ID = environmentId; }
+  const token = crypto.randomUUID();
+  await fsp.mkdir(catxProfileRoot(), { recursive:true });
+  if (Object.keys(credentials).length) {
+    const credentialsPath = path.join(catxProfileRoot(), `${token}.credentials.json`);
+    await fsp.writeFile(credentialsPath, JSON.stringify(credentials), { mode:0o600 });
+    output.credentials_file = credentialsPath;
+  }
+  const profilePath = path.join(catxProfileRoot(), `${token}.json`);
+  await fsp.writeFile(profilePath, JSON.stringify(output, null, 2), { mode:0o600 });
+  return { profile_path:profilePath, inherited:true, vault_ids:vaultIds };
+}
+
 async function stopService() {
   if (!service) return;
   for (const waiter of pending.values()) waiter.reject(new Error("Kernel 服务已重启"));
@@ -83,9 +188,11 @@ async function startService() {
     const sourceRoot = isDev ? path.join(projectRoot, "src") : path.join(process.resourcesPath, "aceval-src");
     const bundledKernel = path.join(process.resourcesPath, "forge-kernel", process.platform === "win32" ? "forge-kernel.exe" : "forge-kernel");
     const command = isDev ? (process.env.ACEVAL_PYTHON || "python3") : bundledKernel;
+    const codexExecutable = findCodexExecutable();
     const args = isDev
-      ? ["-m", "aceval.desktop_service", "--task-root", taskRoot]
-      : ["--task-root", taskRoot];
+      ? ["-m", "aceval.desktop_service", "--task-root", taskRoot, "--model-profile-root", modelProfileRoot]
+      : ["--task-root", taskRoot, "--model-profile-root", modelProfileRoot];
+    if (codexExecutable) args.push("--codex-executable", codexExecutable);
     if (!isDev && !fs.existsSync(bundledKernel)) throw new Error("应用内置 Kernel 缺失，请重新安装完整版本");
     const secrets = await readSecrets();
     service = spawn(command, args, {
@@ -103,8 +210,12 @@ async function startService() {
       stdio: ["pipe", "pipe", "pipe"],
       shell: false,
     });
+    let startupStderr = "";
     service.stderr.setEncoding("utf8");
-    service.stderr.on("data", (chunk) => console.error("[kernel]", String(chunk).slice(-4000)));
+    service.stderr.on("data", (chunk) => {
+      startupStderr = (startupStderr + String(chunk)).slice(-4000);
+      console.error("[kernel]", String(chunk).slice(-4000));
+    });
     service.on("exit", (code) => {
       const error = new Error(`Kernel 服务已退出（${code ?? "signal"}）`);
       for (const waiter of pending.values()) waiter.reject(error);
@@ -116,7 +227,10 @@ async function startService() {
     const lines = readline.createInterface({ input: service.stdout });
     let resolved = false;
     return await new Promise((resolve, reject) => {
-      const timer = setTimeout(() => reject(new Error("Kernel 服务启动超时")), 15000);
+      const timer = setTimeout(() => {
+        const detail = startupStderr.trim();
+        reject(new Error(`Kernel 服务启动超时（60 秒）${detail ? `：${detail}` : ""}`));
+      }, 60000);
       lines.on("line", (line) => {
         let message;
         try { message = JSON.parse(line); } catch { return; }
@@ -133,6 +247,12 @@ async function startService() {
         else waiter.reject(new Error(message.error?.message || "Kernel 请求失败"));
       });
       service.once("error", (error) => { clearTimeout(timer); reject(error); });
+      service.once("exit", (code, signal) => {
+        if (resolved) return;
+        clearTimeout(timer);
+        const detail = startupStderr.trim();
+        reject(new Error(`Kernel 服务启动失败（${code ?? signal ?? "unknown"}）${detail ? `：${detail}` : ""}`));
+      });
     });
   })();
   try { return await serviceReady; } catch (error) { serviceReady = null; throw error; }
@@ -143,7 +263,8 @@ async function rpc(method, params) {
   if (!service?.stdin.writable) throw new Error("Kernel 服务不可用");
   const id = `rpc_${++serviceRequestId}`;
   return await new Promise((resolve, reject) => {
-    const timer = setTimeout(() => { pending.delete(id); reject(new Error(`Kernel 请求超时：${method}`)); }, method === "tasks.create" ? 300000 : 30000);
+    const timeout = ["tasks.create", "tasks.restart"].includes(method) ? 300000 : method === "models.test_codex" ? 120000 : method === "models.refresh_codex" ? 60000 : 30000;
+    const timer = setTimeout(() => { pending.delete(id); reject(new Error(`Kernel 请求超时：${method}`)); }, timeout);
     pending.set(id, {
       resolve(value) { clearTimeout(timer); resolve(value); },
       reject(error) { clearTimeout(timer); reject(error); },
@@ -257,6 +378,32 @@ async function createMainWindow() {
 }
 
 ipcMain.handle("forge:rpc", (_event, method, params) => rpc(method, params));
+ipcMain.handle("forge:model-profiles", () => rpc("models.list", {}));
+ipcMain.handle("forge:import-codex-file", async (_event, kind) => {
+  if (!["config", "auth"].includes(kind)) throw new Error("不支持的 Codex 配置类型");
+  const filename = kind === "config" ? "config.toml" : "auth.json";
+  const projectCandidate = isDev ? path.join(projectRoot, "config", filename) : "";
+  const userCandidate = path.join(os.homedir(), ".codex", filename);
+  const defaultPath = fs.existsSync(projectCandidate) ? projectCandidate : userCandidate;
+  const result = await dialog.showOpenDialog(mainWindow, {
+    properties: ["openFile"],
+    title: kind === "config" ? "导入 Codex config.toml 副本" : "导入 Codex auth.json 副本",
+    defaultPath,
+    filters: kind === "config" ? [{ name:"Codex TOML", extensions:["toml"] }] : [{ name:"Codex Auth JSON", extensions:["json"] }],
+  });
+  if (result.canceled || !result.filePaths[0]) return null;
+  return await rpc("models.import_codex_file", { profile_id:"default", kind, source_path:result.filePaths[0] });
+});
+ipcMain.handle("forge:import-codex-cc-switch", () => rpc("models.import_cc_switch", {
+  profile_id:"default",
+  config_path:path.join(os.homedir(), ".codex", "config.toml"),
+  auth_path:path.join(os.homedir(), ".codex", "auth.json"),
+  claude_settings_path:path.join(os.homedir(), ".claude", "settings.json"),
+}));
+ipcMain.handle("forge:refresh-codex-profile", (_event, profileId) => rpc("models.refresh_codex", { profile_id:String(profileId || "default") }));
+ipcMain.handle("forge:test-codex-profile", (_event, profileId, modelId, reasoningEffort) => rpc("models.test_codex", {
+  profile_id:String(profileId || "default"), model_id:String(modelId || ""), reasoning_effort:String(reasoningEffort || "medium"),
+}));
 ipcMain.handle("forge:select-directory", async () => {
   const result = await dialog.showOpenDialog(mainWindow, { properties: ["openDirectory", "createDirectory"] });
   if (result.canceled || !result.filePaths[0]) return null;
@@ -295,6 +442,9 @@ ipcMain.handle("forge:read-artifact", async (_event, rawPath) => {
   return { path: target, mime, data_url: `data:${mime};base64,${(await fsp.readFile(target)).toString("base64")}` };
 });
 ipcMain.handle("forge:secret-status", async () => Object.keys(await readSecrets()).sort());
+ipcMain.handle("forge:catx-default", readCatxDefault);
+ipcMain.handle("forge:save-catx-default", (_event, value) => writeCatxDefault(value));
+ipcMain.handle("forge:prepare-catx-profile", (_event, value) => prepareCatxProfile(value));
 ipcMain.handle("forge:save-secrets", async (_event, values) => {
   const names = await writeSecrets(values);
   await stopService();

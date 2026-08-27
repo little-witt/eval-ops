@@ -37,6 +37,19 @@ class FakeGateway:
         }
 
 
+class RetryGateway(FakeGateway):
+    def __init__(self):
+        super().__init__()
+        self.fail_first = True
+
+    def start_session(self, request):
+        self.started.append(dict(request))
+        if self.fail_first:
+            self.fail_first = False
+            raise RuntimeError("temporary create failure")
+        return "session-%d" % len(self.started)
+
+
 class RemoteBatchTests(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
@@ -173,6 +186,21 @@ class RemoteBatchTests(unittest.TestCase):
                 goal="goal", standards=("correct",),
             )
         self.assertEqual([], gateway.started)
+
+    def test_failed_session_can_be_retried_without_repeating_successful_cases(self):
+        gateway = RetryGateway()
+        coordinator = RemoteBatchCoordinator(gateway, self.store, poll_interval_seconds=1)
+        first = coordinator.dispatch(
+            "batch-task-001", 0, "evaluation",
+            ({"id": "a", "prompt": "Review A"}, {"id": "b", "prompt": "Review B"}),
+            goal="goal", standards=("correct",),
+        )
+        self.assertEqual(["failed", "running"], [row["status"] for row in first["cases"]])
+        retried = coordinator.retry_failed("batch-task-001", 0, "evaluation")
+        self.assertEqual(3, len(gateway.started))
+        self.assertEqual("session-2", first["cases"][1]["session_id"])
+        self.assertEqual("session-3", retried["cases"][0]["session_id"])
+        self.assertEqual("running", retried["status"])
 
 
 if __name__ == "__main__":

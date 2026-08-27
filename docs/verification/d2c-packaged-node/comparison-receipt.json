@@ -12,14 +12,14 @@
       "sha256": "sha256:53ce83ec885b5ab2f93fd44fd1c6a0a0ffa0034115e591c8171cbee51203f5a3"
     },
     "driver-result.json": {
-      "bytes": 2799,
+      "bytes": 2764,
       "path": "driver-result.json",
-      "sha256": "sha256:ef3eaa8eae470430e94d5fc858fbb4e3aef940d88814ff60564eeade1b9a30be"
+      "sha256": "sha256:bd36d3038c4cc4bd8e7fecfe4481c2f18f34d6e7b862bad4cbd06fb6e8a1ed1e"
     },
     "network.json": {
       "bytes": 306,
       "path": "network.json",
-      "sha256": "sha256:6c6ffe5762f0fe5a7d1d053f3cd4449ead184d40ab592d06fcb39a6abba12471"
+      "sha256": "sha256:40281a90203fd11000fc0db4ac0e53b3d29d2211c243cdef8c21aa39fa3cedf6"
     },
     "screenshot.png": {
       "bytes": 51617,
@@ -36,11 +36,11 @@
   "case_id": "real-browser-smoke",
   "driver_summary": {
     "api_version": "aceval.d2c-browser-driver/v1",
-    "chrome_stderr_tail": "\nDevTools listening on ws://127.0.0.1:50316/devtools/browser/f27b1432-c7d7-489f-a66d-2b82fa1e6b94\nTrying to load the allocator multiple times. This is *not* supported.\n",
+    "chrome_stderr_tail": "\nDevTools listening on ws://127.0.0.1:56796/devtools/browser/587d0b4b-1997-45f5-9453-4f17c442973f\nTrying to load the allocator multiple times. This is *not* supported.\n",
     "console_errors": 0,
     "console_events": 0,
     "failure": null,
-    "final_url": "http://127.0.0.1:8898/",
+    "final_url": "http://127.0.0.1:8878/",
     "metrics": {
       "devicePixelRatio": 1,
       "height": 900,
@@ -54,32 +54,32 @@
         "criticalCHRestart": 0,
         "decodedBodySize": 1414,
         "deliveryType": "",
-        "domComplete": 50.599999994039536,
-        "domContentLoadedEventEnd": 50.400000005960464,
-        "domContentLoadedEventStart": 50.400000005960464,
-        "domInteractive": 50.29999998211861,
+        "domComplete": 44.099999994039536,
+        "domContentLoadedEventEnd": 44,
+        "domContentLoadedEventStart": 44,
+        "domInteractive": 44,
         "domainLookupEnd": 0.5999999940395355,
         "domainLookupStart": 0.5999999940395355,
-        "duration": 50.599999994039536,
+        "duration": 44.19999998807907,
         "encodedBodySize": 1414,
         "entryType": "navigation",
         "fetchStart": 0.5999999940395355,
-        "finalResponseHeadersStart": 7,
+        "finalResponseHeadersStart": 1.699999988079071,
         "firstInterimResponseStart": 0,
         "initiatorType": "navigation",
-        "loadEventEnd": 50.599999994039536,
-        "loadEventStart": 50.599999994039536,
-        "name": "http://127.0.0.1:8898/",
-        "navigationId": 8181,
+        "loadEventEnd": 44.19999998807907,
+        "loadEventStart": 44.19999998807907,
+        "name": "http://127.0.0.1:8878/",
+        "navigationId": 8720,
         "nextHopProtocol": "http/1.0",
         "notRestoredReasons": null,
         "redirectCount": 0,
         "redirectEnd": 0,
         "redirectStart": 0,
         "renderBlockingStatus": "non-blocking",
-        "requestStart": 1.0999999940395355,
-        "responseEnd": 7.299999982118607,
-        "responseStart": 7,
+        "requestStart": 1,
+        "responseEnd": 1.899999976158142,
+        "responseStart": 1.699999988079071,
         "responseStatus": 200,
         "secureConnectionStart": 0,
         "serverTiming": [],
@@ -95,7 +95,7 @@
         "workerStart": 0
       },
       "title": "FORGE D2C Fixture",
-      "url": "http://127.0.0.1:8898/",
+      "url": "http://127.0.0.1:8878/",
       "width": 1440
     },
     "network_events": 2,
@@ -122,13 +122,13 @@
       "reference_sha256": "sha256:bafc125a722c5c69d4a393f1d462af1f61fa35a30bd5784648010631da08dcdf"
     }
   },
-  "duration_ms": 1998.637,
+  "duration_ms": 1431.499,
   "environment_fingerprint": "sha256:2c97133d06356c310ea0a993693a59013bbb9143d5963c9fd26181ba2f8fb150",
-  "finished_at": "2026-08-26T04:47:40.390760+00:00",
+  "finished_at": "2026-08-26T08:31:12.364300+00:00",
   "infrastructure_errors": [],
   "profile": "real-local-chrome-smoke",
-  "receipt_hash": "sha256:bce8f00b6e95866d163339656a7c97b487269e134dcb052fe143d81828100269",
-  "request_hash": "sha256:68643dc00a707c0d7b0fe10dd280c773ba118b024ac4aed1202a0be05624bb7e",
-  "started_at": "2026-08-26T04:47:38.392187+00:00",
+  "receipt_hash": "sha256:ce761384c5aa66567a2a0d64b8e03599a6a5529217fdd2696fbceffefe142950",
+  "request_hash": "sha256:573bb07138d591adcabf2eb3f2decd710ec0d575a65a46666186692fe06cd896",
+  "started_at": "2026-08-26T08:31:10.932836+00:00",
   "status": "succeeded"
 }

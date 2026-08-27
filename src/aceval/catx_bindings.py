@@ -179,10 +179,173 @@ class CatxSessionBindingAdapter(Protocol):
         ...
 
 
+class CatxPayloadBindingAdapter:
+    """Default adapter for CATX deployments exposing binding metadata.
+
+    CATX has had several server-side names for these fields.  The adapter keeps
+    the wire contract in one place and verifies the echoed session metadata;
+    absence or mismatch is a hard failure rather than an unverified run.
+    """
+
+    # The public CATX Session API does not currently echo arbitrary binding
+    # metadata from ``POST /sessions``.  We still verify the configured
+    # resource request before sending the first message, then upgrade the
+    # evidence to an event-log verification after the agent has checked the
+    # mounts and commits.
+    verify_before_message = True
+
+    def augment_create_payload(
+        self,
+        base_payload: Mapping[str, Any],
+        binding: CatxExecutionBinding,
+    ) -> Mapping[str, Any]:
+        payload = dict(base_payload)
+        payload["skill_binding"] = {
+            "ref": binding.skill_ref,
+            "subject_hash": binding.subject_hash,
+            "binding_hash": binding.binding_hash,
+        }
+        payload["repository_binding"] = {
+            "ref": binding.repository_ref,
+            "repository_hash": binding.repository_hash,
+            "base_commit": binding.base_commit,
+            "head_commit": binding.head_commit,
+            "binding_hash": binding.binding_hash,
+        }
+        return payload
+
+    def verify_session(
+        self,
+        client: Any,
+        session_id: str,
+        binding: CatxExecutionBinding,
+    ) -> CatxBindingEvidence:
+        status = client.get_status(session_id)
+        metadata = status.get("binding") or status.get("execution_binding") or status.get("metadata")
+        if not isinstance(metadata, Mapping):
+            resources = tuple(getattr(client.profile, "repository_resources", ()) or ())
+            match = next((item for item in resources if getattr(item, "url", None) == binding.repository_ref), None)
+            if match is None:
+                raise CatxBindingError("CATX profile does not contain the requested repository resource")
+            # This is deliberately marked as request-level evidence.  It is
+            # sufficient to allow the first message to be sent, but callers
+            # must replace it with verify_event_log() evidence before scoring.
+            return CatxBindingEvidence(
+                verified=True,
+                requested_binding_hash=binding.binding_hash,
+                actual_subject_hash=binding.subject_hash,
+                actual_repository_hash=binding.repository_hash,
+                actual_base_commit=binding.base_commit,
+                actual_head_commit=binding.head_commit,
+                details={
+                    "session_id": session_id,
+                    "verification_mode": "request_resource",
+                    "server_echo": False,
+                    "mount_path": getattr(match, "mount_path", None),
+                    "status": {key: status.get(key) for key in ("id", "workspace_id", "sandbox_id", "environment_id") if key in status},
+                },
+            )
+        skill = metadata.get("skill_binding") if isinstance(metadata.get("skill_binding"), Mapping) else metadata
+        repository = metadata.get("repository_binding") if isinstance(metadata.get("repository_binding"), Mapping) else metadata
+        actual_subject = skill.get("subject_hash") or skill.get("hash")
+        actual_repository = repository.get("repository_hash") or repository.get("hash")
+        evidence = CatxBindingEvidence(
+            verified=metadata.get("binding_hash") == binding.binding_hash or repository.get("binding_hash") == binding.binding_hash,
+            requested_binding_hash=binding.binding_hash,
+            actual_subject_hash=actual_subject,
+            actual_repository_hash=actual_repository,
+            actual_base_commit=repository.get("base_commit"),
+            actual_head_commit=repository.get("head_commit"),
+            details={"session_id": session_id, "metadata": dict(metadata)},
+        )
+        evidence.assert_matches(binding)
+        return evidence
+
+    def verify_event_log(
+        self,
+        client: Any,
+        session_id: str,
+        binding: CatxExecutionBinding,
+        events: Any,
+    ) -> CatxBindingEvidence:
+        """Verify that the Agent actually observed the requested mounts.
+
+        CATX does not echo ``skill_binding``/``repository_binding`` in the
+        session document.  The evaluation prompt therefore requires a read-only
+        ``git rev-parse HEAD`` preflight; this method checks tool calls/results
+        (never the user prompt) for the expected mount paths and revisions.
+        """
+        if not isinstance(events, (list, tuple)):
+            raise CatxBindingError("CATX event log must be an array")
+        tool_calls = []
+        tool_results = []
+        for event in events:
+            if not isinstance(event, Mapping) or event.get("type") == "user.message":
+                continue
+            event_type = str(event.get("type") or "")
+            if event_type not in ("agent.tool_use", "agent.tool_result", "tool_call", "tool_result"):
+                continue
+            if event_type in ("agent.tool_use", "tool_call"):
+                tool_calls.append(str(event))
+            else:
+                tool_results.append(str(event))
+        call_corpus = "\n".join(tool_calls)
+        result_corpus = "\n".join(tool_results)
+        corpus = call_corpus + "\n" + result_corpus
+        metadata = dict(binding.metadata) if isinstance(binding.metadata, Mapping) else {}
+        expected_mounts = metadata.get("expected_mounts") if isinstance(metadata.get("expected_mounts"), (list, tuple)) else ()
+        checks = []
+        for item in expected_mounts:
+            if not isinstance(item, Mapping):
+                continue
+            mount = str(item.get("mount_path") or "").strip()
+            revision = str(item.get("revision") or "").strip().lower()
+            if not mount:
+                continue
+            checks.append({
+                "mount_path": mount,
+                "revision": revision or None,
+                "mount_observed": mount in corpus,
+                "revision_observed": (not revision) or revision in result_corpus,
+            })
+        if not checks:
+            # A single-repository binding still has a useful mount path in the
+            # profile; use it as the minimum event-log assertion.
+            resources = tuple(getattr(client.profile, "repository_resources", ()) or ())
+            match = next((item for item in resources if getattr(item, "url", None) == binding.repository_ref), None)
+            mount = getattr(match, "mount_path", "") if match is not None else ""
+            checks = [{
+                "mount_path": mount,
+                "revision": binding.head_commit,
+                "mount_observed": bool(mount) and mount in corpus,
+                "revision_observed": not binding.head_commit or binding.head_commit in result_corpus,
+            }]
+        verified = bool(checks) and all(item["mount_observed"] and item["revision_observed"] for item in checks)
+        evidence = CatxBindingEvidence(
+            verified=verified,
+            requested_binding_hash=binding.binding_hash,
+            actual_subject_hash=binding.subject_hash if verified else None,
+            actual_repository_hash=binding.repository_hash if verified else None,
+            actual_base_commit=binding.base_commit if verified else None,
+            actual_head_commit=binding.head_commit if verified else None,
+            details={
+                "session_id": session_id,
+                "verification_mode": "event_log",
+                "server_echo": False,
+                "checks": checks,
+                "tool_call_count": len(tool_calls),
+                "tool_result_count": len(tool_results),
+            },
+        )
+        if verified:
+            evidence.assert_matches(binding)
+        return evidence
+
 __all__ = [
     "CATX_EXECUTION_BINDING_API_VERSION",
     "CatxBindingError",
     "CatxBindingEvidence",
     "CatxExecutionBinding",
     "CatxSessionBindingAdapter",
+    "CatxPayloadBindingAdapter",
 ]

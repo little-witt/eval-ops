@@ -5,7 +5,7 @@ from dataclasses import replace
 from pathlib import Path
 
 from aceval.agent_runtime import ModelReply
-from aceval.iteration_kernel import IterationKernel
+from aceval.iteration_kernel import IterationKernel, IterationKernelError
 from aceval.kernel_contracts import KERNEL_CONFIG_API_VERSION, KERNEL_INPUT_API_VERSION, KernelConfig, KernelInput
 
 
@@ -210,6 +210,55 @@ Steps:
         self.assertIn("design", snapshot)
         self.assertIn("decision", snapshot)
 
+    def test_analysis_can_resume_from_every_persisted_brain_stage(self):
+        for index, phase in enumerate(("evidence_ready", "semantic_grading", "attribution", "proposal"), start=1):
+            with self.subTest(phase=phase):
+                task_id = "resume-stage-%d" % index
+                self.kernel.create_task(self.config, self.user_input, task_id=task_id)
+                self.kernel.compile_design(task_id)
+                self.kernel.dispatch(task_id)
+                self.kernel.collect(task_id)
+                self.kernel._transition(task_id, phase, brain_stage=phase)
+                result = self.kernel.advance(task_id)
+                self.assertEqual("running", result["status"])
+                self.assertEqual("verification_running", self.kernel.state(task_id)["phase"])
+                receipts = list(
+                    (self.root / "tasks" / task_id / "iterations" / "iteration-000" / "analysis").glob(
+                        "agent-call-receipt-*.json"
+                    )
+                )
+                self.assertTrue(receipts)
+
+    def test_pass_verification_fails_closed_when_trial_environment_drifts(self):
+        task_id = "environment-drift"
+        self.kernel.create_task(self.config, self.user_input, task_id=task_id)
+        self.kernel.compile_design(task_id)
+        self.kernel.dispatch(task_id)
+        self.kernel.collect(task_id)
+        decision = self.kernel.analyze(task_id)
+        self.assertEqual("verify_passes", decision["next_action"])
+        (self.skill / "SKILL.md").write_text(
+            (self.skill / "SKILL.md").read_text(encoding="utf-8") + "\nUnexpected drift.\n",
+            encoding="utf-8",
+        )
+        with self.assertRaisesRegex(IterationKernelError, "environment drift"):
+            self.kernel.dispatch(
+                task_id,
+                purpose="pass-verification",
+                case_ids=decision["verification_required_case_ids"],
+            )
+
+    def test_generated_cases_have_reusable_identity_and_applicability(self):
+        task_id = "case-identity"
+        self.kernel.create_task(self.config, self.user_input, task_id=task_id)
+        design = self.kernel.compile_design(task_id)
+        for case in design["cases"]:
+            self.assertTrue(case["case_revision"].startswith("sha256:"))
+            self.assertTrue(case["content_hash"].startswith("sha256:"))
+            self.assertTrue(case["reuse_key"].startswith("sha256:"))
+            self.assertIn("source", case["provenance"])
+            self.assertEqual("catx", case["environment_applicability"]["trial_provider"])
+
     def test_failed_cases_require_confirmation_before_candidate_and_next_round(self):
         publisher = FakePublisher()
         kernel = IterationKernel(
@@ -228,15 +277,59 @@ Steps:
             kernel.collect("repair-task-001")
             decision = kernel.analyze("repair-task-001")
         self.assertEqual("await_user_confirmation", decision["next_action"])
+        decision_path = Path(kernel.state("repair-task-001")["decision"])
+        immutable_decision = decision_path.read_bytes()
         with self.assertRaises(Exception):
             kernel.optimize("repair-task-001")
         kernel.confirm("repair-task-001", approve=True)
+        self.assertEqual(immutable_decision, decision_path.read_bytes())
+        approvals = list((decision_path.parent / "approvals").glob("approval-record-*.json"))
+        self.assertEqual(1, len(approvals))
+        self.assertTrue(kernel.state("repair-task-001")["approved_decision"])
         candidate = kernel.optimize("repair-task-001")
         self.assertTrue(Path(candidate["path"], "SKILL.md").is_file())
         published = kernel.publish_candidate("repair-task-001")
         self.assertEqual(1, published["iteration"])
-        self.assertEqual("design_ready", published["state"]["phase"])
+        self.assertEqual("evaluation_ready", published["state"]["phase"])
+        self.assertIsNone(published["state"]["environment_contract_hash"])
+        second_round = kernel.dispatch("repair-task-001")
+        self.assertEqual("running", second_round["status"])
+        self.assertEqual("remote_running", kernel.state("repair-task-001")["phase"])
         self.assertEqual(1, len(publisher.calls))
+
+    def test_supplement_after_evaluation_starts_a_clean_iteration(self):
+        kernel = IterationKernel(
+            self.root / "supplement-tasks",
+            gateway_factory=lambda config: self.gateway,
+            model_factory=lambda config: RepairModel(),
+            publisher=FakePublisher(),
+        )
+        task_id = "supplement-task"
+        kernel.create_task(self.config, self.user_input, task_id=task_id)
+        kernel.compile_design(task_id)
+        kernel.dispatch(task_id)
+        kernel.collect(task_id)
+        decision = kernel.analyze(task_id)
+        if decision["next_action"] == "verify_passes":
+            kernel.dispatch(task_id, purpose="pass-verification", case_ids=decision["verification_required_case_ids"])
+            kernel.collect(task_id)
+            decision = kernel.analyze(task_id)
+        self.assertEqual("await_user_confirmation", decision["next_action"])
+        supplemented = KernelInput.from_mapping({
+            "api_version": KERNEL_INPUT_API_VERSION,
+            "skill_name": "reviewer",
+            "goal": "Produce an evidence-backed review and explain severity",
+            "standards": ["Every finding has a source location"],
+            "cases": [{"id": "review-2", "prompt": "Review the fixture and rank severity", "expected_output": "ok"}],
+        })
+        kernel.confirm(task_id, approve=True, supplement=supplemented)
+        state = kernel.state(task_id)
+        self.assertEqual(1, state["iteration"])
+        self.assertEqual("design_ready", state["phase"])
+        self.assertIsNone(state["environment_contract_hash"])
+        batch = kernel.dispatch(task_id)
+        self.assertEqual("running", batch["status"])
+        self.assertEqual("remote_running", kernel.state(task_id)["phase"])
 
     def test_kernel_optimizes_approved_scripts_and_references_together(self):
         (self.skill / "scripts").mkdir()
@@ -322,6 +415,13 @@ Steps:
 
     def test_one_button_run_stops_only_at_a_real_gate(self):
         self.kernel.create_task(self.config, self.user_input, task_id="one-button-task")
+        result = self.kernel.run_until_gate("one-button-task")
+        self.assertEqual("design_ready", result["gate"])
+        self.assertEqual(0, self.gateway.counter)
+        approved = self.kernel.confirm(
+            "one-button-task", approve=True, selected_case_ids=("review-1",)
+        )
+        self.assertEqual("evaluation_ready", approved["phase"])
         result = self.kernel.run_until_gate("one-button-task")
         self.assertEqual("converged", result["gate"])
         self.assertEqual("converged", result["snapshot"]["state"]["phase"])

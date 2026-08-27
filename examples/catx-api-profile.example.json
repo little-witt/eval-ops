@@ -1,7 +1,7 @@
 {
   "api_version": "aceval.catx-profile/v1",
   "name": "catx-online-agent",
-  "base_url": "https://api.catpaw.sankuai.com/v1",
+  "base_url": "https://api.catx.sankuai.com/api/v1",
   "api_key_env": "CATX_API_KEY",
   "user_mis_id_env": "USER_MIS_ID",
   "agent_id_env": "CATX_AGENT_ID",

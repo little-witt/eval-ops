@@ -1,10 +1,11 @@
 # ACEval / Skill Doctor 最终产品与系统架构
 
 > 状态：唯一有效的产品与架构基线  
-> 日期：2026-08-26  
-> 适用形态：单用户、本地优先的桌面工具；远程 Agent 作为真实执行环境，本地或独立 Worker 作为验证环境  
+> 日期：2026-08-27
+> 适用形态：单用户、本地优先的桌面工具；远程 Agent 运行真实 Trial；初测与通过 Case 复验继承同一份冻结环境契约，领域 Grader 可作为独立进程运行但不得改变比较变量
 > 详细内核：[`EVALUATION_SELF_ITERATION_KERNEL_V2.md`](./EVALUATION_SELF_ITERATION_KERNEL_V2.md)  
 > 客户端交互基线：[`PRODUCT_DESIGN_V2.md`](../../design/desktop-v2/PRODUCT_DESIGN_V2.md)
+> 当前实现与下一会话交接：[`NEXT_SESSION_HANDOFF.md`](./NEXT_SESSION_HANDOFF.md)
 
 ## 1. 最终产品定义
 
@@ -77,6 +78,10 @@ EvalPack 是系统内部冻结 Case、Oracle、Fixture 和 Grader 的可复用�
 - [OpenAI — Trace grading](https://developers.openai.com/api/docs/guides/trace-grading)
 - [OpenAI — Graders](https://developers.openai.com/api/docs/guides/graders)
 - [OpenAI — Introducing SWE-bench Verified](https://openai.com/index/introducing-swe-bench-verified/)
+- [OpenAI — Codex App Server](https://learn.chatgpt.com/docs/app-server)
+- [OpenAI — Codex configuration reference](https://learn.chatgpt.com/docs/config-file/config-reference)
+- [OpenAI — Codex authentication](https://learn.chatgpt.com/docs/auth)
+- [OpenAI — Responses API](https://developers.openai.com/api/reference/responses/create)
 - [LangSmith — Trajectory evaluations](https://docs.langchain.com/langsmith/trajectory-evals)
 - [τ-bench](https://arxiv.org/abs/2406.12045)
 - [GEPA](https://arxiv.org/abs/2507.19457)
@@ -112,7 +117,7 @@ ACEval Desktop
    │  ├─ Champion / Challenger / Pareto Set
    │  ├─ Regression / Validation / Holdout
    │  └─ Promotion / Rejection / Safe Stop
-   └─ Validation Worker Interface
+   └─ Domain Grader Worker Interface（继承冻结 Trial Contract）
       ├─ Code Review Fixture Lab
       ├─ D2C Local Browser Worker
       └─ Future Document / Data / Ops Adapters
@@ -148,19 +153,27 @@ ACEval Desktop
 
 ### 7.2 核心页面
 
-1. **首次运行与环境体检**：基础体检显示内置 Kernel、Git、内置 Node 和 Chrome；CATX Profile、模型桥和仓库权限在任务创建/首次使用前按配置校验，浏览器插件使用受控安装入口。
+1. **首次运行与环境体检**：基础体检显示内置 Kernel、Git、内置 Node、Chrome 和 Codex CLI；CATX 安全存储字段与 Vault ID、Codex/Claude 隔离 Profile 和仓库权限在任务创建/首次使用前校验，浏览器插件使用受控安装入口。
 2. **任务中心**：真实任务、状态、需要操作、最新收益、预算和错误；不注入演示任务。
-3. **创建任务**：Skill/代码仓库、操作模式、目标、Case、标准、远程 Agent 与验证环境；创建后立即进入详情。
+3. **创建任务**：Skill/代码仓库、操作模式、目标、Case、标准、本地分析大脑与 CATX 评测运行环境；创建后立即进入详情。初测、无 Skill 基线和通过 Case 复验不再要求用户分别配置环境。
 4. **任务详情**：实时路径大盘、进化轨迹、Case/路径、Session/日志、Trial Verdict、诊断、Proposal、Diff 和 Champion/Challenger。
 5. **证据检查器**：任意结论跳转到原始事件、日志区间、产物、截图、Diff 和 Grader。
 6. **资源与设置**：仓库、环境 Profile、Eval 资产、浏览器插件、模型和密钥引用。
+
+### 7.2.1 本地分析模型接入
+
+- 用户可以让应用自动识别 CC Switch 当前应用的 Codex 或 Claude Code 配置；Codex 也可分别导入 `config.toml` 与 `auth.json`。应用复制到自己的 0700 Profile 目录，文件权限为 0600；原始 Codex、项目和 Claude 配置不修改。
+- `config.toml` 只提取模型、provider、Responses 连接与重试等白名单字段，不继承 MCP、通知命令、插件或项目行为；认证内容保持不透明且不进入 Renderer、任务事件和日志。
+- Codex App Server `model/list` 提供模型能力与推理强度，Responses provider 的 `/models` 在可用时进一步过滤账户目录；用户可执行一次最小探针，区分“目录可见”和“账户真正可用”。
+- API Key Profile 的分析调用通过同一 Codex provider/base URL 走精简 Responses 请求，避免引入编程 Agent 工具上下文；ChatGPT OAuth Profile 使用 App Server 兼容路径。两者都实现同一个 `aceval.model-bridge/v1` 边界，Kernel 不依赖具体认证方式。
+- 模型负责语义归因与候选内容，仍不获得本地工具；Kernel 的硬事实、证据资格、回归、预算与收敛门禁不下放给模型。
 
 ### 7.3 D2C 页面运行与设计稿对比
 
 D2C 由两个不同视图组成：
 
 - **交互预览窗口**：桌面端打开隔离的浏览器窗口运行候选页面，用户可以人工探索；它不作为自动评分证据。
-- **验证 Worker**：使用干净临时 Chrome Profile、冻结 viewport/locale/timezone/color scheme，自动执行动作并生成可复现证据。
+- **领域 Grader Worker**：使用干净临时 Chrome Profile，自动执行动作并生成可复现证据。每次 Attempt 可以是新进程/新 Profile，但必须继承任务冻结的浏览器版本、代码 revision、viewport、locale、timezone、color scheme、Fixture 与阈值；与初测不一致时结果不可比较并 fail closed。
 
 验证结果在客户端以三栏呈现：
 

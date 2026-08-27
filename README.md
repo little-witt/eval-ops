@@ -24,10 +24,12 @@ EvalPack，补齐 Case 与语义评测路径，在真实远程 Agent 上并行�
 - 用户批准门、Git commit/push、被拒候选的可审计 revert、稳定通过保护；
 - D2C 独立 Chrome Worker、交互预览、受控插件、DOM/网络/控制台/截图/像素差异证据；
 - Skill 与 Agent 共用的 `EvaluationSubject` 控制面契约。
+- Codex `config.toml` / `auth.json` 分离导入、隔离 Profile、真实 GPT 目录与推理强度选择；API Key Profile 走低 Token Responses 主路径，OAuth Profile 回退 App Server。
 
 完整产品与架构基线见
 [最终系统架构](docs/current/FINAL_SYSTEM_ARCHITECTURE.md) 和
-[Kernel V2](docs/current/EVALUATION_SELF_ITERATION_KERNEL_V2.md)。
+[Kernel V2](docs/current/EVALUATION_SELF_ITERATION_KERNEL_V2.md)。当前完成状态、真实验收边界和
+下一会话优先级见 [交接文档](docs/current/NEXT_SESSION_HANDOFF.md)。
 
 ## 桌面端使用
 
@@ -41,19 +43,19 @@ Developer ID 签名/公证，因此它是本地验证构建，不是公开分发
 
 启动后：
 
-1. 在“配置与环境”中完成 Kernel / Git / D2C 体检，并把 API Key/PAT 保存到系统安全存储；
+1. 在“配置与环境”中完成 Kernel / Git / D2C / Codex 体检，分别导入 Codex `config.toml` 与 `auth.json` 的隔离副本，读取并验证 GPT 模型；CATX/PAT 等其他密钥保存到系统安全存储；
 2. 创建任务，填写 Skill 仓库、分支、目标/标准、可选代码仓库和 Case；
 3. 如有自己的 EvalPack，选择目录；留空时系统自动生成或复用；
 4. 创建后立即进入任务详情，观察 EvalPack、Case/Path、远程会话和日志事件；
 5. 在分析门选择修改提案并补充意见；系统继续生成、发布、复评，直到晋升、拒绝或安全停止。
 
-凭据只进入 Electron `safeStorage` 和子进程环境；任务配置持久化的是环境变量名，不是明文。
+Codex 导入副本位于客户端私有 Profile，权限为 0600；原始 `~/.codex`、项目配置和 Claude 配置不会被修改。CATX/PAT 等凭据只进入 Electron `safeStorage` 和受控子进程环境，任务配置不持久化明文。
 
 桌面开发与构建说明见 [desktop/README.md](desktop/README.md)。
 
 ## 源码运行
 
-要求 Python 3.9+。核心运行时没有强制第三方依赖。
+要求 Python 3.9+；Python 3.9/3.10 会安装 TOML 兼容解析器。
 
 ```bash
 python3 -m venv .venv
@@ -109,7 +111,8 @@ D2C 分为两个隔离环境：
   采集 DOM、console、network、title、URL、截图和视觉差异。
 
 设计稿会被冻结路径与 hash；Actual、Reference、Diff 和 receipt 与 Case、Attempt、candidate
-commit 一一关联。执行环境和验证环境可以隔离，通过不可变 Git commit 交接。
+commit 一一关联。代码执行进程与领域 Grader 可以物理隔离，但初测、复验和候选对比必须继承
+同一份冻结环境契约；Git revision、浏览器版本、Fixture 与评分参数漂移时停止比较。
 
 ## 验证
 
@@ -144,4 +147,3 @@ Comparison 与 Convergence Controller 可直接复用，Agent 级别仅需增加
 不要把真实 API Key、PAT、访问令牌或含敏感会话内容的 `.aceval/` 目录提交到仓库。
 Renderer 无 Shell、Git、远程 Session 或任意文件读取权限；所有副作用经过主进程 IPC
 白名单和 Python Kernel 的版本化命令执行。
-

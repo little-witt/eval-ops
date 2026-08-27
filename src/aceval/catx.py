@@ -38,7 +38,7 @@ from .catx_bindings import (
 
 
 CATX_PROFILE_API_VERSION = "aceval.catx-profile/v1"
-DEFAULT_CATX_BASE_URL = "https://api.catpaw.sankuai.com/v1"
+DEFAULT_CATX_BASE_URL = "https://api.catx.sankuai.com/api/v1"
 DEFAULT_EVENTS_LIMIT = 200
 MAX_PROFILE_BYTES = 1024 * 1024
 MAX_CREDENTIALS_BYTES = 64 * 1024
@@ -813,6 +813,7 @@ class CatxAgentClient:
             )
         )
         self._binding_adapter = binding_adapter
+        self.last_binding_evidence: Optional[CatxBindingEvidence] = None
 
     def _redact_event(self, event: Mapping[str, Any]) -> Mapping[str, Any]:
         redacted = _redact_sensitive(event, self._sensitive_values)
@@ -925,6 +926,10 @@ class CatxAgentClient:
             "environment_id": _environment_value(self._environment, self.profile.environment_id_env, "CATX Environment ID"),
             "vault_ids": list(self.profile.vault_ids),
         }
+        # CATX mounts repositories through the documented `resources` field.
+        # Keep the resource materialization in the connector so every session
+        # (including the first message) sees the same immutable mounts; tokens
+        # are resolved only in memory and never persisted in the profile.
         if self.profile.repository_resources:
             create_payload["resources"] = [
                 repository.request_resource(self._environment)
@@ -958,6 +963,18 @@ class CatxAgentClient:
             create_payload = dict(augmented)
         create = self._request_json("POST", "/sessions", create_payload)
         session_id = _safe_session_id(create.get("id"))
+        if binding is not None and getattr(self._binding_adapter, "verify_before_message", False):
+            # Binding must be proven immediately after creation and before the
+            # first user message is appended.  A session with unverifiable
+            # repository provenance is never allowed to execute.
+            try:
+                evidence = self.verify_binding(session_id, binding)
+                evidence.assert_matches(binding)
+            except Exception as exc:
+                raise CompanyApiRequestError(
+                    "CATX session %s was created but repository binding verification failed: %s" % (session_id, exc)
+                ) from exc
+            self.last_binding_evidence = evidence
         encoded = urllib.parse.quote(session_id, safe="")
         try:
             self._request_json(
@@ -986,6 +1003,27 @@ class CatxAgentClient:
         evidence = self._binding_adapter.verify_session(self, session, binding)
         if not isinstance(evidence, CatxBindingEvidence):
             raise CompanyApiRequestError("CATX binding adapter returned invalid evidence")
+        return evidence
+
+    def verify_binding_events(
+        self,
+        session_id: str,
+        binding: CatxExecutionBinding,
+        events: Sequence[Mapping[str, Any]],
+    ) -> CatxBindingEvidence:
+        """Upgrade request-level binding evidence using the complete event log."""
+        session = _safe_session_id(session_id)
+        if not isinstance(binding, CatxExecutionBinding):
+            raise TypeError("binding must be a CatxExecutionBinding")
+        if self._binding_adapter is None:
+            raise CompanyApiRequestError("CATX exact Skill/repository binding requires a binding adapter")
+        verifier = getattr(self._binding_adapter, "verify_event_log", None)
+        if not callable(verifier):
+            raise CompanyApiRequestError("CATX binding adapter cannot verify event logs")
+        evidence = verifier(self, session, binding, events)
+        if not isinstance(evidence, CatxBindingEvidence):
+            raise CompanyApiRequestError("CATX binding adapter returned invalid event evidence")
+        self.last_binding_evidence = evidence
         return evidence
 
     def get_status(self, session_id: str) -> Mapping[str, Any]:
@@ -1096,10 +1134,9 @@ class CatxAgentClient:
         usage = _catx_usage(status_document.get("usage", {}))
         trace = _catx_trace(events)
         truncated = len(events) >= self.profile.events_limit
-        completeness = ObservationCompleteness(
-            expected=frozenset(("output", "trace", "usage", "error", "metadata")),
-            observed=frozenset(("output", "trace", "usage", "error", "metadata")),
-        )
+        expected_fields = frozenset(("output", "trace", "usage", "error", "metadata"))
+        observed_fields = expected_fields if not truncated else frozenset(("output", "usage", "error", "metadata"))
+        completeness = ObservationCompleteness(expected=expected_fields, observed=observed_fields)
         observation = RunObservation(
             output=output,
             trace=trace,
@@ -1112,6 +1149,9 @@ class CatxAgentClient:
                 "catx_status": status,
                 "events_limit": self.profile.events_limit,
                 "trace_may_be_truncated": truncated,
+                "raw_event_count": len(events),
+                "required_event_types": ["user.message", "agent.message"],
+                "missing_required_event_types": [kind for kind in ("user.message", "agent.message") if not any(event.get("type") == kind for event in events)],
                 "observation_completeness": completeness.as_dict(),
             },
         )

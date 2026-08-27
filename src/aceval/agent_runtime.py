@@ -45,6 +45,9 @@ class ModelReply:
     content: str = ""
     tool_calls: Sequence[ToolCall] = ()
     usage: Mapping[str, Any] = field(default_factory=dict)
+    # Provider bridges may report the concrete model selected after resolving
+    # a CC Switch alias. Existing clients can omit this field.
+    model_id: Optional[str] = None
 
 
 class ModelClient(Protocol):
@@ -317,6 +320,7 @@ class CommandModelClient:
                 content=content,
                 tool_calls=tuple(calls),
                 usage=_validated_usage(raw_usage, "invalid model bridge response"),
+                model_id=(str(payload.get("model_id")) if payload.get("model_id") else None),
             )
         except (
             KeyError,

@@ -230,6 +230,35 @@ class RemoteAgentConfig:
 
 
 @dataclass(frozen=True)
+class ExecutorConfig:
+    """Role-oriented executor declaration.
+
+    ``trial_executor`` is the environment that runs cases.  The analysis
+    executor is deliberately separate so a remote trial provider is never
+    confused with the local IterationBrain.
+    """
+    provider: str
+    profile_path: Optional[str] = None
+    environment_contract_hash: Optional[str] = None
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "provider", _text(self.provider, "executor.provider", 128).lower())
+        if self.profile_path is not None:
+            object.__setattr__(self, "profile_path", str(Path(_text(self.profile_path, "executor.profile_path")).expanduser().resolve()))
+        if self.environment_contract_hash is not None:
+            _text(self.environment_contract_hash, "executor.environment_contract_hash", 256)
+
+    @classmethod
+    def from_mapping(cls, value: Any, label: str) -> "ExecutorConfig":
+        item = _object(value, label)
+        _reject_unknown(item, ("provider", "profile_path", "environment_contract_hash"), label)
+        return cls(item.get("provider", ""), item.get("profile_path"), item.get("environment_contract_hash"))
+
+    def to_dict(self) -> Mapping[str, Any]:
+        return {"provider": self.provider, "profile_path": self.profile_path, "environment_contract_hash": self.environment_contract_hash}
+
+
+@dataclass(frozen=True)
 class KernelPolicy:
     max_generated_cases: int = 12
     max_rounds: int = 5
@@ -312,6 +341,9 @@ class KernelConfig:
     local_analysis: LocalAnalysisConfig
     remote_agent: RemoteAgentConfig
     policy: KernelPolicy = field(default_factory=KernelPolicy)
+    trial_executor: Optional[ExecutorConfig] = None
+    analysis_executor: Optional[ExecutorConfig] = None
+    _legacy_executor_schema: bool = field(default=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         if self.api_version != KERNEL_CONFIG_API_VERSION:
@@ -320,14 +352,28 @@ class KernelConfig:
     @classmethod
     def from_mapping(cls, value: Any) -> "KernelConfig":
         item = _object(value, "Kernel config")
-        _reject_unknown(item, ("api_version", "skill_repository", "code_repository", "local_analysis", "remote_agent", "policy"), "Kernel config")
+        _reject_unknown(item, ("api_version", "skill_repository", "code_repository", "local_analysis", "remote_agent", "policy", "trial_executor", "analysis_executor"), "Kernel config")
+        has_trial = "trial_executor" in item and item.get("trial_executor") is not None
+        has_remote = "remote_agent" in item and item.get("remote_agent") is not None
+        if has_trial and has_remote:
+            raise KernelContractError("trial_executor and legacy remote_agent cannot be configured together")
+        legacy_remote = item.get("remote_agent")
+        trial = ExecutorConfig.from_mapping(item["trial_executor"], "trial_executor") if has_trial else None
+        remote_value = legacy_remote if has_remote else ({"profile_path": trial.profile_path} if trial and trial.profile_path else None)
+        trial_provider = trial.provider if trial is not None else "catx"
+        if trial_provider != "catx":
+            raise KernelContractError("trial_executor provider is unsupported; P0 requires catx")
+        analysis = ExecutorConfig.from_mapping(item["analysis_executor"], "analysis_executor") if item.get("analysis_executor") is not None else ExecutorConfig("local-forge")
         return cls(
             api_version=item.get("api_version", ""),
             skill_repository=RepositoryConfig.from_mapping(item.get("skill_repository"), "skill_repository"),
             code_repository=RepositoryConfig.from_mapping(item["code_repository"], "code_repository") if item.get("code_repository") is not None else None,
             local_analysis=LocalAnalysisConfig.from_mapping(item.get("local_analysis")),
-            remote_agent=RemoteAgentConfig.from_mapping(item.get("remote_agent")),
+            remote_agent=RemoteAgentConfig.from_mapping(remote_value),
             policy=KernelPolicy.from_mapping(item.get("policy", {})),
+            trial_executor=trial,
+            analysis_executor=analysis,
+            _legacy_executor_schema=not has_trial,
         )
 
     @classmethod
@@ -340,7 +386,8 @@ class KernelConfig:
             "skill_repository": self.skill_repository.to_dict(),
             "code_repository": self.code_repository.to_dict() if self.code_repository else None,
             "local_analysis": self.local_analysis.to_dict(),
-            "remote_agent": self.remote_agent.to_dict(),
+            **({"remote_agent": self.remote_agent.to_dict()} if self._legacy_executor_schema else {"trial_executor": self.trial_executor.to_dict() if self.trial_executor else None}),
+            "analysis_executor": self.analysis_executor.to_dict() if self.analysis_executor else None,
             "policy": self.policy.to_dict(),
         }
 
@@ -516,5 +563,5 @@ __all__ = [
     "ANALYSIS_DECISION_API_VERSION", "EVALUATION_DESIGN_API_VERSION", "KERNEL_CONFIG_API_VERSION",
     "KERNEL_INPUT_API_VERSION", "REMOTE_BATCH_API_VERSION", "KernelConfig", "KernelContractError",
     "KernelInput", "KernelPolicy", "LocalAnalysisConfig", "RemoteAgentConfig", "RepositoryConfig", "SKILL_HARNESS_OPERATIONS",
-    "UserCase", "contract_hash",
+    "UserCase", "ExecutorConfig", "contract_hash",
 ]

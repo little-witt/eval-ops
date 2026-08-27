@@ -68,6 +68,8 @@ V2 采用以下原则：
 - `failure_attribution.py`：环境、Driver、Fixture、Evaluator 和证据缺失不会误授权修改 Skill。
 - `orchestrator.py`：已有 baseline/candidate、dev/validation/holdout、硬回归和目标比较能力。
 - `iteration_kernel.py`：已有轮次、Token/会话预算、最小收益、耐心值和最大轮次停止条件。
+- `iteration_brain.py`：本地分析已拆为冻结证据、语义评分、跨 Case 归因和 Proposal 四阶段；每阶段使用严格 JSON、输入/输出 hash、可恢复 manifest 与追加式模型调用收据，模型失败不会覆盖既有证据。
+- `trial_environment.py`：每轮首次 Trial 冻结 Profile 内容、仓库 revision/tree、Fixture、Case revision 集与运行参数；初测、无 Skill 基线和通过 Case 复验必须使用同一 contract hash，跨轮重新冻结。
 
 ### 3.2 V2 工程落地结果与边界
 
@@ -515,6 +517,7 @@ V2 客户端继续以「任务详情 + 进化轨迹」为主场，但必须把�
 1. Fixture 合成与 Reference Run 自动校准。
 2. 种子 Case 扩展、metamorphic、fault injection、idempotency 与对抗样本生成。
 3. 从失败会话挖掘、脱敏、去重并晋升回归 Case。
+   P0 已为全部 Case 写入 `case_revision`、`content_hash`、`provenance`、`environment_applicability` 与 `reuse_key`，P1 在此基础上建设跨任务候选池与晋升策略，不改变当前任务内 EvalPack 精确复用能力。
 4. 语义 Judge 校准集、专家一致性指标、pairwise 盲化与偏差检测。
 5. 自适应重复与统计不确定性，保留小规模 Pareto frontier。
 

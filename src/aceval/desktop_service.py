@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
+from dataclasses import replace
 import json
 import os
 from pathlib import Path
@@ -22,6 +23,8 @@ from typing import Any, Callable, Mapping, Optional
 import uuid
 
 from . import __version__
+from .codex_profiles import CodexProfileManager, codex_env_allowlist
+from .claude_profiles import ClaudeProfileManager, ClaudeProfileError
 from .d2c import (
     D2C_PROFILE_API_VERSION,
     D2CBrowserProfile,
@@ -95,15 +98,87 @@ def _command_health(name: str, *version_args: str) -> Mapping[str, Any]:
 
 
 class DesktopService:
-    def __init__(self, task_root: Path) -> None:
+    def __init__(
+        self,
+        task_root: Path,
+        *,
+        model_profile_root: Optional[Path] = None,
+        codex_executable: Optional[str] = None,
+    ) -> None:
         self.task_root = task_root.expanduser().resolve()
         self.task_root.mkdir(parents=True, exist_ok=True)
+        self.model_profiles = CodexProfileManager(
+            model_profile_root or (self.task_root.parent / "model-profiles"),
+            codex_executable,
+        )
+        self.claude_profiles = ClaudeProfileManager(model_profile_root or (self.task_root.parent / "model-profiles"))
         self.kernel = IterationKernel(self.task_root)
         self.store = TaskStore(self.task_root)
         self.executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="aceval-desktop")
         self.operations: dict[str, dict[str, Any]] = {}
         self.task_operations: dict[str, str] = {}
         self.lock = threading.RLock()
+
+    def _local_analysis(self, raw: Any) -> Mapping[str, Any]:
+        if not isinstance(raw, Mapping) or raw.get("provider") not in ("codex", "claude"):
+            return raw
+        if raw.get("provider") == "claude":
+            allowed = {"provider", "profile_id", "model_id", "reasoning_effort", "timeout_seconds", "max_prompt_chars", "max_output_chars"}
+            unknown = sorted(set(raw).difference(allowed))
+            if unknown:
+                raise ValueError("Claude local analysis contains unsupported fields: %s" % ", ".join(unknown))
+            selected = self.claude_profiles.resolve_model(
+                str(raw.get("model_id") or ""),
+                str(raw["reasoning_effort"]) if raw.get("reasoning_effort") else None,
+            )
+            timeout = int(raw.get("timeout_seconds", 180))
+            command = [sys.executable, "--claude-bridge"] if getattr(sys, "frozen", False) else [sys.executable, "-m", "aceval.claude_bridge"]
+            command.extend(["--profile", str(self.claude_profiles.profile_path), "--model", selected["model"], "--effort", selected["effort"], "--timeout-seconds", str(timeout)])
+            return {
+                "model_command": command,
+                "model_id": "claude:%s" % selected["model"],
+                "api_base_url_env": None,
+                "api_key_env": None,
+                "env_allowlist": [],
+                "timeout_seconds": timeout + 15,
+                "max_prompt_chars": int(raw.get("max_prompt_chars", 48_000)),
+                "max_output_chars": int(raw.get("max_output_chars", 24_000)),
+            }
+        allowed = {
+            "provider", "profile_id", "model_id", "reasoning_effort",
+            "timeout_seconds", "max_prompt_chars", "max_output_chars",
+        }
+        unknown = sorted(set(raw).difference(allowed))
+        if unknown:
+            raise ValueError("Codex local analysis contains unsupported fields: %s" % ", ".join(unknown))
+        selected = self.model_profiles.resolve_model(
+            str(raw.get("profile_id") or "default"),
+            str(raw.get("model_id") or ""),
+            str(raw["reasoning_effort"]) if raw.get("reasoning_effort") else None,
+        )
+        timeout = int(raw.get("timeout_seconds", 180))
+        profile_home = self.model_profiles.root / selected["profile_id"]
+        if getattr(sys, "frozen", False):
+            command = [sys.executable, "--codex-bridge"]
+        else:
+            command = [sys.executable, "-m", "aceval.codex_bridge"]
+        command.extend([
+            "--codex-executable", str(self.model_profiles.codex_executable),
+            "--codex-home", str(profile_home),
+            "--model", selected["model"],
+            "--effort", selected["effort"],
+            "--timeout-seconds", str(timeout),
+        ])
+        return {
+            "model_command": command,
+            "model_id": "codex:%s" % selected["model"],
+            "api_base_url_env": None,
+            "api_key_env": None,
+            "env_allowlist": list(codex_env_allowlist()),
+            "timeout_seconds": timeout + 15,
+            "max_prompt_chars": int(raw.get("max_prompt_chars", 48_000)),
+            "max_output_chars": int(raw.get("max_output_chars", 24_000)),
+        }
 
     def _start_operation(self, kind: str, action: Callable[[], Any], *, task_id: Optional[str] = None) -> Mapping[str, Any]:
         with self.lock:
@@ -192,6 +267,7 @@ class DesktopService:
                         "chrome": d2c_health.get("versions", {}).get("chrome"),
                         "missing": d2c_health.get("missing", []),
                     },
+                    "codex": self.model_profiles.health(),
                 },
                 "capabilities": {
                     "skill_harness": True,
@@ -199,8 +275,52 @@ class DesktopService:
                     "d2c_browser_worker": True,
                     "visual_comparison": True,
                     "remote_agent": True,
+                    "codex_local_brain": True,
                 },
             }
+        if method == "models.list":
+            return {"profiles": list(self.model_profiles.list_profiles()) + [self.claude_profiles.profile()]}
+        if method == "models.import_codex_file":
+            return self.model_profiles.import_file(
+                str(params.get("profile_id") or "default"),
+                str(params.get("kind") or ""),
+                str(params.get("source_path") or ""),
+            )
+        if method == "models.import_codex_cc_switch":
+            return self.model_profiles.import_cc_switch(
+                str(params.get("profile_id") or "default"),
+                str(params.get("config_path") or ""),
+                str(params.get("auth_path") or ""),
+            )
+        if method == "models.import_cc_switch":
+            codex_error = None
+            try:
+                return self.model_profiles.import_cc_switch(
+                    str(params.get("profile_id") or "default"),
+                    str(params.get("config_path") or ""),
+                    str(params.get("auth_path") or ""),
+                )
+            except Exception as exc:
+                codex_error = str(exc)
+            try:
+                return self.claude_profiles.import_cc_switch(str(params.get("claude_settings_path") or ""))
+            except ClaudeProfileError as exc:
+                raise ValueError("CC Switch 未发现可用的 Codex 或 Claude Code 当前配置；Codex: %s；Claude: %s" % (codex_error, exc)) from exc
+        if method == "models.refresh_codex":
+            if str(params.get("profile_id") or "default") == "claude-default":
+                return self.claude_profiles.refresh_models()
+            return self.model_profiles.refresh_models(str(params.get("profile_id") or "default"))
+        if method == "models.test_codex":
+            if str(params.get("profile_id") or "default") == "claude-default":
+                return self.claude_profiles.test_model(
+                    str(params.get("model_id") or ""),
+                    str(params["reasoning_effort"]) if params.get("reasoning_effort") else None,
+                )
+            return self.model_profiles.test_model(
+                str(params.get("profile_id") or "default"),
+                str(params.get("model_id") or ""),
+                str(params["reasoning_effort"]) if params.get("reasoning_effort") else None,
+            )
         if method == "tasks.list":
             return {"tasks": self._task_list()}
         if method == "tasks.get":
@@ -210,7 +330,11 @@ class DesktopService:
                 "events": list(self.store.events(str(params.get("task_id") or ""), after_seq=int(params.get("after_seq", 0))))
             }
         if method == "tasks.create":
-            config = KernelConfig.from_mapping(params.get("config"))
+            config_value = _json_clone(params.get("config"))
+            if not isinstance(config_value, dict):
+                raise ValueError("task config must be an object")
+            config_value["local_analysis"] = self._local_analysis(config_value.get("local_analysis"))
+            config = KernelConfig.from_mapping(config_value)
             user_input = KernelInput.from_mapping(params.get("input"))
             task_id = params.get("task_id")
             return self.kernel.create_task(config, user_input, task_id=str(task_id) if task_id else None)
@@ -222,6 +346,42 @@ class DesktopService:
                 lambda: self.kernel.run_until_gate(task_id, max_steps=max_steps),
                 task_id=task_id,
             )
+        if method == "tasks.restart":
+            task_id = str(params.get("task_id") or "")
+            if not task_id:
+                raise ValueError("task_id is required")
+            # Restart from the immutable task input/config snapshot.  A new task
+            # keeps the failed task's audit trail intact while rerunning the
+            # complete lifecycle from `created`.
+            config = self.kernel._config(task_id)
+            # Force fresh managed checkouts for the new run; never point the
+            # restarted task at the previous task's mutable working copy.
+            config = replace(
+                config,
+                skill_repository=replace(config.skill_repository, local_path=None),
+                code_repository=(replace(config.code_repository, local_path=None) if config.code_repository else None),
+            )
+            user_input = self.kernel._input(task_id)
+            created = self.kernel.create_task(config, user_input)
+            new_task_id = str(created["task"]["id"])
+            operation = self._start_operation(
+                "kernel.run_until_gate",
+                lambda: self.kernel.run_until_gate(new_task_id),
+                task_id=new_task_id,
+            )
+            return {"task": created["task"], "state": created["state"], "operation": operation, "restarted_from": task_id}
+        if method == "tasks.retry_failed":
+            task_id = str(params.get("task_id") or "")
+            purpose = str(params.get("purpose") or "evaluation")
+            result = self.kernel.retry_failed(task_id, purpose=purpose)
+            return {
+                "retry": result,
+                "operation": self._start_operation(
+                    "kernel.run_until_gate",
+                    lambda: self.kernel.run_until_gate(task_id),
+                    task_id=task_id,
+                ),
+            }
         if method == "tasks.confirm":
             task_id = str(params.get("task_id") or "")
             supplement = KernelInput.from_mapping(params["supplement"]) if params.get("supplement") is not None else None
@@ -230,6 +390,7 @@ class DesktopService:
                 approve=bool(params.get("approve")),
                 supplement=supplement,
                 selected_capability_ids=tuple(str(item) for item in params.get("selected_capability_ids", ())),
+                selected_case_ids=tuple(str(item) for item in params.get("selected_case_ids", ())),
                 selected_change_ids=tuple(str(item) for item in params.get("selected_change_ids", ())),
                 user_feedback=str(params["user_feedback"]) if params.get("user_feedback") is not None else None,
             )
@@ -280,8 +441,8 @@ class DesktopService:
         raise ValueError("unsupported desktop method: %s" % method)
 
 
-def serve(task_root: Path) -> int:
-    service = DesktopService(task_root)
+def serve(task_root: Path, *, model_profile_root: Optional[Path] = None, codex_executable: Optional[str] = None) -> int:
+    service = DesktopService(task_root, model_profile_root=model_profile_root, codex_executable=codex_executable)
     write_lock = threading.Lock()
 
     def respond(value: Mapping[str, Any]) -> None:
@@ -311,9 +472,15 @@ def serve(task_root: Path) -> int:
 def main(argv: Optional[list[str]] = None) -> int:
     parser = argparse.ArgumentParser(prog="python -m aceval.desktop_service")
     parser.add_argument("--task-root", default=".aceval/tasks")
+    parser.add_argument("--model-profile-root")
+    parser.add_argument("--codex-executable")
     args = parser.parse_args(argv)
     try:
-        return serve(Path(args.task_root))
+        return serve(
+            Path(args.task_root),
+            model_profile_root=Path(args.model_profile_root) if args.model_profile_root else None,
+            codex_executable=args.codex_executable,
+        )
     except KeyboardInterrupt:
         return 0
 

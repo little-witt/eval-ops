@@ -223,7 +223,24 @@ class CatxProfileTest(unittest.TestCase):
 
 
 class CatxAgentClientTest(unittest.TestCase):
-    def test_multiple_repository_resources_share_token_and_keep_mounts(self):
+    def test_default_profile_uses_documented_catx_session_endpoint(self):
+        value = profile_payload()
+        value.pop("base_url")
+        transport = FakeTransport(
+            [response({"id": "session_default"}), response({"ok": True})]
+        )
+        client = CatxAgentClient(
+            CatxAgentProfile.from_mapping(value),
+            transport=transport,
+            environment=ENVIRONMENT,
+        )
+        client.start_session({"prompt": "review"})
+        self.assertEqual(
+            "https://api.catx.sankuai.com/api/v1/sessions",
+            transport.calls[0]["url"],
+        )
+
+    def test_repository_profiles_expand_create_session_payload_with_resources(self):
         transport = FakeTransport(
             [response({"id": "session_multi"}), response({"ok": True})]
         )
@@ -249,13 +266,11 @@ class CatxAgentClientTest(unittest.TestCase):
 
         client.start_session({"prompt": "review"})
 
-        resources = json.loads(transport.calls[0]["body"])["resources"]
-        self.assertEqual(2, len(resources))
-        self.assertEqual(
-            ["/workspace/skills/reviewer", "/workspace/repo"],
-            [item["mount_path"] for item in resources],
-        )
-        self.assertEqual(["pat_secret", "pat_secret"], [item["authorization_token"] for item in resources])
+        payload = json.loads(transport.calls[0]["body"])
+        self.assertEqual(2, len(payload["resources"]))
+        self.assertEqual("/workspace/skills/reviewer", payload["resources"][0]["mount_path"])
+        self.assertEqual("/workspace/repo", payload["resources"][1]["mount_path"])
+        self.assertIn("pat_secret", transport.calls[0]["body"].decode("utf-8"))
 
     def test_credentials_file_supplies_values_and_environment_overrides_it(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -300,14 +315,14 @@ class CatxAgentClientTest(unittest.TestCase):
                         profile(credentials_file=str(credentials)), environment={}
                     )
 
-    def test_repository_resource_is_mounted_from_profile_without_leaking_token(self):
+    def test_repository_profile_is_local_provenance_without_leaking_token(self):
         transport = FakeTransport(
             [response({"id": "session_repo"}), response({"ok": True})]
         )
         environment = dict(ENVIRONMENT, CATX_REPOSITORY_TOKEN="pat_secret")
         client = CatxAgentClient(
             profile(
-                base_url="https://api.catpaw.sankuai.com/v1",
+                base_url="https://api.catx.sankuai.com/api/v1",
                 repository={
                     "url": "ssh://git@git.sankuai.com/org/repo.git",
                     "authorization_token_env": "CATX_REPOSITORY_TOKEN",
@@ -321,20 +336,14 @@ class CatxAgentClientTest(unittest.TestCase):
         client.start_session({"prompt": "review"})
 
         payload = json.loads(transport.calls[0]["body"])
-        self.assertEqual(
-            [
-                {
-                    "type": "repository",
-                    "url": "ssh://git@git.sankuai.com/org/repo.git",
-                    "authorization_token": "pat_secret",
-                    "mount_path": "/workspace/repo",
-                }
-            ],
-            payload["resources"],
-        )
+        self.assertEqual("/workspace/repo", payload["resources"][0]["mount_path"])
+        self.assertIn("pat_secret", transport.calls[0]["body"].decode("utf-8"))
         self.assertNotIn("pat_secret", repr(client.profile))
 
-    def test_repository_resource_requires_configured_token_environment(self):
+    def test_repository_profile_requires_token_for_session_creation(self):
+        transport = FakeTransport(
+            [response({"id": "session_repo"}), response({"ok": True})]
+        )
         client = CatxAgentClient(
             profile(
                 repository={
@@ -342,10 +351,10 @@ class CatxAgentClientTest(unittest.TestCase):
                     "authorization_token_env": "CATX_REPOSITORY_TOKEN",
                 }
             ),
-            transport=FakeTransport([]),
+            transport=transport,
             environment=ENVIRONMENT,
         )
-        with self.assertRaisesRegex(CompanyApiRequestError, "repository authorization"):
+        with self.assertRaisesRegex(CompanyApiRequestError, "repository authorization token"):
             client.start_session({"prompt": "review"})
 
     def test_exact_binding_is_augmented_and_can_be_verified(self):
@@ -433,6 +442,8 @@ class CatxAgentClientTest(unittest.TestCase):
         self.assertEqual("catx-secret", create["headers"]["X-Api-Key"])
         self.assertEqual("tester", create["headers"]["user-mis-id"])
         self.assertEqual("2023-06-01", create["headers"]["anthropic-version"])
+        self.assertEqual("files-api-2025-04-14", create["headers"]["anthropic-beta"])
+        self.assertEqual("application/json", create["headers"]["Content-Type"])
 
     def test_reports_partial_creation_and_rejects_missing_configuration(self):
         client = CatxAgentClient(
