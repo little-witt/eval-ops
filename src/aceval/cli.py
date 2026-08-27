@@ -1524,9 +1524,12 @@ def _code_review_online_run(args: argparse.Namespace) -> int:
     )
     execution_path = None
     if args.execution_path:
-        execution_path = ExecutionPathSpec.from_mapping(
-            _json_value("@" + args.execution_path, "execution path")
-        )
+        # The online suite accepts either one legacy path or a case-id path
+        # catalog.  Resolution happens per Case so a catalog is not flattened
+        # into one global route before execution.
+        execution_path = _json_value("@" + args.execution_path, "execution path")
+        if not isinstance(execution_path, Mapping):
+            raise ValueError("execution path must be a JSON object")
     store = TaskStore(args.task_root) if args.task_id else None
     summary = run_online_review_suite(
         profile,

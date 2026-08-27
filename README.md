@@ -118,8 +118,7 @@ commit 一一关联。代码执行进程与领域 Grader 可以物理隔离，�
 
 ```bash
 PYTHONPATH=src python3 -m pytest -q
-cd desktop
-node tests/renderer-contract.test.mjs
+node desktop/tests/renderer-contract.test.mjs
 ```
 
 真实浏览器发布烟测入口为 `tests/run_real_d2c_smoke.py`。测试产物写入 `.aceval/`，不会进入 Git。
@@ -128,6 +127,7 @@ node tests/renderer-contract.test.mjs
 
 - [docs/current/FINAL_SYSTEM_ARCHITECTURE.md](docs/current/FINAL_SYSTEM_ARCHITECTURE.md)：唯一有效的产品与系统架构；
 - [docs/current/EVALUATION_SELF_ITERATION_KERNEL_V2.md](docs/current/EVALUATION_SELF_ITERATION_KERNEL_V2.md)：Case、路径、Verdict、诊断和收敛算法；
+- [docs/current/SKILL_EVALUATION_CASE_PIPELINE_V3.md](docs/current/SKILL_EVALUATION_CASE_PIPELINE_V3.md)：路径先行的 Case 生成、完整 Trace、统一评分与总结分析演进方案；
 - [design/desktop-v2/PRODUCT_DESIGN_V2.md](design/desktop-v2/PRODUCT_DESIGN_V2.md)：已确认桌面信息架构与视觉基线；
 - [docs/current/PRODUCT_RELEASE_READINESS.md](docs/current/PRODUCT_RELEASE_READINESS.md)：当前实现、验证证据与发布边界；
 - [docs/reference/EVALPACK_SPEC.md](docs/reference/EVALPACK_SPEC.md)：EvalPack 兼容规范；

@@ -14,7 +14,11 @@ from typing import Any, Mapping, Optional, Sequence, Tuple, Union
 from .catx import CatxAgentClient, CatxAgentProfile
 from .code_review import CodeReviewFindingsGrader, repository_observation
 from .contracts import GradeResult, Oracle, as_primitive
-from .execution_path import ExecutionPathSpec, evaluate_trace_conformance
+from .execution_path import (
+    ExecutionPathInput,
+    evaluate_trace_conformance,
+    resolve_execution_path,
+)
 from .task_center import TaskStore
 
 
@@ -249,7 +253,7 @@ def run_online_review_case(
     poll_interval_seconds: float = 5.0,
     max_wait_seconds: float = 1200.0,
     infrastructure_retries: int = 1,
-    execution_path: Optional[ExecutionPathSpec] = None,
+    execution_path: Optional[ExecutionPathInput] = None,
 ) -> Mapping[str, Any]:
     run_dir = Path(output_dir)
     prompt = build_online_review_prompt(
@@ -302,12 +306,13 @@ def run_online_review_case(
     binding_ok, binding_evidence = _binding_verified(bundle, case, skill_commit)
     expectations = _expectation_results(grade, binding_ok, binding_evidence)
     path_conformance = None
-    if execution_path is not None:
+    case_path = resolve_execution_path(execution_path, case.id)
+    if case_path is not None:
         trace_complete = bool(bundle.completeness.trace) and not bool(
             bundle.observation.metadata.get("trace_may_be_truncated", False)
         )
         path_conformance = evaluate_trace_conformance(
-            execution_path,
+            case_path,
             [as_primitive(event) for event in bundle.trace],
             trace_complete=trace_complete,
         )
@@ -408,11 +413,17 @@ def run_online_review_suite(
     task_store: Optional[TaskStore] = None,
     task_id: Optional[str] = None,
     iteration: int = 0,
-    execution_path: Optional[ExecutionPathSpec] = None,
+    execution_path: Optional[ExecutionPathInput] = None,
 ) -> Mapping[str, Any]:
     root = Path(workspace).expanduser().resolve()
     root.mkdir(parents=True, exist_ok=True)
     cases = load_online_review_cases(lab_root, stacks=stacks, case_ids=case_ids)
+    # Resolve every selected path before creating a CATX client or starting a
+    # Session.  A malformed later catalog entry must not leave earlier Cases
+    # already executed under a partially valid evaluation design.
+    execution_paths = {
+        case.id: resolve_execution_path(execution_path, case.id) for case in cases
+    }
     client = CatxAgentClient(profile)
     results = []
     evals = []
@@ -456,7 +467,7 @@ def run_online_review_suite(
                 skill_commit=skill_commit,
                 output_dir=run_dir,
                 title_prefix=f"aceval {configuration}",
-                execution_path=execution_path,
+                execution_path=execution_paths[case.id],
             )
         except Exception as exc:
             if task_store and task_id:

@@ -138,6 +138,7 @@
   }
 
   function resultPill(payload) {
+    payload = payload || {};
     let label = payload.status || "unavailable";
     let className = "result-pill";
     if (payload.formal_pass) {
@@ -148,6 +149,20 @@
       className += " fail";
     }
     return node("span", className, label);
+  }
+
+  function scorePill(payload) {
+    const score = payload && payload.score ? payload.score.overall : null;
+    const status = payload && payload.score && payload.score.hard_gate ? "gate pass" : score == null ? "N/M" : `${(score * 100).toFixed(0)}%`;
+    const className = payload && payload.score && payload.score.hard_gate ? "result-pill pass" : score == null ? "result-pill" : "result-pill fail";
+    return node("span", className, status);
+  }
+
+  function pathPill(payload) {
+    const status = payload && payload.path_status;
+    const coverage = payload && typeof payload.path_coverage === "number" ? ` ${(payload.path_coverage * 100).toFixed(0)}%` : "";
+    const className = status === "pass" ? "result-pill pass" : status === "fail" ? "result-pill fail" : "result-pill";
+    return node("span", className, `${status || "N/M"}${coverage}`);
   }
 
   function renderCases(graph) {
@@ -164,11 +179,169 @@
       const candidateCell = node("td");
       candidateCell.appendChild(resultPill(item.candidate));
       row.appendChild(candidateCell);
+      const pathCell = node("td");
+      pathCell.appendChild(pathPill(item.candidate || item.baseline));
+      row.appendChild(pathCell);
+      const scoreCell = node("td");
+      scoreCell.appendChild(scorePill(item.candidate || item.baseline));
+      row.appendChild(scoreCell);
       const binding = item.candidate.binding_verified || item.baseline.binding_verified;
       const bindingCell = node("td");
       bindingCell.appendChild(node("span", `result-pill ${binding ? "pass" : "fail"}`, binding ? "verified" : "missing"));
       row.appendChild(bindingCell);
       target.appendChild(row);
+    });
+  }
+
+  function renderPathAnalysis(graph) {
+    const target = byId("path-analysis");
+    if (!target) return;
+    clear(target);
+    const design = graph.evaluation_design || {};
+    const sourceCases = Array.isArray(design.cases) ? design.cases : [];
+    const analysis = graph.path_analysis || {};
+    const summary = node("div", "path-analysis-summary");
+    const summaryStats = [
+      ["Cases", analysis.case_count ?? sourceCases.length],
+      ["有路径", analysis.cases_with_paths ?? sourceCases.filter(item => item.path_graph).length],
+      ["路径定义率", typeof analysis.coverage_rate === "number" ? `${(analysis.coverage_rate * 100).toFixed(1)}%` : "—"],
+    ];
+    summaryStats.forEach(([label, value]) => {
+      const stat = node("div", "path-summary-stat");
+      stat.appendChild(node("span", "", label));
+      stat.appendChild(node("strong", "", value));
+      summary.appendChild(stat);
+    });
+    target.appendChild(summary);
+
+    if (!sourceCases.length) {
+      target.appendChild(node("p", "empty-state", "暂无可展示的执行路径。路径定义会在评测设计编译后冻结。"));
+      return;
+    }
+    sourceCases.forEach((item) => {
+      const path = item.path || design.paths?.[item.id];
+      const graphValue = item.path_graph || design.path_graphs?.[item.id];
+      const card = node("article", "path-case-card");
+      const header = node("header", "path-case-head");
+      const copy = node("div");
+      copy.appendChild(node("span", "eyebrow", "CASE PATH"));
+      copy.appendChild(node("h4", "", item.id));
+      copy.appendChild(node("p", "path-prompt", item.prompt || "—"));
+      header.appendChild(copy);
+      const source = node("span", "path-source", item.path_source || "未记录来源");
+      header.appendChild(source);
+      card.appendChild(header);
+
+      const body = node("div", "path-case-body");
+      const route = node("div", "path-route");
+      route.appendChild(node("div", "path-route-title", path?.purpose || "预期执行路径"));
+      const steps = graphValue?.nodes || path?.steps || [];
+      const baseline = sourceCases.find(value => value.id === item.id)?.baseline || item.baseline || {};
+      const candidate = sourceCases.find(value => value.id === item.id)?.candidate || item.candidate || {};
+      const stepStates = (run) => Object.fromEntries((run?.path_conformance?.steps || []).map(step => [step.id, step]));
+      const baselineStates = stepStates(baseline);
+      const candidateStates = stepStates(candidate);
+      const observedStates = Object.keys(candidateStates).length ? candidateStates : baselineStates;
+      const graphFlow = node("div", "path-graph-flow");
+      steps.forEach((step, index) => {
+        const id = step.id || `step-${index + 1}`;
+        const kind = step.kind || "required";
+        const observed = observedStates[id];
+        const box = node("div", `path-graph-node ${kind}`);
+        box.appendChild(node("b", "", String(index + 1).padStart(2, "0")));
+        box.appendChild(node("span", "", step.label || id));
+        box.title = `${step.label || id} · ${kind}`;
+        if (observed) box.classList.add(kind === "forbidden" ? (observed.observed ? "violation" : "clear") : observed.observed ? "observed" : "missing");
+        graphFlow.appendChild(box);
+      });
+      route.appendChild(graphFlow);
+      const listTarget = node("ol", "path-route-list");
+      steps.forEach((step, index) => {
+        const id = step.id || `step-${index + 1}`;
+        const observed = observedStates[id];
+        const kind = step.kind || "required";
+        let observedClass = "unmeasured";
+        let badge = "not measured";
+        if (observed) {
+          if (kind === "forbidden") {
+            observedClass = observed.observed ? "violation" : "clear";
+            badge = observed.observed ? "violation" : "clear";
+          } else if (kind === "required") {
+            observedClass = observed.observed ? "observed" : "missing";
+            badge = observed.observed ? "observed" : "missing";
+          } else {
+            observedClass = observed.observed ? "observed" : "optional";
+            badge = observed.observed ? "observed" : "optional";
+          }
+        }
+        const row = node("li", `path-route-step ${kind} ${observedClass}`);
+        row.appendChild(node("b", "path-step-number", String(index + 1).padStart(2, "0")));
+        const detail = node("span", "path-step-detail");
+        detail.appendChild(node("strong", "", step.label || id));
+        const after = Array.isArray(step.after) && step.after.length
+          ? `after: ${step.after.join(", ")}`
+          : step.after_explicit ? "无顺序约束" : "兼容旧数据：按列表顺序";
+        detail.appendChild(node("small", "", `${step.kind || "required"} · ${after}`));
+        detail.appendChild(node("code", "", JSON.stringify(step.match || {})));
+        row.appendChild(detail);
+        row.appendChild(node("em", "", badge));
+        listTarget.appendChild(row);
+      });
+      route.appendChild(listTarget);
+      const edges = graphValue?.edges || [];
+      if (edges.length) {
+        const edgeLine = node("p", "path-edges");
+        edgeLine.appendChild(node("b", "", "分支 / 顺序："));
+        edgeLine.appendChild(node("span", "", edges.map(edge => {
+          const annotation = [edge.relation, edge.condition].filter(Boolean).join(" / ");
+          return `${edge.source} → ${edge.target}${annotation ? ` [${annotation}]` : ""}`;
+        }).join(" · ")));
+        route.appendChild(edgeLine);
+      }
+      if (graphValue?.mermaid) {
+        const diagram = node("details", "path-diagram");
+        diagram.appendChild(node("summary", "", "嵌入式流程图源码（Mermaid）"));
+        diagram.appendChild(node("pre", "path-mermaid", graphValue.mermaid));
+        route.appendChild(diagram);
+      }
+      body.appendChild(route);
+
+      const runs = node("div", "path-run-grid");
+      [["BASELINE", baseline], ["CANDIDATE", candidate]].forEach(([label, run]) => {
+        const panel = node("section", "path-run-panel");
+        panel.appendChild(node("h5", "", label));
+        const pills = node("div", "trace-tags");
+        pills.appendChild(pathPill(run));
+        pills.appendChild(scorePill(run));
+        const traceLabel = run.trace_complete === true ? "日志完整" : run.trace_complete === false ? "日志不完整 / 不可评估" : "日志完整性未测量";
+        const traceClass = run.trace_complete === true ? "tag-ok" : run.trace_complete === false ? "tag-warn" : "";
+        pills.appendChild(node("span", `tag ${traceClass}`, traceLabel));
+        pills.appendChild(node("span", "tag", `重试 ${run.retry_count ?? 0}`));
+        pills.appendChild(node("span", "tag", `${run.tokens ?? 0} tokens`));
+        pills.appendChild(node("span", "tag", `${Number(run.duration_seconds || 0).toFixed(1)}s`));
+        panel.appendChild(pills);
+        const dimensions = run.score_dimensions || run.score?.dimensions || {};
+        const scoreList = node("ul", "score-list");
+        Object.values(dimensions).forEach((dimension) => {
+          if (!dimension || !dimension.label) return;
+          const score = typeof dimension.score === "number" ? `${(dimension.score * 100).toFixed(0)}%` : "N/M";
+          const row = node("li", `score-row ${dimension.status || "not_measured"}`);
+          row.appendChild(node("span", "", dimension.label));
+          row.appendChild(node("strong", "", `${score} · ${dimension.status || "not measured"}`));
+          scoreList.appendChild(row);
+        });
+        panel.appendChild(scoreList);
+        const session = run.evidence?.session;
+        const attempts = run.evidence?.attempts;
+        const refs = node("div", "path-evidence-refs");
+        refs.appendChild(node("code", "", `session: ${session || "—"}`));
+        refs.appendChild(node("code", "", `attempts: ${attempts || "—"}`));
+        panel.appendChild(refs);
+        runs.appendChild(panel);
+      });
+      body.appendChild(runs);
+      card.appendChild(body);
+      target.appendChild(card);
     });
   }
 
@@ -438,6 +611,7 @@
     renderTree(graph);
     renderDimensions(graph);
     renderCases(graph);
+    renderPathAnalysis(graph);
     renderConfiguration(graph);
     const preferred = state.selectedNode && graph.nodes.some((item) => item.id === state.selectedNode)
       ? state.selectedNode

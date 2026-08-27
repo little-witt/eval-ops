@@ -72,6 +72,7 @@
             <button class="view-tab active" data-view="tree">优化树</button>
             <button class="view-tab" data-view="dimensions">维度诊断</button>
             <button class="view-tab" data-view="cases">Case 矩阵</button>
+            <button class="view-tab" data-view="paths">路径分析</button>
             <button class="view-tab" data-view="configuration">环境配置</button>
           </div>
           <p id="stage-caption">每个节点都必须回答：为什么、改什么、效果、决策、下一步。</p>
@@ -111,10 +112,19 @@
           </div>
           <div class="table-wrap">
             <table>
-              <thead><tr><th>Case</th><th>Stack</th><th>类型</th><th>Baseline</th><th>Candidate</th><th>Binding</th></tr></thead>
+              <thead><tr><th>Case</th><th>Stack</th><th>类型</th><th>Baseline</th><th>Candidate</th><th>路径</th><th>评分</th><th>Binding</th></tr></thead>
               <tbody id="case-table"></tbody>
             </table>
           </div>
+        </section>
+
+        <section id="paths-view" class="view" aria-label="路径分析">
+          <div class="view-intro">
+            <p class="eyebrow">EXECUTION PATH EVIDENCE</p>
+            <h3>预期路径、实际 Trace 与逐 Case 评分</h3>
+            <p>路径定义与结果评分分开呈现：缺失、绕行和禁止步骤不会被结果分数掩盖；日志不完整时明确标记为不可评估。</p>
+          </div>
+          <div id="path-analysis" class="path-analysis"></div>
         </section>
 
         <section id="configuration-view" class="view" aria-label="环境配置">

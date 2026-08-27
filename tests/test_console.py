@@ -219,6 +219,215 @@ class OptimizationConsoleTest(unittest.TestCase):
         self.assertNotIn("actual-model-secret", task_center)
         self.assertIn("<2 arguments hidden>", task_center)
 
+    def test_graph_exposes_authored_path_trace_and_score_vector(self):
+        """The read model keeps process conformance separate from outcome score."""
+        path = {
+            "api_version": "aceval.execution-path-spec/v1",
+            "purpose": "读取 Skill 后完成审查",
+            "trace_completeness_required": True,
+            "steps": [
+                {
+                    "id": "load",
+                    "label": "读取 Skill",
+                    "kind": "required",
+                    "match": {"event_type": "tool_call", "contains": "SKILL.md"},
+                    "after": [],
+                },
+                {
+                    "id": "publish",
+                    "label": "不得发布 Skill",
+                    "kind": "forbidden",
+                    "match": {
+                        "contains": [
+                            "git push",
+                            "https://user:actual-url-secret@example.test/repo.git",
+                            "Authorization: Basic YWN0dWFsLXBhdGgtc2VjcmV0",
+                        ],
+                        "authorization_token": "actual-path-secret",
+                    },
+                    "after": ["load"],
+                },
+            ],
+        }
+        (self.workspace / "execution-paths.json").write_text(
+            json.dumps({"paths": {"ts-web-case": path}}), encoding="utf-8"
+        )
+        run = self.workspace / "iteration-2" / "eval-01-ts-web-case" / "with_skill" / "run-1"
+        (run / "path_conformance.json").write_text(
+            json.dumps({"status": "pass", "coverage": 1.0, "steps": [
+                {"id": "load", "observed": True},
+                {"id": "publish", "observed": False},
+            ]}), encoding="utf-8"
+        )
+        (run / "outputs").mkdir(exist_ok=True)
+        (run / "outputs" / "session.json").write_text(
+            json.dumps({"completeness": {"trace": True}, "observation": {
+                "trace": [{"kind": "tool_call", "tool": "read_file"}, {"kind": "tool_result"}],
+                "metadata": {},
+            }}), encoding="utf-8"
+        )
+        (run / "outputs" / "attempts.json").write_text(
+            json.dumps([{"attempt": 1}]), encoding="utf-8"
+        )
+        graph = compile_optimization_graph(self.workspace, plan_path=self.plan)
+        case = graph["evaluation_design"]["cases"][0]
+        self.assertEqual(2, case["path_graph"]["step_count"])
+        self.assertIn("flowchart TD", case["path_graph"]["mermaid"])
+        self.assertIn("-->", case["path_graph"]["mermaid"])
+        self.assertEqual("pass", case["candidate"]["path_status"])
+        self.assertTrue(case["candidate"]["trace_complete"])
+        self.assertEqual(0, case["candidate"]["retry_count"])
+        self.assertIn("outcome", case["candidate"]["score_dimensions"])
+        self.assertEqual("pass", case["candidate"]["score_dimensions"]["evidence"]["status"])
+        self.assertFalse(case["candidate"]["score"]["hard_gate"])
+        self.assertNotIn("actual-path-secret", json.dumps(case["path"]))
+        self.assertNotIn("actual-url-secret", json.dumps(case["path"]))
+        self.assertNotIn("YWN0dWFsLXBhdGgtc2VjcmV0", json.dumps(case["path"]))
+        self.assertIn("path_analysis", graph)
+
+    def test_incomplete_trace_blocks_hard_gate_even_with_perfect_outcome(self):
+        run = self.workspace / "iteration-2" / "eval-01-ts-web-case" / "with_skill" / "run-1"
+        (run / "grading.json").write_text(
+            json.dumps(
+                {
+                    "summary": {"pass_rate": 1.0},
+                    "formal_grade": {"status": "pass"},
+                    "binding_verified": True,
+                    "expectations": [
+                        {"text": "Strict JSON", "passed": True, "evidence": "result"}
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+        (run / "outputs").mkdir(exist_ok=True)
+        (run / "outputs" / "session.json").write_text(
+            json.dumps(
+                {
+                    "completeness": {"trace": False},
+                    "observation": {
+                        "trace": [{"kind": "tool_call", "tool": "read_file"}],
+                        "metadata": {"trace_may_be_truncated": True},
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        graph = compile_optimization_graph(self.workspace, plan_path=self.plan)
+        candidate = graph["evaluation_design"]["cases"][0]["candidate"]
+        self.assertEqual(1.0, candidate["pass_rate"])
+        self.assertFalse(candidate["trace_complete"])
+        self.assertFalse(candidate["score"]["hard_gate"])
+
+    def test_missing_trace_completeness_remains_unmeasured(self):
+        run = self.workspace / "iteration-2" / "eval-01-ts-web-case" / "with_skill" / "run-1"
+        (run / "grading.json").write_text(
+            json.dumps(
+                {
+                    "summary": {"pass_rate": 1.0},
+                    "formal_grade": {"status": "pass"},
+                    "binding_verified": True,
+                    "expectations": [{"text": "Strict JSON", "passed": True}],
+                }
+            ),
+            encoding="utf-8",
+        )
+        (run / "outputs").mkdir(exist_ok=True)
+        (run / "outputs" / "session.json").write_text(
+            json.dumps(
+                {
+                    "observation": {
+                        "trace": [{"kind": "tool_call", "tool": "read_file"}],
+                        "metadata": {},
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+        graph = compile_optimization_graph(self.workspace, plan_path=self.plan)
+        candidate = graph["evaluation_design"]["cases"][0]["candidate"]
+        self.assertIsNone(candidate["trace_complete"])
+        self.assertEqual(
+            "not_measured", candidate["score_dimensions"]["evidence"]["status"]
+        )
+
+    def test_string_false_binding_cannot_pass_the_binding_dimension(self):
+        run = self.workspace / "iteration-2" / "eval-01-ts-web-case" / "with_skill" / "run-1"
+        (run / "grading.json").write_text(
+            json.dumps(
+                {
+                    "summary": {"pass_rate": 1.0},
+                    "formal_grade": {"status": "pass"},
+                    "binding_verified": "false",
+                    "expectations": [{"text": "Strict JSON", "passed": "false"}],
+                }
+            ),
+            encoding="utf-8",
+        )
+        graph = compile_optimization_graph(self.workspace, plan_path=self.plan)
+        candidate = graph["evaluation_design"]["cases"][0]["candidate"]
+        self.assertFalse(candidate["binding_verified"])
+        self.assertEqual("fail", candidate["score_dimensions"]["binding"]["status"])
+        self.assertEqual("fail", candidate["score_dimensions"]["format"]["status"])
+        self.assertFalse(candidate["score"]["hard_gate"])
+
+    def test_v3_graph_preserves_conditional_edges_without_inventing_node_order(self):
+        (self.workspace / "execution-paths.json").write_text(
+            json.dumps(
+                {
+                    "paths": {
+                        "ts-web-case": {
+                            "api_version": "aceval.path-analysis/v3",
+                            "nodes": [
+                                {
+                                    "step_id": "call",
+                                    "action": "调用工具",
+                                    "requiredness": "required",
+                                    "match": {"contains": "call"},
+                                },
+                                {
+                                    "step_id": "retry",
+                                    "action": "超时重试",
+                                    "requiredness": "recommended",
+                                    "match": {"contains": "retry"},
+                                },
+                                {
+                                    "step_id": "finish",
+                                    "action": "完成",
+                                    "requiredness": "required",
+                                    "match": {"contains": "finish"},
+                                },
+                            ],
+                            "edges": [
+                                {
+                                    "from": "call",
+                                    "to": "retry",
+                                    "kind": "failure",
+                                    "when": "exit_code=timeout",
+                                }
+                            ],
+                        }
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+        graph = compile_optimization_graph(self.workspace, plan_path=self.plan)
+        path_graph = graph["evaluation_design"]["cases"][0]["path_graph"]
+        self.assertEqual(
+            [
+                {
+                    "source": "call",
+                    "target": "retry",
+                    "relation": "failure",
+                    "condition": "exit_code=timeout",
+                }
+            ],
+            path_graph["edges"],
+        )
+        self.assertIn("failure · exit_code=timeout", path_graph["mermaid"])
+        self.assertEqual(1, path_graph["mermaid"].count("-->"))
+
 
 if __name__ == "__main__":
     unittest.main()
