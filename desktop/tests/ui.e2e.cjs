@@ -1,6 +1,34 @@
-const { chromium } = require("/Users/liuzhenni/.cache/codex-runtimes/codex-primary-runtime/dependencies/node/node_modules/playwright");
+const { existsSync } = require("node:fs");
 const { mkdir } = require("node:fs/promises");
 const path = require("node:path");
+
+function loadChromium() {
+  const candidates = [
+    process.env.PLAYWRIGHT_MODULE,
+    "playwright",
+    path.resolve(__dirname, "../../node_modules/playwright"),
+    path.resolve(__dirname, "../node_modules/playwright"),
+  ].filter(Boolean);
+  const failures = [];
+  for (const candidate of candidates) {
+    try {
+      const loaded = require(candidate);
+      if (loaded?.chromium) return loaded.chromium;
+      failures.push(`${candidate}（没有 chromium 导出）`);
+    } catch (error) {
+      failures.push(`${candidate}（${error.code || error.message}）`);
+    }
+  }
+  throw new Error(`未找到可用的 Playwright。请先在本机安装 playwright，或设置 PLAYWRIGHT_MODULE 指向已安装模块。尝试过：${failures.join("；")}`);
+}
+
+let chromium;
+try {
+  chromium = loadChromium();
+} catch (error) {
+  console.error(`[ui.e2e] ${error.message}`);
+  process.exit(2);
+}
 
 const task = { id:"review-skill-001", skill:{ name:"frontend-code-reviewer", source:"ssh://git@example/skill.git@feature/eval" }, scenario:"code-review", goal:"稳定发现高价值缺陷，输出可定位、可执行、无猜测的评审意见", status:"awaiting_confirmation", current_iteration:1 };
 const state = { phase:"awaiting_confirmation", iteration:1, champion_commit:"a".repeat(40), challenger_commit:"b".repeat(40), candidate_status:"evaluating", environment_contract_hash:`sha256:${"c".repeat(64)}` };
@@ -28,7 +56,19 @@ const modelProfile = { id:"default",provider:"codex",ready:true,config_ready:tru
 
 let browser;
 (async () => {
-  browser = await chromium.launch({ headless:true, executablePath:"/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" });
+  const executableCandidates = [
+    process.env.PLAYWRIGHT_EXECUTABLE_PATH,
+    process.env.CHROME_PATH,
+    "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+  ].filter(Boolean);
+  const executablePath = executableCandidates.find((candidate) => existsSync(candidate));
+  const launchOptions = { headless:true };
+  if (executablePath) launchOptions.executablePath = executablePath;
+  try {
+    browser = await chromium.launch(launchOptions);
+  } catch (error) {
+    throw new Error(`无法启动 Playwright 浏览器${executablePath ? `（${executablePath}）` : ""}：${error.message}。可设置 PLAYWRIGHT_EXECUTABLE_PATH，或执行 npx playwright install chromium。`);
+  }
   const page = await browser.newPage({ viewport:{ width:1540,height:980 }, deviceScaleFactor:1 });
   const errors = [];
   page.on("console", message => { if (message.type() === "error") errors.push(message.text()); });
@@ -51,11 +91,11 @@ let browser;
   }, { snapshot,task,state,modelProfile });
   await page.goto("http://127.0.0.1:8877/index.html");
   await page.getByRole("heading", { name:"frontend-code-reviewer" }).waitFor();
-  await page.getByRole("button", { name:"Case / Path" }).click();
+  await page.getByRole("button", { name:"Case / 路径" }).click();
   await page.locator(".case-card").filter({ hasText:"react-effect-cleanup" }).first().waitFor();
   await page.getByRole("button", { name:"会话日志" }).click();
-  await page.getByText("查看 user.message、工具调用、返回与终端事件").first().click();
-  await page.getByText("Immutable session evidence").waitFor();
+  await page.getByText("查看用户消息、工具调用、返回和终止事件").first().click();
+  await page.getByText("不可变会话证据").waitFor();
   await page.locator('[data-action="close-modal"]').click();
   await page.getByRole("button", { name:"分析 / 决策" }).click();
   await page.getByText("增加异步竞态的证据检查表").waitFor();

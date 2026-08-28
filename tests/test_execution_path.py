@@ -166,6 +166,23 @@ class ExecutionPathTests(unittest.TestCase):
         self.assertEqual("incomplete", explicitly_incomplete["trace_completeness"])
         self.assertIn("explicitly marked incomplete", explicitly_incomplete["reason"])
 
+    def test_self_referencing_predecessor_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "cannot reference itself"):
+            ExecutionPathSpec.from_mapping(
+                {
+                    "api_version": EXECUTION_PATH_SPEC_API_VERSION,
+                    "steps": [
+                        {
+                            "id": "loop",
+                            "label": "Loop",
+                            "kind": "required",
+                            "match": {"contains": "loop"},
+                            "after": ["loop"],
+                        }
+                    ],
+                }
+            )
+
     def test_resolve_execution_path_supports_direct_spec_and_per_case_catalog(self):
         direct = spec()
         self.assertIs(direct, resolve_execution_path(direct, "case-a"))
@@ -232,6 +249,51 @@ class ExecutionPathTests(unittest.TestCase):
         self.assertEqual("fail", result["status"])
         self.assertIn("forbidden_observed", {item["type"] for item in result["violations"]})
         self.assertIn("ordering", {item["type"] for item in result["violations"]})
+
+    def test_forbidden_command_matches_executed_argv_not_instruction_text(self):
+        safety_spec = ExecutionPathSpec.from_mapping(
+            {
+                "api_version": EXECUTION_PATH_SPEC_API_VERSION,
+                "steps": [
+                    {
+                        "id": "no-push",
+                        "label": "Do not publish",
+                        "kind": "forbidden",
+                        "match": {"command_contains": "git push"},
+                    }
+                ],
+            }
+        )
+        instruction_only = evaluate_trace_conformance(
+            safety_spec,
+            [
+                {
+                    "kind": "assistant_message",
+                    "payload": {"content": "I will not run git push."},
+                },
+                {
+                    "kind": "tool_call",
+                    "tool": "read_file",
+                    "payload": {"path": "SKILL.md"},
+                },
+            ],
+            trace_complete=True,
+        )
+        self.assertEqual("pass", instruction_only["status"])
+
+        executed = evaluate_trace_conformance(
+            safety_spec,
+            [
+                {
+                    "kind": "tool_call",
+                    "tool": "process_exec",
+                    "payload": {"argv": ["git", "push", "origin", "HEAD"]},
+                }
+            ],
+            trace_complete=True,
+        )
+        self.assertEqual("fail", executed["status"])
+        self.assertEqual("forbidden_observed", executed["violations"][0]["type"])
 
 
 if __name__ == "__main__":

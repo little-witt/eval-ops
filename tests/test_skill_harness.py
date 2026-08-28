@@ -245,8 +245,24 @@ class SkillHarnessTests(unittest.TestCase):
         self.assertTrue(published["initial_build"])
         design = kernel.advance("create-task")
         self.assertIn("capability-one-positive", design["case_ids"])
+        positive = next(
+            item for item in design["cases"] if item["id"] == "capability-one-positive"
+        )
+        self.assertEqual(
+            "model_proposed",
+            positive["metadata"]["aceval_test"]["oracle_trust"],
+        )
+        self.assertFalse(positive["metadata"]["aceval_test"]["oracle_ready"])
         self.assertTrue((skill / "SKILL.md").is_file())
-        kernel.confirm("create-task", approve=True, selected_case_ids=tuple(design["case_ids"]))
+        kernel.confirm(
+            "create-task",
+            approve=True,
+            selected_case_ids=tuple(design["case_ids"]),
+            case_calibrations={
+                case_id: ["完成该 Case 描述的目标，并提供可核对的结果"]
+                for case_id in design["case_ids"]
+            },
+        )
         baseline = kernel.advance("create-task")
         self.assertEqual("without-skill-baseline", baseline["purpose"])
         self.assertEqual("baseline_running", kernel.state("create-task")["phase"])
@@ -266,6 +282,23 @@ class SkillHarnessTests(unittest.TestCase):
         kernel.confirm("extend-task", approve=True)
         design = kernel.compile_design("extend-task")
         self.assertIn("capability-one-positive", design["case_ids"])
+        positive = next(
+            item for item in design["cases"] if item["id"] == "capability-one-positive"
+        )
+        self.assertEqual(
+            "model_proposed",
+            positive["metadata"]["aceval_test"]["oracle_trust"],
+        )
+        self.assertFalse(positive["metadata"]["aceval_test"]["oracle_ready"])
+        kernel.confirm(
+            "extend-task",
+            approve=True,
+            selected_case_ids=tuple(design["case_ids"]),
+            case_calibrations={
+                case_id: ["完成该 Case 描述的目标，并提供可核对的结果"]
+                for case_id in design["case_ids"]
+            },
+        )
         kernel.dispatch("extend-task")
         kernel.collect("extend-task")
         decision = kernel.analyze("extend-task")

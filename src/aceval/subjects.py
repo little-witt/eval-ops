@@ -12,6 +12,8 @@ from dataclasses import dataclass, field
 import hashlib
 import json
 from pathlib import Path
+from pathlib import PurePosixPath
+import re
 from typing import Any, Dict, Mapping, Optional, Tuple
 
 from .contracts import SubjectSnapshot
@@ -56,7 +58,160 @@ def _load_subject_manifest(path: Path) -> Tuple[bytes, Dict[str, Any]]:
     return raw, value
 
 
-def hash_skill_subject(skill_bytes: bytes, manifest_bytes: Optional[bytes]) -> str:
+_RESOURCE_DIRECTORIES = frozenset(
+    ("scripts", "references", "templates", "workflow", "knowledge", "specs", "config", "assets")
+)
+_RESOURCE_EXCLUDED_PARTS = frozenset((".git", "__pycache__", "node_modules", "dist", "build"))
+_RESOURCE_LINK = re.compile(r"\]\(([^)#?]+)(?:[?#][^)]*)?\)|`([^`\n]+\.[A-Za-z0-9]{1,12})`")
+_MAX_RESOURCE_FILES = 2048
+_MAX_RESOURCE_BYTES = 32 * 1024 * 1024
+
+
+def _safe_resource_path(value: str) -> str:
+    path = PurePosixPath(value)
+    if (
+        not value
+        or "\x00" in value
+        or "\\" in value
+        or path.is_absolute()
+        or value != path.as_posix()
+        or any(part in ("", ".", "..") for part in path.parts)
+        or any(part in _RESOURCE_EXCLUDED_PARTS for part in path.parts)
+        or path.name == ".env"
+        or path.name.startswith(".env.")
+    ):
+        raise SubjectValidationError("unsafe Skill resource path: %s" % value)
+    return value
+
+
+def _resolve_resource_reference(base: PurePosixPath, reference: str) -> str:
+    """Normalize a resource-relative reference without allowing root escape."""
+
+    if not reference or "\x00" in reference or "\\" in reference:
+        raise SubjectValidationError("unsafe Skill resource reference: %s" % reference)
+    raw = PurePosixPath(reference)
+    if raw.is_absolute():
+        raise SubjectValidationError("unsafe Skill resource reference: %s" % reference)
+    parts = [part for part in base.parts if part not in ("", ".")]
+    for part in raw.parts:
+        if part in ("", "."):
+            continue
+        if part == "..":
+            if not parts:
+                raise SubjectValidationError("Skill resource reference escaped its root: %s" % reference)
+            parts.pop()
+            continue
+        parts.append(part)
+    if not parts:
+        raise SubjectValidationError("unsafe Skill resource reference: %s" % reference)
+    return _safe_resource_path(PurePosixPath(*parts).as_posix())
+
+
+def _resource_closure(root: Path, skill_text: str) -> Tuple[Dict[str, bytes], Tuple[Mapping[str, str], ...]]:
+    """Freeze declared Skill resources without following links or executing them."""
+
+    pending = []
+    issues = []
+    for directory in sorted(_RESOURCE_DIRECTORIES):
+        candidate = root / directory
+        if candidate.exists() or candidate.is_symlink():
+            pending.append((candidate, None, None))
+    for match in _RESOURCE_LINK.finditer(skill_text):
+        reference = (match.group(1) or match.group(2) or "").strip()
+        if not reference or "://" in reference or reference.startswith(("#", "/")):
+            continue
+        try:
+            relative = _resolve_resource_reference(PurePosixPath(), reference)
+        except SubjectValidationError as exc:
+            issues.append({"source_path": "SKILL.md", "reference": reference, "reason": str(exc)})
+            continue
+        pending.append((root / relative, "SKILL.md", reference))
+
+    files: Dict[str, bytes] = {}
+    visited = set()
+    total = 0
+    while pending:
+        candidate, referenced_from, original_reference = pending.pop(0)
+        try:
+            relative = candidate.relative_to(root).as_posix()
+        except ValueError as exc:
+            raise SubjectValidationError("Skill resource escaped its root") from exc
+        if relative in visited:
+            continue
+        visited.add(relative)
+        _safe_resource_path(relative)
+        if candidate.is_symlink():
+            raise SubjectValidationError("Skill resource symlink is not allowed: %s" % relative)
+        if not candidate.exists():
+            if referenced_from is not None:
+                issues.append({
+                    "source_path": referenced_from,
+                    "reference": str(original_reference or relative),
+                    "reason": "referenced Skill resource does not exist: %s" % relative,
+                })
+            continue
+        if candidate.is_dir():
+            for child in sorted(candidate.iterdir()):
+                pending.append((child, None, None))
+            continue
+        if not candidate.is_file():
+            raise SubjectValidationError("Skill resource must be a regular file: %s" % relative)
+        try:
+            raw = candidate.read_bytes()
+        except OSError as exc:
+            raise SubjectValidationError("cannot read Skill resource: %s" % relative) from exc
+        total += len(raw)
+        if len(files) + 1 > _MAX_RESOURCE_FILES or total > _MAX_RESOURCE_BYTES:
+            raise SubjectValidationError("Skill resource closure exceeds the safety limit")
+        files[relative] = raw
+        try:
+            text = raw.decode("utf-8")
+        except UnicodeDecodeError:
+            continue
+        for match in _RESOURCE_LINK.finditer(text):
+            reference = (match.group(1) or match.group(2) or "").strip()
+            if not reference or "://" in reference or reference.startswith(("#", "/")):
+                continue
+            base = PurePosixPath(relative).parent
+            try:
+                safe = _resolve_resource_reference(base, reference)
+            except SubjectValidationError as exc:
+                issues.append({"source_path": relative, "reference": reference, "reason": str(exc)})
+                continue
+            pending.append((root / safe, relative, reference))
+    unique_issues = {
+        (item["source_path"], item["reference"], item["reason"]): item
+        for item in issues
+    }
+    return files, tuple(unique_issues[key] for key in sorted(unique_issues))
+
+
+def hash_skill_subject(
+    skill_bytes: bytes,
+    manifest_bytes: Optional[bytes],
+    resource_files: Optional[Mapping[str, bytes]] = None,
+) -> str:
+    resources = {
+        _safe_resource_path(str(path)): content
+        for path, content in dict(resource_files or {}).items()
+        if str(path) not in ("SKILL.md", "subject.json")
+    }
+    if any(not isinstance(content, bytes) for content in resources.values()):
+        raise SubjectValidationError("frozen Skill resources must contain bytes")
+    if resources:
+        digest = hashlib.sha256()
+        digest.update(b"aceval-skill-subject-v2\0")
+        all_files = {"SKILL.md": skill_bytes, **resources}
+        if manifest_bytes is not None:
+            all_files["subject.json"] = manifest_bytes
+        for path in sorted(all_files):
+            name = path.encode("utf-8")
+            content = all_files[path]
+            digest.update(len(name).to_bytes(4, "big"))
+            digest.update(name)
+            digest.update(len(content).to_bytes(8, "big"))
+            digest.update(content)
+        return digest.hexdigest()
     if manifest_bytes is None:
         return hashlib.sha256(skill_bytes).hexdigest()
     digest = hashlib.sha256()
@@ -97,6 +252,13 @@ class SkillMarkdownSubjectAdapter:
             raise SubjectValidationError("subject symlink is not allowed")
         directory_mode = source.is_dir()
         skill_file = source / "SKILL.md" if directory_mode else source
+        # A direct ``.../SKILL.md`` reference addresses the same Skill
+        # checkout as its parent directory.  Keep the resource closure and
+        # optional subject manifest identical for both forms; otherwise the
+        # evaluation compiler could freeze one hash while the runtime binds
+        # the other (especially when ``references/`` or ``scripts/`` exist).
+        if not directory_mode and source.name == "SKILL.md":
+            directory_mode = True
         if skill_file.is_symlink():
             raise SubjectValidationError("SKILL.md symlink is not allowed")
         if not skill_file.is_file():
@@ -114,12 +276,16 @@ class SkillMarkdownSubjectAdapter:
                 if not manifest_file.is_file():
                     raise SubjectValidationError("subject.json must be a regular file")
                 manifest_bytes, manifest = _load_subject_manifest(manifest_file)
+        if directory_mode:
+            resource_files, resource_issues = _resource_closure(root, content)
+        else:
+            resource_files, resource_issues = {}, ()
         manifest_metadata = manifest.get("metadata", {})
         metadata = dict(manifest_metadata)
         for key in ("id", "version"):
             if key in manifest and key not in metadata:
                 metadata[key] = manifest[key]
-        content_hash = hash_skill_subject(skill_bytes, manifest_bytes)
+        content_hash = hash_skill_subject(skill_bytes, manifest_bytes, resource_files)
         variant = metadata.get("variant")
         if directory_mode and _is_generated_candidate(root, content_hash):
             variant = "candidate"
@@ -127,10 +293,25 @@ class SkillMarkdownSubjectAdapter:
             variant = metadata.get("version")
         if not _has_value(variant):
             variant = root.name
-        metadata.update({"path": str(root), "entrypoint": "SKILL.md", "variant": variant})
+        metadata.update({
+            "path": str(root),
+            "entrypoint": "SKILL.md",
+            "variant": variant,
+            "resource_paths": sorted(resource_files),
+            "resource_count": len(resource_files),
+            "resource_issues": [dict(item) for item in resource_issues],
+        })
         return SubjectSnapshot(
             kind="skill", uri=str(root), content_hash=content_hash, content=content,
-            files={key: value for key, value in (("SKILL.md", skill_bytes), ("subject.json", manifest_bytes)) if value is not None},
+            files={
+                key: value
+                for key, value in (
+                    ("SKILL.md", skill_bytes),
+                    ("subject.json", manifest_bytes),
+                    *tuple(sorted(resource_files.items())),
+                )
+                if value is not None
+            },
             metadata=metadata,
         )
 
@@ -148,12 +329,18 @@ class SkillMarkdownSubjectAdapter:
                 if source_snapshot.content_hash != snapshot.content_hash:
                     raise SubjectValidationError("Subject source changed after snapshot")
                 frozen_files = dict(source_snapshot.files)
-        unsupported = set(frozen_files).difference({"SKILL.md", "subject.json"})
-        if unsupported:
-            raise SubjectValidationError("skill_markdown_v1 cannot materialize files: %s" % ", ".join(sorted(unsupported)))
         skill_bytes = frozen_files.get("SKILL.md")
         manifest_bytes = frozen_files.get("subject.json")
-        if not isinstance(skill_bytes, bytes) or (manifest_bytes is not None and not isinstance(manifest_bytes, bytes)):
+        resource_files = {
+            _safe_resource_path(str(path)): content
+            for path, content in frozen_files.items()
+            if path not in ("SKILL.md", "subject.json")
+        }
+        if (
+            not isinstance(skill_bytes, bytes)
+            or (manifest_bytes is not None and not isinstance(manifest_bytes, bytes))
+            or any(not isinstance(content, bytes) for content in resource_files.values())
+        ):
             raise SubjectValidationError("frozen Subject files must contain bytes")
         try:
             skill_content = skill_bytes.decode("utf-8")
@@ -161,13 +348,12 @@ class SkillMarkdownSubjectAdapter:
             raise SubjectValidationError("invalid frozen SKILL.md: %s" % exc) from exc
         if isinstance(snapshot.content, str) and skill_content != snapshot.content:
             raise SubjectValidationError("frozen SKILL.md differs from snapshot content")
-        if snapshot.content_hash != hash_skill_subject(skill_bytes, manifest_bytes):
+        if snapshot.content_hash != hash_skill_subject(skill_bytes, manifest_bytes, resource_files):
             raise SubjectValidationError("frozen Subject content hash mismatch")
-        for name in ("SKILL.md", "subject.json"):
-            value = frozen_files.get(name)
-            if value is None:
-                continue
+        for name, value in sorted(frozen_files.items()):
+            _safe_resource_path(name)
             target = destination / name
+            target.parent.mkdir(parents=True, exist_ok=True)
             target.write_bytes(value)
             target.chmod(0o444)
         if snapshot.metadata.get("variant") == "candidate":

@@ -50,6 +50,67 @@ class RetryGateway(FakeGateway):
         return "session-%d" % len(self.started)
 
 
+class CachedLogGateway(FakeGateway):
+    def __init__(self):
+        super().__init__()
+        self.fetch_events_calls = 0
+        self.events = [
+            {"type": "user.message", "content": [{"type": "text", "text": "review"}]},
+            {"type": "agent.message", "content": [{"type": "text", "text": "ok"}]},
+        ]
+
+    def last_event_log(self, session_id):
+        encoded = json.dumps(self.events, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        import hashlib
+        return {
+            "events": self.events,
+            "integrity": {
+                "complete": True,
+                "reason_codes": [],
+                "page_count": 1,
+                "event_count": 2,
+                "event_types": ["agent.message", "user.message"],
+                "required_event_types": ["user.message", "agent.message"],
+                "missing_required_event_types": [],
+                "sequence_status": "not_provided",
+                "event_log_sha256": hashlib.sha256(encoded).hexdigest(),
+            },
+        }
+
+    def fetch_events(self, session_id):
+        self.fetch_events_calls += 1
+        raise AssertionError("collector fetched a second, inconsistent event snapshot")
+
+
+class IncompleteLogGateway(CachedLogGateway):
+    def last_event_log(self, session_id):
+        value = dict(super().last_event_log(session_id))
+        integrity = dict(value["integrity"])
+        integrity.update(
+            {
+                "complete": False,
+                "reason_codes": ["sequence_gap"],
+                "sequence_status": "gap",
+            }
+        )
+        value["integrity"] = integrity
+        return value
+
+
+class MismatchedCatxSealGateway(CachedLogGateway):
+    def fetch_session(self, session_id):
+        value = dict(super().fetch_session(session_id))
+        value["source"] = "catx_session_api"
+        return value
+
+    def last_event_log(self, session_id):
+        value = dict(super().last_event_log(session_id))
+        integrity = dict(value["integrity"])
+        integrity["event_log_sha256"] = "0" * 64
+        value["integrity"] = integrity
+        return value
+
+
 class RemoteBatchTests(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
@@ -187,6 +248,27 @@ class RemoteBatchTests(unittest.TestCase):
             )
         self.assertEqual([], gateway.started)
 
+    def test_persisted_batch_reuse_rejects_changed_prompt_or_case_set(self):
+        gateway = FakeGateway()
+        coordinator = RemoteBatchCoordinator(gateway, self.store, poll_interval_seconds=1)
+        coordinator.dispatch(
+            "batch-task-001", 0, "evaluation",
+            ({"id": "a", "prompt": "Review A"},),
+            goal="goal", standards=("correct",),
+        )
+        with self.assertRaisesRegex(RemoteBatchError, "request does not match"):
+            coordinator.dispatch(
+                "batch-task-001", 0, "evaluation",
+                ({"id": "a", "prompt": "Review a different fixture"},),
+                goal="goal", standards=("correct",),
+            )
+        with self.assertRaisesRegex(RemoteBatchError, "request does not match|exactly the requested cases"):
+            coordinator.dispatch(
+                "batch-task-001", 0, "evaluation",
+                ({"id": "a", "prompt": "Review A"}, {"id": "b", "prompt": "Review B"}),
+                goal="goal", standards=("correct",),
+            )
+
     def test_failed_session_can_be_retried_without_repeating_successful_cases(self):
         gateway = RetryGateway()
         coordinator = RemoteBatchCoordinator(gateway, self.store, poll_interval_seconds=1)
@@ -201,6 +283,73 @@ class RemoteBatchTests(unittest.TestCase):
         self.assertEqual("session-2", first["cases"][1]["session_id"])
         self.assertEqual("session-3", retried["cases"][0]["session_id"])
         self.assertEqual("running", retried["status"])
+        retried_case = retried["cases"][0]
+        self.assertEqual(2, retried_case["attempt_number"])
+        self.assertEqual(1, len(retried_case["attempts"]))
+        self.assertEqual("failed", retried_case["attempts"][0]["status"])
+        self.assertIn("temporary create failure", retried_case["attempts"][0]["error"])
+        self.assertIn(
+            "temporary create failure",
+            retried_case["attempts"][0]["retry_reason"],
+        )
+
+    def test_collection_reuses_the_session_snapshot_and_records_hash_receipt(self):
+        gateway = CachedLogGateway()
+        coordinator = RemoteBatchCoordinator(gateway, self.store, poll_interval_seconds=1)
+        coordinator.dispatch(
+            "batch-task-001", 0, "evaluation",
+            ({"id": "a", "prompt": "Review A"},),
+            goal="goal", standards=("correct",),
+        )
+
+        completed = coordinator.collect_once("batch-task-001", 0, "evaluation")
+        row = completed["cases"][0]
+        payload = json.loads(Path(row["artifact"]).read_text(encoding="utf-8"))
+
+        self.assertEqual(0, gateway.fetch_events_calls)
+        self.assertTrue(payload["log_completeness"]["complete"])
+        self.assertEqual(64, len(payload["log_completeness"]["event_log_sha256"]))
+        self.assertEqual(1, len(row["attempts"]))
+        self.assertEqual(row["artifact"], row["attempts"][0]["artifact"])
+
+    def test_incomplete_catx_log_is_retriable_infrastructure_failure(self):
+        gateway = IncompleteLogGateway()
+        coordinator = RemoteBatchCoordinator(gateway, self.store, poll_interval_seconds=1)
+        coordinator.dispatch(
+            "batch-task-001", 0, "evaluation",
+            ({"id": "a", "prompt": "Review A"},),
+            goal="goal", standards=("correct",),
+        )
+
+        completed = coordinator.collect_once("batch-task-001", 0, "evaluation")
+        row = completed["cases"][0]
+        self.assertEqual("failed", row["status"])
+        self.assertIn("sequence_gap", row["error"])
+        retried = coordinator.retry_failed("batch-task-001", 0, "evaluation")
+        self.assertEqual("running", retried["status"])
+        self.assertEqual(2, retried["cases"][0]["attempt_number"])
+        self.assertIn(
+            "sequence_gap",
+            retried["cases"][0]["attempts"][0]["retry_reason"],
+        )
+
+    def test_catx_server_seal_is_preserved_and_mismatch_is_not_hidden_by_local_hash(self):
+        gateway = MismatchedCatxSealGateway()
+        coordinator = RemoteBatchCoordinator(gateway, self.store, poll_interval_seconds=1)
+        coordinator.dispatch(
+            "batch-task-001", 0, "evaluation",
+            ({"id": "a", "prompt": "Review A"},),
+            goal="goal", standards=("correct",),
+        )
+
+        completed = coordinator.collect_once("batch-task-001", 0, "evaluation")
+        row = completed["cases"][0]
+        payload = json.loads(Path(row["artifact"]).read_text(encoding="utf-8"))
+        integrity = payload["log_completeness"]
+        self.assertEqual("0" * 64, integrity["event_log_sha256"])
+        self.assertNotEqual(integrity["event_log_sha256"], integrity["computed_event_log_sha256"])
+        self.assertIn("event_log_hash_mismatch", integrity["reason_codes"])
+        self.assertEqual("failed", row["status"])
 
 
 if __name__ == "__main__":

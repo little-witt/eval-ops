@@ -102,6 +102,8 @@ class OptimizationConsoleTest(unittest.TestCase):
                 {
                     "eval_id": 1,
                     "eval_name": "ts-web-case",
+                    "stack": "typescript-web",
+                    "case_type": "defect",
                     "prompt": "Review the change",
                     "assertions": ["Strict JSON"],
                 }
@@ -155,6 +157,21 @@ class OptimizationConsoleTest(unittest.TestCase):
         self.assertNotIn("actual-secret-token", serialized)
         self.assertNotIn("password@", serialized)
         self.assertIn("CATX_AGENT_ID", serialized)
+        case = graph["evaluation_design"]["cases"][0]
+        self.assertEqual("TypeScript Web", case["group"])
+        self.assertEqual("defect", case["type"])
+
+    def test_legacy_case_ids_do_not_invent_group_or_type(self):
+        metadata = self.workspace / "iteration-2" / "eval-01-ts-web-case" / "eval_metadata.json"
+        value = json.loads(metadata.read_text(encoding="utf-8"))
+        value.pop("stack", None)
+        value.pop("case_type", None)
+        metadata.write_text(json.dumps(value), encoding="utf-8")
+
+        graph = compile_optimization_graph(self.workspace, plan_path=self.plan)
+        case = graph["evaluation_design"]["cases"][0]
+        self.assertEqual("未分组", case["group"])
+        self.assertEqual("未标注", case["type"])
 
     def test_builds_offline_console_with_embedded_graph(self):
         output = self.root / "console"
@@ -350,6 +367,23 @@ class OptimizationConsoleTest(unittest.TestCase):
         self.assertEqual(
             "not_measured", candidate["score_dimensions"]["evidence"]["status"]
         )
+
+    def test_missing_pass_rate_remains_unknown_instead_of_zero(self):
+        run = self.workspace / "iteration-2" / "eval-01-ts-web-case" / "with_skill" / "run-1"
+        (run / "grading.json").write_text(
+            json.dumps(
+                {
+                    "formal_grade": {"status": "pass"},
+                    "binding_verified": True,
+                    "expectations": [{"text": "Strict JSON", "passed": True}],
+                }
+            ),
+            encoding="utf-8",
+        )
+        graph = compile_optimization_graph(self.workspace, plan_path=self.plan)
+        candidate = graph["evaluation_design"]["cases"][0]["candidate"]
+        self.assertIsNone(candidate["pass_rate"])
+        self.assertIsNone(candidate["score"]["overall"])
 
     def test_string_false_binding_cannot_pass_the_binding_dimension(self):
         run = self.workspace / "iteration-2" / "eval-01-ts-web-case" / "with_skill" / "run-1"

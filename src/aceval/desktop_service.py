@@ -392,6 +392,11 @@ class DesktopService:
                 selected_capability_ids=tuple(str(item) for item in params.get("selected_capability_ids", ())),
                 selected_case_ids=tuple(str(item) for item in params.get("selected_case_ids", ())),
                 selected_change_ids=tuple(str(item) for item in params.get("selected_change_ids", ())),
+                case_calibrations=(
+                    dict(params.get("case_calibrations", {}))
+                    if isinstance(params.get("case_calibrations", {}), Mapping)
+                    else None
+                ),
                 user_feedback=str(params["user_feedback"]) if params.get("user_feedback") is not None else None,
             )
             if params.get("continue"):

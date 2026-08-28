@@ -294,6 +294,7 @@ def compile_evaluation(
         cases_document,
         fixture_root,
         selected_type,
+        graph.subject_hash,
     )
     required_inputs = _required_inputs(cases_document)
     runtime_gaps = tuple(
@@ -344,6 +345,11 @@ def compile_evaluation(
         {
             "api_version": EVALUATION_COMPILER_API_VERSION,
             "signature": signature,
+            # Keep the subject identity visible in the generated manifest and
+            # bound to the reuse signature.  A Suite is only reusable for the
+            # exact Skill resource closure that was analyzed; profile/Case
+            # similarity alone is not enough to compare or execute it.
+            "subject_hash": graph.subject_hash,
             "standards_hash": _canonical_hash(normalized_standards),
             "case_source": "provided" if cases is not None else "generated",
             "runtime_support": (
@@ -521,10 +527,12 @@ def _evaluation_signature(
     document: Mapping[str, Any],
     fixture_root: Path,
     pack_type: str,
+    subject_hash: str,
 ) -> str:
     return _canonical_hash(
         {
             "compiler": EVALUATION_COMPILER_API_VERSION,
+            "subject_hash": subject_hash,
             "profile": profile.to_dict(include_signals=False),
             "standards": standards,
             "pack_type": pack_type,

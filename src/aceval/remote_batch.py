@@ -67,6 +67,89 @@ def _safe_case_file(case_id: str) -> str:
     return "%s-%s.json" % (slug, digest)
 
 
+def _event_log_sha256(events: Sequence[Mapping[str, Any]]) -> str:
+    payload = json.dumps(
+        list(events),
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _request_fingerprint(
+    *,
+    purpose: str,
+    prepared_cases: Sequence[tuple[str, str, str]],
+    goal: str,
+    standards: Sequence[str],
+    repository_bindings: Sequence[Mapping[str, Any]],
+    environment_contract_hash: Optional[str],
+) -> str:
+    """Identify the exact immutable inputs of a persisted remote batch."""
+
+    payload = {
+        "purpose": str(purpose),
+        "cases": [
+            {"case_id": case_id, "prompt": prompt, "title": title}
+            for case_id, prompt, title in prepared_cases
+        ],
+        "goal": str(goal),
+        "standards": [str(item) for item in standards],
+        "repository_bindings": [dict(item) for item in repository_bindings],
+        "environment_contract_hash": environment_contract_hash,
+    }
+    encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False).encode("utf-8")
+    return "sha256:" + hashlib.sha256(encoded).hexdigest()
+
+
+def _attempt_number(row: Mapping[str, Any]) -> int:
+    value = row.get("attempt_number")
+    if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+        return value
+    attempts = row.get("attempts", ())
+    return len(attempts) + 1 if isinstance(attempts, list) else 1
+
+
+def _archive_attempt(row: dict[str, Any], *, retry_reason: Optional[str] = None) -> None:
+    """Preserve a terminal remote attempt before retrying or returning it."""
+
+    number = _attempt_number(row)
+    attempts = [dict(item) for item in row.get("attempts", ()) if isinstance(item, Mapping)]
+    existing = next(
+        (item for item in attempts if item.get("attempt_number") == number),
+        None,
+    )
+    if existing is not None:
+        # A terminal attempt is normally archived during collection, before a
+        # person asks to retry it.  Preserve that immutable attempt while
+        # attaching the later retry decision to the same history row.
+        if retry_reason and not existing.get("retry_reason"):
+            existing["retry_reason"] = retry_reason
+        row["attempts"] = attempts
+        return
+    attempts.append(
+        {
+            "attempt_number": number,
+            "session_id": row.get("session_id"),
+            "status": row.get("status"),
+            "started_at": row.get("started_at"),
+            "completed_at": row.get("completed_at"),
+            "terminal": row.get("terminal"),
+            "artifact": row.get("artifact"),
+            "error": row.get("error"),
+            "fetch_error": row.get("fetch_error"),
+            "binding_status": row.get("binding_status"),
+            "binding_evidence": row.get("binding_evidence"),
+            "message_status": row.get("message_status"),
+            "log_completeness": row.get("log_completeness"),
+            "retry_reason": retry_reason,
+        }
+    )
+    row["attempts"] = attempts
+
+
 def _session_payload(bundle: Any) -> Mapping[str, Any]:
     if hasattr(bundle, "observation") and hasattr(bundle, "completeness"):
         return {
@@ -241,14 +324,37 @@ class RemoteBatchCoordinator:
         requested_ids = [item[0] for item in prepared_cases]
         if len(requested_ids) != len(set(requested_ids)):
             raise RemoteBatchError("remote batch case ids must be unique")
+        request_fingerprint = _request_fingerprint(
+            purpose=purpose,
+            prepared_cases=prepared_cases,
+            goal=goal,
+            standards=standards,
+            repository_bindings=repository_bindings,
+            environment_contract_hash=environment_contract_hash,
+        )
         path = self.batch_path(task_id, iteration, purpose)
         if path.is_file():
             loaded = dict(_load(path))
             if loaded.get("environment_contract_hash") != environment_contract_hash:
                 raise RemoteBatchError("persisted batch environment contract does not match requested contract")
             persisted_ids = [str(row.get("case_id") or "") for row in loaded.get("cases", ()) if isinstance(row, Mapping)]
+            if loaded.get("request_fingerprint") and loaded.get("request_fingerprint") != request_fingerprint:
+                raise RemoteBatchError("persisted batch request does not match the requested cases, prompts, or repository bindings")
             if any(case_id not in requested_ids for case_id in persisted_ids):
                 raise RemoteBatchError("persisted batch does not match requested cases")
+            if loaded.get("status") != "dispatching" and set(persisted_ids) != set(requested_ids):
+                raise RemoteBatchError("completed persisted batch does not contain exactly the requested cases")
+            if loaded.get("status") == "dispatching":
+                persisted_prompts = {
+                    str(row.get("case_id")): str(row.get("prompt"))
+                    for row in loaded.get("cases", ())
+                    if isinstance(row, Mapping)
+                    and isinstance(row.get("prompt"), str)
+                    and row.get("prompt")
+                }
+                requested_prompts = {case_id: prompt for case_id, prompt, _ in prepared_cases}
+                if any(case_id in persisted_prompts and persisted_prompts[case_id] != prompt for case_id, prompt in requested_prompts.items()):
+                    raise RemoteBatchError("interrupted persisted batch prompt does not match the requested Case")
             if loaded.get("status") != "dispatching":
                 return loaded
             batch = loaded
@@ -259,6 +365,7 @@ class RemoteBatchCoordinator:
             for row in case_states:
                 if row.get("status") == "starting":
                     row.update({"status": "failed", "error": "dispatch was interrupted before the session id was persisted; duplicate creation was refused", "completed_at": _now()})
+                    _archive_attempt(row)
                     self.store.append_event(task_id, "case_run.failed", {"purpose": purpose, "error": row["error"]}, iteration=iteration, case_id=row.get("case_id"), run_id=purpose)
             batch["cases"] = case_states
             _atomic_json(path, batch)
@@ -270,6 +377,7 @@ class RemoteBatchCoordinator:
                 "iteration": iteration,
                 "purpose": purpose,
                 "environment_contract_hash": environment_contract_hash,
+                "request_fingerprint": request_fingerprint,
                 "status": "dispatching",
                 "created_at": _now(),
                 "updated_at": _now(),
@@ -302,6 +410,8 @@ class RemoteBatchCoordinator:
                 "binding_evidence": None,
                 "message_status": "pending",
                 "log_completeness": None,
+                "attempt_number": 1,
+                "attempts": [],
             }
             case_states.append(row)
             persisted_ids.add(case_id)
@@ -329,6 +439,7 @@ class RemoteBatchCoordinator:
                 self.store.append_event(task_id, "case_run.started", {"purpose": purpose, "session_id": session_id, "binding_status": row.get("binding_status"), "message_status": row.get("message_status")}, iteration=iteration, case_id=case_id, run_id=purpose)
             except Exception as exc:
                 row.update({"status": "failed", "error": str(exc), "binding_status": "failed" if execution_binding is not None else row.get("binding_status"), "message_status": "failed", "completed_at": _now()})
+                _archive_attempt(row)
                 self.store.append_event(task_id, "case_run.failed", {"purpose": purpose, "error": str(exc)}, iteration=iteration, case_id=case_id, run_id=purpose)
             batch["updated_at"] = _now()
             _atomic_json(path, batch)
@@ -348,6 +459,7 @@ class RemoteBatchCoordinator:
             for row in rows:
                 if row.get("status") == "running":
                     row.update({"status": "failed", "error": "remote batch deadline exceeded", "completed_at": _now()})
+                    _archive_attempt(row)
                     self.store.append_event(task_id, "case_run.failed", {"purpose": purpose, "error": row["error"], "session_id": row.get("session_id")}, iteration=iteration, case_id=row.get("case_id"), run_id=purpose)
             batch.update({"cases": rows, "status": "completed", "updated_at": _now()})
             _atomic_json(path, batch)
@@ -373,17 +485,36 @@ class RemoteBatchCoordinator:
             if status not in ("COMPLETED", "FAILED"):
                 continue
             case_id = str(row["case_id"])
-            artifact = path.parent.parent / "runs" / purpose / _safe_case_file(case_id)
+            attempt_number = _attempt_number(row)
+            artifact = (
+                path.parent.parent
+                / "runs"
+                / purpose
+                / Path(_safe_case_file(case_id)).stem
+                / ("attempt-%03d.json" % attempt_number)
+            )
             try:
                 bundle = self.gateway.fetch_session(str(row["session_id"]))
                 raw_events = None
-                fetch_events = getattr(self.gateway, "fetch_events", None)
-                if callable(fetch_events):
-                    raw_events = [dict(item) for item in fetch_events(str(row["session_id"]))]
+                event_integrity = None
+                last_event_log = getattr(self.gateway, "last_event_log", None)
+                if callable(last_event_log):
+                    cached = last_event_log(str(row["session_id"]))
+                    if isinstance(cached, Mapping):
+                        cached_events = cached.get("events")
+                        if isinstance(cached_events, Sequence) and not isinstance(cached_events, (str, bytes)):
+                            raw_events = [dict(item) for item in cached_events if isinstance(item, Mapping)]
+                        if isinstance(cached.get("integrity"), Mapping):
+                            event_integrity = dict(cached["integrity"])
+                if raw_events is None:
+                    fetch_events = getattr(self.gateway, "fetch_events", None)
+                    if callable(fetch_events):
+                        raw_events = [dict(item) for item in fetch_events(str(row["session_id"]))]
                 payload = {
                     "api_version": "aceval.kernel-case-run/v1",
                     "task_id": task_id,
                     "iteration": iteration,
+                    "attempt_number": attempt_number,
                     "purpose": purpose,
                     "environment_contract_hash": batch.get("environment_contract_hash"),
                     "case_id": case_id,
@@ -395,14 +526,57 @@ class RemoteBatchCoordinator:
                     "terminal": terminal,
                     "session": _session_payload(bundle),
                 }
+                session_source = str(
+                    payload["session"].get("source")
+                    if isinstance(payload.get("session"), Mapping)
+                    else ""
+                )
+                catx_session = session_source in {"catx_session_api", "catx"}
                 if raw_events is not None:
                     payload["events"] = raw_events
+                    actual_event_hash = _event_log_sha256(raw_events)
+                    if event_integrity is None:
+                        event_types = sorted({str(item.get("type") or item.get("kind") or "") for item in raw_events})
+                        missing = [kind for kind in ("user.message", "agent.message") if kind not in event_types]
+                        legacy = not catx_session
+                        event_integrity = {
+                            "complete": not missing and not catx_session,
+                            "reason_codes": (["required_event_type_missing"] if missing else []) + (["event_log_hash_missing"] if catx_session else []),
+                            "page_count": 1,
+                            "event_count": len(raw_events),
+                            "event_types": event_types,
+                            "required_event_types": ["user.message", "agent.message"],
+                            "missing_required_event_types": missing,
+                            "event_log_sha256": None if catx_session else actual_event_hash,
+                            "computed_event_log_sha256": actual_event_hash,
+                            "legacy_event_log": legacy,
+                            "promotion_eligible": not legacy,
+                        }
+                    elif event_integrity.get("event_log_sha256") not in (None, actual_event_hash):
+                        event_integrity = dict(event_integrity)
+                        event_integrity["complete"] = False
+                        event_integrity["reason_codes"] = list(dict.fromkeys(
+                            list(event_integrity.get("reason_codes", ())) + ["event_log_hash_mismatch"]
+                        ))
+                    elif catx_session and not event_integrity.get("event_log_sha256"):
+                        event_integrity = dict(event_integrity)
+                        event_integrity["complete"] = False
+                        event_integrity["reason_codes"] = list(dict.fromkeys(
+                            list(event_integrity.get("reason_codes", ())) + ["event_log_hash_missing"]
+                        ))
                     payload["log_completeness"] = {
                         "raw_events": True,
-                        "event_count": len(raw_events),
-                        "event_types": sorted({str(item.get("type")) for item in raw_events if isinstance(item, Mapping)}),
-                        "required_event_types": ["user.message", "agent.message"],
-                        "missing_required_event_types": [kind for kind in ("user.message", "agent.message") if not any(item.get("type") == kind for item in raw_events)],
+                        **event_integrity,
+                        # Keep the server-provided seal distinct from a hash
+                        # computed locally.  For a CATX receipt, inventing a
+                        # missing server seal would turn an incomplete log
+                        # into apparently complete evidence.
+                        "event_log_sha256": (
+                            event_integrity.get("event_log_sha256")
+                            if catx_session
+                            else actual_event_hash
+                        ),
+                        "computed_event_log_sha256": actual_event_hash,
                     }
                     # CATX does not echo repository binding metadata in the
                     # session document. Upgrade request-level evidence using
@@ -421,6 +595,24 @@ class RemoteBatchCoordinator:
                                 "binding_evidence": None,
                                 "binding_error": "CATX event-log binding verification failed: %s" % str(exc)[:500],
                             })
+                else:
+                    # A real CATX session must expose the immutable event
+                    # snapshot.  A gateway that cannot expose events is only
+                    # accepted as an explicitly marked local legacy fixture;
+                    # it must never be mistaken for a complete CATX receipt.
+                    legacy = not catx_session and not callable(getattr(self.gateway, "fetch_events", None)) and not callable(getattr(self.gateway, "last_event_log", None))
+                    payload["log_completeness"] = {
+                        "raw_events": False,
+                        "complete": legacy,
+                        "legacy_event_log": legacy,
+                        "promotion_eligible": not legacy,
+                        "reason_codes": ["legacy_event_log"] if legacy else ["event_log_missing", "event_log_hash_missing"],
+                        "missing_required_event_types": [],
+                        "event_count": 0,
+                        "page_count": 0,
+                        "sequence_status": "not_provided",
+                        "event_log_sha256": None,
+                    }
                 payload["binding_status"] = row.get("binding_status")
                 payload["binding_evidence"] = row.get("binding_evidence")
                 _atomic_json(artifact, payload)
@@ -428,7 +620,31 @@ class RemoteBatchCoordinator:
                 final_error = payload["session"].get("observation", {}).get("error")
                 if row.get("binding_status") == "failed":
                     final_error = row.get("binding_error") or "CATX event log did not prove the requested Skill/repository mounts"
-                row.update({"status": "completed" if status == "COMPLETED" and row.get("binding_status") != "failed" else "failed", "artifact": str(artifact), "completed_at": _now(), "error": final_error, "log_completeness": completeness})
+                event_log_incomplete = (
+                    isinstance(payload.get("log_completeness"), Mapping)
+                    and payload.get("log_completeness", {}).get("complete") is False
+                )
+                if event_log_incomplete and not final_error:
+                    codes = payload.get("log_completeness", {}).get("reason_codes", ())
+                    final_error = "session event log is incomplete%s" % (
+                        ": " + ", ".join(str(item) for item in codes)
+                        if codes
+                        else ""
+                    )
+                row.update({
+                    "status": (
+                        "completed"
+                        if status == "COMPLETED"
+                        and row.get("binding_status") != "failed"
+                        and not event_log_incomplete
+                        else "failed"
+                    ),
+                    "artifact": str(artifact),
+                    "completed_at": _now(),
+                    "error": final_error,
+                    "log_completeness": completeness,
+                })
+                _archive_attempt(row)
                 self.store.append_event(task_id, "trace.captured", {"purpose": purpose, "session_id": row["session_id"], "session_log": str(artifact), "completeness": payload["session"].get("completeness")}, iteration=iteration, case_id=case_id, run_id=purpose)
                 self.store.append_event(task_id, "case_run.completed" if row["status"] == "completed" else "case_run.failed", {"purpose": purpose, "session_id": row["session_id"], "status": row["status"], "session_log": str(artifact), "binding_status": row.get("binding_status"), "message_status": row.get("message_status"), "log_completeness": row.get("log_completeness")}, iteration=iteration, case_id=case_id, run_id=purpose)
             except Exception as exc:
@@ -471,6 +687,9 @@ class RemoteBatchCoordinator:
         for row in failed:
             case_id = str(row.get("case_id") or "")
             prompt = str(row.get("prompt") or "")
+            retry_reason = str(row.get("error") or row.get("fetch_error") or "failed remote attempt")
+            _archive_attempt(row, retry_reason=retry_reason)
+            next_attempt = _attempt_number(row) + 1
             row.update({
                 "status": "starting",
                 "session_id": None,
@@ -480,6 +699,16 @@ class RemoteBatchCoordinator:
                 "fetch_error": None,
                 "started_at": _now(),
                 "completed_at": None,
+                "attempt_number": next_attempt,
+                "retry_reason": retry_reason,
+                "log_completeness": None,
+                "message_status": "pending",
+                # A retry is a fresh transport attempt.  Do not carry a
+                # previous binding failure into an intentionally unbound
+                # retry (or stale evidence into a newly bound one).
+                "binding_status": "pending" if execution_binding is not None else "not_requested",
+                "binding_evidence": None,
+                "binding_error": None,
             })
             batch.update({"cases": rows, "status": "dispatching", "updated_at": _now()})
             _atomic_json(path, batch)
@@ -497,11 +726,12 @@ class RemoteBatchCoordinator:
                     if evidence is None or (hasattr(evidence, "assert_matches") and not evidence.verified):
                         raise RemoteBatchError("retried session binding was not verified")
                     row.update({"binding_status": "verified", "binding_evidence": _binding_evidence_payload(evidence)})
-                    row["message_status"] = "sent"
+                row["message_status"] = "sent"
                 row.update({"session_id": session_id, "status": "running"})
-                self.store.append_event(task_id, "case_run.retried", {"purpose": purpose, "session_id": session_id}, iteration=iteration, case_id=case_id, run_id=purpose)
+                self.store.append_event(task_id, "case_run.retried", {"purpose": purpose, "session_id": session_id, "attempt_number": next_attempt, "retry_reason": retry_reason}, iteration=iteration, case_id=case_id, run_id=purpose)
             except Exception as exc:
                 row.update({"status": "failed", "error": str(exc), "binding_status": "failed" if execution_binding is not None else row.get("binding_status"), "message_status": "failed", "completed_at": _now()})
+                _archive_attempt(row)
                 self.store.append_event(task_id, "case_run.failed", {"purpose": purpose, "error": str(exc), "retry": True}, iteration=iteration, case_id=case_id, run_id=purpose)
             batch["updated_at"] = _now()
             _atomic_json(path, batch)

@@ -151,7 +151,9 @@ def _parse_proposal(value: Mapping[str, Any], inventory: Sequence[str]) -> Mappi
 
 
 class IterationBrain:
-    def __init__(self, model: Optional[ModelClient], artifact_root: Path, *, provider: str = "local-forge", profile: str = "default", model_id: Optional[str] = None, max_retries: int = 1, max_evidence_chars_per_case: int = 4000, max_prompt_chars: int = 48_000, stage_callback: Optional[Callable[[str], None]] = None) -> None:
+    def __init__(self, model: Optional[ModelClient], artifact_root: Path, *, provider: str = "local-forge", profile: str = "default", model_id: Optional[str] = None, max_retries: int = 1, max_evidence_chars_per_case: int = 4000, max_prompt_chars: int = 48_000, required_k: int = 2, stage_callback: Optional[Callable[[str], None]] = None) -> None:
+        if isinstance(required_k, bool) or not isinstance(required_k, int) or not 1 <= required_k <= 20:
+            raise ValueError("required_k must be between 1 and 20")
         self.model, self.artifact_root = model, Path(artifact_root)
         self.provider = provider
         model_profile = getattr(model, "profile", None)
@@ -161,6 +163,7 @@ class IterationBrain:
         self.model_id = str(getattr(model, "model_id", None) or model_id or "unconfigured")
         self.max_retries = max(0, max_retries)
         self.max_evidence_chars_per_case, self.max_prompt_chars = max_evidence_chars_per_case, max_prompt_chars
+        self.required_k = required_k
         self.receipts: list[Mapping[str, Any]] = []
         self.query_receipts: list[Mapping[str, Any]] = []
         self.current_receipts: list[Mapping[str, Any]] = []
@@ -261,14 +264,15 @@ class IterationBrain:
     def _compile_evidence(self, kwargs: Mapping[str, Any], cases: Sequence[Mapping[str, Any]]):
         primary, verification_batch, baseline_batch = kwargs.get("primary_batch", {}), kwargs.get("verification_batch"), kwargs.get("comparison_baseline_batch")
         paths = kwargs.get("path_specs") or {}
+        evalpack_ref = kwargs.get("evalpack_ref")
         def rows(batch): return {str(x.get("case_id")): x for x in (batch.get("cases", ()) if isinstance(batch, Mapping) else ()) if isinstance(x, Mapping)}
         primary_rows, verification_rows, baseline_rows = rows(primary), rows(verification_batch), rows(baseline_batch)
         evidence, verification, baseline, artifacts = [], [], [], []
         for case in cases:
-            cid = str(case.get("id")); item = compact_case_evidence(case, primary_rows.get(cid, {}), max_chars=self.max_evidence_chars_per_case, path_spec=paths.get(cid)); evidence.append(item)
+            cid = str(case.get("id")); item = compact_case_evidence(case, primary_rows.get(cid, {}), max_chars=self.max_evidence_chars_per_case, path_spec=paths.get(cid), evalpack_ref=evalpack_ref); evidence.append(item)
             if item.get("artifact"): artifacts.append(str(item["artifact"]))
-            if verification_batch is not None: verification.append(compact_case_evidence(case, verification_rows.get(cid, {}), max_chars=self.max_evidence_chars_per_case, path_spec=paths.get(cid)))
-            if baseline_batch is not None: baseline.append(compact_case_evidence(case, baseline_rows.get(cid, {}), max_chars=self.max_evidence_chars_per_case, path_spec=None))
+            if verification_batch is not None: verification.append(compact_case_evidence(case, verification_rows.get(cid, {}), max_chars=self.max_evidence_chars_per_case, path_spec=paths.get(cid), evalpack_ref=evalpack_ref))
+            if baseline_batch is not None: baseline.append(compact_case_evidence(case, baseline_rows.get(cid, {}), max_chars=self.max_evidence_chars_per_case, path_spec=None, evalpack_ref=evalpack_ref))
         self.evidence_query_port = LocalEvidenceQueryPort(self._evidence_root(artifacts))
         def heur(items): return {str(c.get("id")): v for c, i in zip(cases, items) if (v := _heuristic_case_result(c, i)) is not None}
         bundle = {"api_version": EVIDENCE_BUNDLE_API_VERSION, "task_id": kwargs.get("task_id"), "iteration": kwargs.get("iteration"), "environment_contract_hash": primary.get("environment_contract_hash"), "cases": evidence, "verification_evidence": verification, "without_skill_baseline_evidence": baseline, "context_compiler": "bounded-indexed-window/v2"}
@@ -335,43 +339,243 @@ class IterationBrain:
         return out
 
     def _assemble(self, kwargs, cases, bundle, results_by_id, verification_heuristic, baseline_heuristic, attribution, proposal):
-        task_id, iteration = str(kwargs.get("task_id")), int(kwargs.get("iteration", 0)); evidence = list(bundle["cases"]); results = [dict(results_by_id[str(c.get("id"))]) for c in cases]; eligible = {str(c.get("id")) for c in cases if _optimization_case_ready(c)}; inventory = set(str(x) for x in (kwargs.get("editable_resource_inventory") or ("SKILL.md",)))
+        task_id = str(kwargs.get("task_id"))
+        iteration = int(kwargs.get("iteration", 0))
+        evidence = list(bundle["cases"])
+        results = [dict(results_by_id[str(case.get("id"))]) for case in cases]
+        eligible = {
+            str(case.get("id"))
+            for case in cases
+            if _optimization_case_ready(case)
+        }
+        inventory = set(
+            str(item)
+            for item in (kwargs.get("editable_resource_inventory") or ("SKILL.md",))
+        )
+
+        primary_passes = [item["case_id"] for item in results if item["status"] == "pass"]
+
+        # Build the deterministic aggregate before deriving stability and
+        # authorization lists. A model-provided ``verification_status`` is
+        # only a hint; hard dimensions and evidence validity remain decisive.
+        verification_results = {
+            str(case.get("id")): verification_heuristic[str(case.get("id"))]
+            for case in cases
+            if str(case.get("id")) in verification_heuristic
+        }
+        if kwargs.get("verification_batch") is not None:
+            for case in cases:
+                case_id = str(case.get("id"))
+                if case_id in verification_results:
+                    continue
+                semantic_status = results_by_id.get(case_id, {}).get("verification_status")
+                if semantic_status in ("pass", "fail", "not_evaluable"):
+                    verification_results[case_id] = {
+                        "case_id": case_id,
+                        "status": semantic_status,
+                        "reason": "local semantic grader stability verdict: %s" % semantic_status,
+                        "evidence_refs": results_by_id.get(case_id, {}).get("evidence_refs", ()),
+                    }
+        aggregates = build_case_aggregates(
+            cases,
+            results,
+            evidence,
+            list(bundle.get("verification_evidence", [])),
+            verification_results=verification_results,
+            required_k=self.required_k,
+            run_context={
+                "task_id": task_id,
+                "comparison_context_hash": kwargs.get("comparison_context_hash"),
+                "evaluation_design_hash": kwargs.get("evaluation_design_hash"),
+            },
+        )
+        aggregate_by_id = {item.case_id: item for item in aggregates}
+        verification_ids = {
+            str(item.get("case_id"))
+            for item in bundle.get("verification_evidence", ())
+            if isinstance(item, Mapping) and item.get("case_id")
+        }
+        if kwargs.get("verification_batch") is not None:
+            stable = [
+                case_id
+                for case_id in primary_passes
+                if case_id in verification_ids
+                and aggregate_by_id.get(case_id) is not None
+                and aggregate_by_id[case_id].stable_pass
+            ]
+            flaky = [
+                case_id
+                for case_id in primary_passes
+                if case_id in verification_ids
+                and aggregate_by_id.get(case_id) is not None
+                and aggregate_by_id[case_id].flaky
+            ]
+        else:
+            stable = []
+            flaky = []
+
+        failed = [item["case_id"] for item in results if item["status"] == "fail"] + flaky
+        authorizable_failure_ids = set(failed).intersection(eligible)
+
+        # A model may explain or group any observed row, but only a real
+        # failed/flaky Case with a trusted Oracle may authorize a Skill edit.
         clusters = []
         for cluster in attribution.get("failure_clusters", []):
-            value = dict(cluster); original = [str(x) for x in value.get("case_ids", [])]; ids = [x for x in original if x in eligible]; value["case_ids"], value["excluded_unready_case_ids"] = ids, [x for x in original if x not in eligible]; value["skill_change_authorized"] = bool(value.get("skill_change_authorized") is True and ids); clusters.append(value)
+            value = dict(cluster)
+            original = [str(item) for item in value.get("case_ids", [])]
+            authorized_ids = [item for item in original if item in authorizable_failure_ids]
+            value["case_ids"] = authorized_ids
+            value["excluded_unready_case_ids"] = [item for item in original if item not in eligible]
+            value["excluded_non_failure_case_ids"] = [
+                item for item in original if item in eligible and item not in authorizable_failure_ids
+            ]
+            value["skill_change_authorized"] = bool(
+                value.get("skill_change_authorized") is True and authorized_ids
+            )
+            clusters.append(value)
+
         changes = []
         for change in proposal.get("proposed_changes", []):
-            value = dict(change); original = [str(x) for x in value.get("case_ids", [])]; ids = [x for x in original if x in eligible]
-            if ids: value["case_ids"], value["excluded_unready_case_ids"] = ids, [x for x in original if x not in eligible]; changes.append(value)
-        scope = [x for x in proposal.get("target_scope", []) if x in inventory]; primary_passes = [x["case_id"] for x in results if x["status"] == "pass"]; stable, flaky = [], []
-        if kwargs.get("verification_batch") is not None:
-            for cid in primary_passes:
-                verify = verification_heuristic.get(cid)
-                if verify and verify.get("status") == "pass": stable.append(cid)
-                elif verify and verify.get("status") == "fail": flaky.append(cid)
-                elif results_by_id.get(cid, {}).get("verification_status") == "pass": stable.append(cid)
-                else: flaky.append(cid)
-        failed = [x["case_id"] for x in results if x["status"] == "fail"] + flaky
-        if flaky:
-            clusters.append({"id": "unstable-pass-verification", "case_ids": list(flaky), "root_cause": "a primary pass did not reproduce in verification", "skill_change_authorized": True}); changes.append({"target": "SKILL.md", "change": "make the affected workflow deterministic", "why": "primary pass was not stable", "case_ids": list(flaky)}); scope = list(scope) + ([] if "SKILL.md" in scope else ["SKILL.md"])
-        not_eval = [x["case_id"] for x in results if x["status"] == "not_evaluable"]
-        if primary_passes and kwargs.get("verification_batch") is None: next_action = "verify_passes"
-        elif not_eval: next_action = "needs_evidence"
-        elif failed: next_action = "await_user_confirmation"
-        else: next_action = "converged"
+            value = dict(change)
+            original = [str(item) for item in value.get("case_ids", [])]
+            authorized_ids = [item for item in original if item in authorizable_failure_ids]
+            if not authorized_ids:
+                continue
+            value["case_ids"] = authorized_ids
+            value["excluded_unready_case_ids"] = [item for item in original if item not in eligible]
+            value["excluded_non_failure_case_ids"] = [
+                item for item in original if item in eligible and item not in authorizable_failure_ids
+            ]
+            changes.append(value)
+
+        eligible_flaky = [case_id for case_id in flaky if case_id in eligible]
+        if eligible_flaky:
+            clusters.append({
+                "id": "unstable-pass-verification",
+                "case_ids": eligible_flaky,
+                "excluded_unready_case_ids": [],
+                "excluded_non_failure_case_ids": [],
+                "root_cause": "a trusted primary pass did not reproduce in verification",
+                "skill_change_authorized": True,
+            })
+            changes.append({
+                "target": "SKILL.md",
+                "change": "make the affected workflow deterministic",
+                "why": "a trusted primary pass was not stable",
+                "case_ids": eligible_flaky,
+            })
+
+        requested_scope = [str(item) for item in proposal.get("target_scope", [])]
+        if eligible_flaky and "SKILL.md" not in requested_scope:
+            requested_scope.append("SKILL.md")
+        unsupported_scope = [item for item in requested_scope if item not in inventory]
+        scope = [item for item in requested_scope if item in inventory]
+
+        not_eval = sorted(set(
+            [item["case_id"] for item in results if item["status"] == "not_evaluable"]
+            + [item.case_id for item in aggregates if item.status == "not_evaluable"]
+        ))
+        if primary_passes and kwargs.get("verification_batch") is None:
+            next_action = "verify_passes"
+        elif not_eval:
+            next_action = "needs_evidence"
+        elif failed:
+            next_action = "await_user_confirmation"
+        else:
+            next_action = "converged"
+
         blocker = None
         if next_action == "await_user_confirmation":
-            if not any(x.get("skill_change_authorized") is True for x in clusters): next_action, blocker = "needs_evidence", "no failure cluster authorizes a Skill change"
-            elif any(x not in inventory for x in scope): next_action, blocker = "needs_evidence", "target scope is not an editable existing Skill resource: %s" % ", ".join(x for x in scope if x not in inventory)
-        verification_results = {str(c.get("id")): verification_heuristic[str(c.get("id"))] for c in cases if str(c.get("id")) in verification_heuristic}; aggregates = build_case_aggregates(cases, results, evidence, list(bundle.get("verification_evidence", [])), verification_results=verification_results, required_k=2, run_context={"task_id": task_id, "iteration": iteration, "primary_purpose": kwargs.get("primary_batch", {}).get("purpose", "evaluation"), "primary_created_at": kwargs.get("primary_batch", {}).get("created_at"), "verification_created_at": kwargs.get("verification_batch", {}).get("created_at") if kwargs.get("verification_batch") else None}); diagnosis = compile_diagnosis_graph(results, clusters, changes, list(attribution.get("conflicts", []))); model_calls = sum(1 for x in self.receipts if x.get("status") == "succeeded")
+            if not any(item.get("skill_change_authorized") is True for item in clusters):
+                next_action = "needs_evidence"
+                if flaky and not eligible_flaky:
+                    blocker = "unstable Cases are not Oracle-ready and cannot authorize a Skill change"
+                else:
+                    blocker = "no trusted failed Case authorizes a Skill change"
+            elif unsupported_scope:
+                next_action = "needs_evidence"
+                blocker = "target scope is not an editable existing Skill resource: %s" % ", ".join(unsupported_scope)
+        diagnosis = compile_diagnosis_graph(
+            results,
+            clusters,
+            changes,
+            list(attribution.get("conflicts", [])),
+        )
+        model_calls = sum(1 for item in self.receipts if item.get("status") == "succeeded")
         usage = {}
         for receipt in self.receipts:
             for key, value in (receipt.get("usage") or {}).items():
-                if isinstance(value, (int, float)) and not isinstance(value, bool): usage[key] = usage.get(key, 0) + value
+                if isinstance(value, (int, float)) and not isinstance(value, bool):
+                    usage[key] = usage.get(key, 0) + value
         receipt_paths = sorted(str(path) for path in self.artifact_root.glob("attempt-*/**/agent-call-receipt.json"))
         root_receipt_paths = sorted(str(path) for path in self.artifact_root.glob("agent-call-receipt-*.json"))
         query_paths = sorted(str(path) for path in self.artifact_root.glob("evidence-query-receipt-*.json"))
-        return {"api_version": ANALYSIS_DECISION_API_VERSION, "task_id": task_id, "iteration": iteration, "brain_stage": "proposal", "case_results": results, "stable_pass_case_ids": stable, "verification_required_case_ids": primary_passes if kwargs.get("verification_batch") is None else [], "flaky_case_ids": flaky, "failed_case_ids": failed, "not_evaluable_case_ids": not_eval, "without_skill_baseline_case_results": [baseline_heuristic.get(str(c.get("id")), {"case_id": str(c.get("id")), "status": "not_evaluable", "reason": "baseline requires semantic analysis", "evidence_refs": []}) for c in cases] if kwargs.get("comparison_baseline_batch") is not None else [], "incremental_value_case_ids": [x["case_id"] for x in results if x["status"] == "pass" and baseline_heuristic.get(x["case_id"], {}).get("status") == "fail"], "failure_clusters": clusters, "conflicts": list(attribution.get("conflicts", [])), "proposed_changes": changes, "target_scope": scope if changes else [], "optimization_eligible_case_ids": sorted(eligible), "next_action": next_action, "intervention_blocker": blocker, "requires_user_confirmation": next_action == "await_user_confirmation", "analysis_usage": usage, "attempt_verdicts": [a.to_dict() for ag in aggregates for a in ag.attempts], "case_aggregates": [a.to_dict() for a in aggregates], "diagnosis_graph": diagnosis, "evidence_health": {"valid_attempts": sum(a.evidence_validity.status == "valid" for ag in aggregates for a in ag.attempts), "invalid_attempts": sum(a.evidence_validity.status == "invalid" for ag in aggregates for a in ag.attempts), "not_evaluable_case_ids": [a.case_id for a in aggregates if a.status == "not_evaluable"]}, "token_economy": {"model_calls": model_calls, "full_logs_sent": False, "evidence_artifacts": [x.get("artifact") for x in evidence], "serialized_prompt_chars": self._prompt_chars, "estimated_prompt_tokens": (self._prompt_chars + 3) // 4}, "analysis_artifacts": {"evidence_bundle": str(self.artifact_root / "evidence-bundle.json"), "semantic_verdict": str(self.artifact_root / "semantic-verdict.json"), "attribution_report": str(self.artifact_root / "attribution-report.json"), "optimization_plan": str(self.artifact_root / "optimization-plan.json"), "agent_call_receipts": receipt_paths, "agent_call_receipt_history": root_receipt_paths, "evidence_query_receipts": query_paths}, "agent_call_receipts": list(self.receipts), "evidence_query_receipts": list(self.query_receipts)}
+        return {
+            "api_version": ANALYSIS_DECISION_API_VERSION,
+            "task_id": task_id,
+            "iteration": iteration,
+            "brain_stage": "proposal",
+            "case_results": results,
+            "stable_pass_case_ids": stable,
+            "verification_required_case_ids": primary_passes if kwargs.get("verification_batch") is None else [],
+            "flaky_case_ids": flaky,
+            "failed_case_ids": failed,
+            "not_evaluable_case_ids": not_eval,
+            "without_skill_baseline_case_results": [
+                baseline_heuristic.get(
+                    str(case.get("id")),
+                    {
+                        "case_id": str(case.get("id")),
+                        "status": "not_evaluable",
+                        "reason": "baseline requires semantic analysis",
+                        "evidence_refs": [],
+                    },
+                )
+                for case in cases
+            ] if kwargs.get("comparison_baseline_batch") is not None else [],
+            "incremental_value_case_ids": [
+                item["case_id"]
+                for item in results
+                if item["status"] == "pass"
+                and baseline_heuristic.get(item["case_id"], {}).get("status") == "fail"
+            ],
+            "failure_clusters": clusters,
+            "conflicts": list(attribution.get("conflicts", [])),
+            "proposed_changes": changes,
+            "target_scope": scope if changes else [],
+            "optimization_eligible_case_ids": sorted(eligible),
+            "authorizable_failure_case_ids": sorted(authorizable_failure_ids),
+            "next_action": next_action,
+            "intervention_blocker": blocker,
+            "requires_user_confirmation": next_action == "await_user_confirmation",
+            "analysis_usage": usage,
+            "attempt_verdicts": [attempt.to_dict() for aggregate in aggregates for attempt in aggregate.attempts],
+            "case_aggregates": [aggregate.to_dict() for aggregate in aggregates],
+            "diagnosis_graph": diagnosis,
+            "evidence_health": {
+                "valid_attempts": sum(attempt.evidence_validity.status == "valid" for aggregate in aggregates for attempt in aggregate.attempts),
+                "invalid_attempts": sum(attempt.evidence_validity.status == "invalid" for aggregate in aggregates for attempt in aggregate.attempts),
+                "not_evaluable_case_ids": [aggregate.case_id for aggregate in aggregates if aggregate.status == "not_evaluable"],
+            },
+            "token_economy": {
+                "model_calls": model_calls,
+                "full_logs_sent": False,
+                "evidence_artifacts": [item.get("artifact") for item in evidence],
+                "serialized_prompt_chars": self._prompt_chars,
+                "estimated_prompt_tokens": (self._prompt_chars + 3) // 4,
+            },
+            "analysis_artifacts": {
+                "evidence_bundle": str(self.artifact_root / "evidence-bundle.json"),
+                "semantic_verdict": str(self.artifact_root / "semantic-verdict.json"),
+                "attribution_report": str(self.artifact_root / "attribution-report.json"),
+                "optimization_plan": str(self.artifact_root / "optimization-plan.json"),
+                "agent_call_receipts": receipt_paths,
+                "agent_call_receipt_history": root_receipt_paths,
+                "evidence_query_receipts": query_paths,
+            },
+            "agent_call_receipts": list(self.receipts),
+            "evidence_query_receipts": list(self.query_receipts),
+        }
 
 
 __all__ = ["IterationBrain", "LocalEvidenceQueryPort", "EvidenceQueryError"]

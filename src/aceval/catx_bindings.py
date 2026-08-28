@@ -8,17 +8,200 @@ changes, while orchestration, evidence, and replay identities remain intact.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import os
+import re
+import shlex
 from types import MappingProxyType
-from typing import Any, Mapping, Optional, Protocol
+from typing import Any, Mapping, Optional, Protocol, Sequence
 
 from .environment_contracts import canonical_hash, normalize_sha256
 
 
 CATX_EXECUTION_BINDING_API_VERSION = "aceval.catx-execution-binding/v1"
 
+_TOOL_CALL_TYPES = frozenset(("agent.tool_use", "tool.call", "tool_call"))
+_TOOL_RESULT_TYPES = frozenset(("agent.tool_result", "tool.result", "tool_result"))
+_SUCCESS_STATUSES = frozenset(("ok", "success", "succeeded", "completed", "complete", "done"))
+_FULL_SHA = re.compile(r"(?<![0-9a-f])([0-9a-f]{40})(?![0-9a-f])", re.IGNORECASE)
+_COMMAND_TOOL_NAMES = frozenset(
+    (
+        "bash",
+        "command",
+        "exec",
+        "execute",
+        "process_exec",
+        "run_command",
+        "shell",
+        "terminal",
+    )
+)
+
 
 class CatxBindingError(ValueError):
     """A CATX execution is not provably bound to the requested inputs."""
+
+
+def _nested(value: Any, *keys: str) -> Any:
+    current = value
+    for key in keys:
+        if not isinstance(current, Mapping):
+            return None
+        current = current.get(key)
+    return current
+
+
+def _event_kind(event: Mapping[str, Any]) -> str:
+    value = event.get("type") or event.get("kind")
+    return str(value or "")
+
+
+def _call_id(event: Mapping[str, Any], *, result: bool = False) -> Optional[str]:
+    keys = (
+        ("tool_use_id", "tool_call_id", "call_id", "parent_event_id")
+        if result
+        else ("id", "tool_call_id", "call_id", "tool_use_id")
+    )
+    for key in keys:
+        value = event.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    # A few CATX proxies wrap the identifiers in a payload object.  Keep the
+    # accepted aliases narrow so arbitrary text fields can never become a
+    # binding relationship.
+    for container in (event.get("payload"), event.get("data"), event.get("metadata")):
+        if not isinstance(container, Mapping):
+            continue
+        for key in keys:
+            value = container.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+    return None
+
+
+def _command_values(value: Any) -> tuple[str, ...]:
+    """Extract executable command fields, never free-form event text."""
+
+    values: list[str] = []
+
+    def visit(item: Any, *, field: Optional[str] = None) -> None:
+        if isinstance(item, Mapping):
+            for key, child in item.items():
+                key_text = str(key).casefold()
+                if key_text in {"command", "cmd", "shell_command"}:
+                    if isinstance(child, str):
+                        values.append(child)
+                    elif isinstance(child, Sequence) and not isinstance(child, (str, bytes)):
+                        if all(isinstance(part, (str, int, float)) and not isinstance(part, bool) for part in child):
+                            values.append(" ".join(str(part) for part in child))
+                elif key_text in {"argv", "args", "arguments", "cmd"} and isinstance(child, Sequence) and not isinstance(child, (str, bytes)):
+                    if all(isinstance(part, (str, int, float)) and not isinstance(part, bool) for part in child):
+                        values.append(" ".join(str(part) for part in child))
+                    else:
+                        visit(child, field=key_text)
+                elif key_text in {"input", "parameters", "payload", "data", "arguments", "request"}:
+                    visit(child, field=key_text)
+        elif field in {"input", "parameters", "payload", "data", "arguments", "request"}:
+            if isinstance(item, str) and item.strip():
+                values.append(item)
+            elif isinstance(item, Sequence) and not isinstance(item, (str, bytes)):
+                for child in item:
+                    visit(child, field=field)
+
+    visit(value)
+    return tuple(item for item in values if item.strip())
+
+
+def _result_values(value: Any) -> tuple[str, ...]:
+    """Extract structured stdout/result text from a tool result."""
+
+    values: list[str] = []
+
+    def visit(item: Any, *, key: Optional[str] = None) -> None:
+        if isinstance(item, str):
+            if key in {"text", "stdout", "output", "result", "value", "content", "message", "data"}:
+                values.append(item)
+            return
+        if isinstance(item, Mapping):
+            for child_key, child in item.items():
+                name = str(child_key).casefold()
+                if name in {"text", "stdout", "output", "result", "value", "content", "message", "data"}:
+                    visit(child, key=name)
+                elif name in {"payload", "data", "result", "response", "output"}:
+                    visit(child, key=name)
+                # Do not recurse through arbitrary keys: a prose field such
+                # as ``description`` must not be accepted as command output.
+        elif isinstance(item, Sequence) and not isinstance(item, (str, bytes)):
+            for child in item:
+                visit(child, key=key)
+
+    visit(value)
+    return tuple(item for item in values if item.strip())
+
+
+def _command_mount(command: str) -> Optional[str]:
+    """Return the mount from a structured ``git -C MOUNT rev-parse HEAD``."""
+
+    try:
+        tokens = shlex.split(command, posix=True)
+    except (ValueError, TypeError):
+        return None
+    if len(tokens) != 5 or os.path.basename(tokens[0]) != "git":
+        return None
+    if tokens[1] != "-C" or tokens[3] != "rev-parse" or tokens[4] != "HEAD":
+        return None
+    mount = tokens[2]
+    if mount.startswith("/"):
+        return os.path.normpath(mount)
+    return None
+
+
+def _structured_call(event: Any) -> Optional[Mapping[str, Any]]:
+    if not isinstance(event, Mapping) or _event_kind(event) not in _TOOL_CALL_TYPES:
+        return None
+    identifier = _call_id(event)
+    commands = _command_values(event)
+    if not identifier or not commands:
+        return None
+    return {"id": identifier, "commands": commands}
+
+
+def _looks_like_command_call(event: Any) -> bool:
+    """Whether a typed tool call is intended to execute a shell command.
+
+    CATX sessions routinely contain non-command calls such as ``read_file``
+    whose payload has no executable command.  Those calls are irrelevant to
+    repository binding and must not be treated as malformed command evidence.
+    A command-shaped payload or a well-known command tool name, however, is
+    checked fail-closed when its id/command structure is incomplete.
+    """
+
+    if not isinstance(event, Mapping) or _event_kind(event) not in _TOOL_CALL_TYPES:
+        return False
+    name = event.get("name") or event.get("tool")
+    if isinstance(name, str) and name.strip().casefold() in _COMMAND_TOOL_NAMES:
+        return True
+    return bool(_command_values(event))
+
+
+def _structured_result(event: Any) -> Optional[Mapping[str, Any]]:
+    if not isinstance(event, Mapping) or _event_kind(event) not in _TOOL_RESULT_TYPES:
+        return None
+    identifier = _call_id(event, result=True)
+    values = _result_values(event)
+    if not identifier or not values:
+        return None
+    is_error = event.get("is_error")
+    ok = event.get("ok")
+    success = event.get("success")
+    exit_code = event.get("exit_code", event.get("returncode"))
+    status = event.get("status") or event.get("state")
+    if is_error is True or ok is False or success is False:
+        return {"id": identifier, "values": values, "success": False}
+    if isinstance(exit_code, bool) or (exit_code is not None and str(exit_code) != "0"):
+        return {"id": identifier, "values": values, "success": False}
+    if status is not None and str(status).casefold() not in _SUCCESS_STATUSES:
+        return {"id": identifier, "values": values, "success": False}
+    return {"id": identifier, "values": values, "success": True}
 
 
 def _text(value: Any, label: str, maximum: int = 4096) -> str:
@@ -277,21 +460,46 @@ class CatxPayloadBindingAdapter:
         """
         if not isinstance(events, (list, tuple)):
             raise CatxBindingError("CATX event log must be an array")
-        tool_calls = []
-        tool_results = []
-        for event in events:
-            if not isinstance(event, Mapping) or event.get("type") == "user.message":
+        # Never search ``str(event)`` here.  A model message or a tool result
+        # can contain a quoted command/path without that command having run.
+        # Only a typed tool-use with a structured command and a paired typed
+        # tool-result is admissible binding evidence.
+        calls: dict[str, dict[str, Any]] = {}
+        results: dict[str, list[dict[str, Any]]] = {}
+        malformed_calls = 0
+        malformed_results = 0
+        for index, event in enumerate(events):
+            call = _structured_call(event)
+            if call is not None:
+                call = dict(call)
+                call["event_index"] = index
+                if call["id"] in calls:
+                    # Duplicate call ids make the association ambiguous even
+                    # if one of the duplicate events happens to look valid.
+                    malformed_calls += 1
+                else:
+                    calls[str(call["id"])] = call
                 continue
-            event_type = str(event.get("type") or "")
-            if event_type not in ("agent.tool_use", "agent.tool_result", "tool_call", "tool_result"):
+            if isinstance(event, Mapping) and _event_kind(event) in _TOOL_CALL_TYPES:
+                # Ignore ordinary non-command tools (read_file, list_dir,
+                # browser actions, ...).  Only a command-shaped event is a
+                # binding assertion that must satisfy the strict schema.
+                if _looks_like_command_call(event):
+                    malformed_calls += 1
                 continue
-            if event_type in ("agent.tool_use", "tool_call"):
-                tool_calls.append(str(event))
-            else:
-                tool_results.append(str(event))
-        call_corpus = "\n".join(tool_calls)
-        result_corpus = "\n".join(tool_results)
-        corpus = call_corpus + "\n" + result_corpus
+            result = _structured_result(event)
+            if result is not None:
+                result = dict(result)
+                result["event_index"] = index
+                results.setdefault(str(result["id"]), []).append(result)
+            elif isinstance(event, Mapping) and _event_kind(event) in _TOOL_RESULT_TYPES:
+                # A non-command tool result is not binding evidence.  A
+                # malformed result for a known command call is still a hard
+                # failure; unrelated result shapes may safely be ignored.
+                result_id = _call_id(event, result=True)
+                if result_id and result_id in calls:
+                    malformed_results += 1
+
         metadata = dict(binding.metadata) if isinstance(binding.metadata, Mapping) else {}
         expected_mounts = metadata.get("expected_mounts") if isinstance(metadata.get("expected_mounts"), (list, tuple)) else ()
         checks = []
@@ -305,22 +513,84 @@ class CatxPayloadBindingAdapter:
             checks.append({
                 "mount_path": mount,
                 "revision": revision or None,
-                "mount_observed": mount in corpus,
-                "revision_observed": (not revision) or revision in result_corpus,
+                "mount_observed": False,
+                "revision_observed": False,
             })
         if not checks:
             # A single-repository binding still has a useful mount path in the
-            # profile; use it as the minimum event-log assertion.
+            # profile; use it as the minimum event-log assertion.  The
+            # revision is still checked against a full SHA in the result.
             resources = tuple(getattr(client.profile, "repository_resources", ()) or ())
             match = next((item for item in resources if getattr(item, "url", None) == binding.repository_ref), None)
             mount = getattr(match, "mount_path", "") if match is not None else ""
             checks = [{
                 "mount_path": mount,
                 "revision": binding.head_commit,
-                "mount_observed": bool(mount) and mount in corpus,
-                "revision_observed": not binding.head_commit or binding.head_commit in result_corpus,
+                "mount_observed": False,
+                "revision_observed": False,
             }]
-        verified = bool(checks) and all(item["mount_observed"] and item["revision_observed"] for item in checks)
+        for check in checks:
+            mount = os.path.normpath(str(check["mount_path"])) if check.get("mount_path") else ""
+            revision = str(check.get("revision") or "").casefold()
+            matching_calls = []
+            for call in calls.values():
+                command_mounts = tuple(
+                    mount_value
+                    for command in call.get("commands", ())
+                    if (mount_value := _command_mount(str(command))) is not None
+                )
+                if mount and mount in command_mounts:
+                    matching_calls.append(call)
+            selected = None
+            selected_result = None
+            for call in matching_calls:
+                paired = [
+                    result
+                    for result in results.get(str(call["id"]), ())
+                    if int(result.get("event_index", -1)) > int(call.get("event_index", -1))
+                ]
+                if not paired:
+                    continue
+                # A call id should have one authoritative result. Multiple
+                # results are ambiguous and therefore not binding evidence.
+                if len(paired) != 1:
+                    continue
+                result = paired[0]
+                observed_shas = {
+                    match.group(1).casefold()
+                    for value in result.get("values", ())
+                    for match in _FULL_SHA.finditer(str(value))
+                }
+                if not result.get("success") or not observed_shas:
+                    continue
+                if revision and revision not in observed_shas:
+                    continue
+                selected, selected_result = call, result
+                break
+            if selected is not None and selected_result is not None:
+                observed_shas = sorted(
+                    {
+                        match.group(1).casefold()
+                        for value in selected_result.get("values", ())
+                        for match in _FULL_SHA.finditer(str(value))
+                    }
+                )
+                check.update(
+                    {
+                        "mount_observed": True,
+                        "revision_observed": (not revision) or revision in observed_shas,
+                        "call_id": selected["id"],
+                        "call_event_index": selected.get("event_index"),
+                        "result_event_index": selected_result.get("event_index"),
+                        "observed_commits": observed_shas,
+                        "result_success": bool(selected_result.get("success")),
+                    }
+                )
+            else:
+                check.update({"result_success": False, "observed_commits": []})
+        verified = bool(checks) and malformed_calls == 0 and malformed_results == 0 and all(
+            item["mount_observed"] and item["revision_observed"] for item in checks
+        )
         evidence = CatxBindingEvidence(
             verified=verified,
             requested_binding_hash=binding.binding_hash,
@@ -333,8 +603,10 @@ class CatxPayloadBindingAdapter:
                 "verification_mode": "event_log",
                 "server_echo": False,
                 "checks": checks,
-                "tool_call_count": len(tool_calls),
-                "tool_result_count": len(tool_results),
+                "tool_call_count": len(calls),
+                "tool_result_count": sum(len(items) for items in results.values()),
+                "malformed_tool_call_count": malformed_calls,
+                "malformed_tool_result_count": malformed_results,
             },
         )
         if verified:

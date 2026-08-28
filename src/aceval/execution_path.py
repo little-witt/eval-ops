@@ -202,7 +202,7 @@ def _normalize_step_mapping(
         if isinstance(command, Mapping):
             argv = command.get("argv")
             if isinstance(argv, Sequence) and not isinstance(argv, (str, bytes)) and argv:
-                derived.setdefault("contains", [str(argument) for argument in argv])
+                derived.setdefault("command_contains", [str(argument) for argument in argv])
         if derived:
             item["match"] = derived
     return item
@@ -223,7 +223,13 @@ class ExecutionStepSpec:
         if self.kind not in STEP_KINDS:
             raise ExecutionPathError("step.kind must be one of %s" % ", ".join(STEP_KINDS))
         matcher = _mapping(self.match, "step.match")
-        allowed = {"event_type", "tool_name", "contains", "fields"}
+        allowed = {
+            "event_type",
+            "tool_name",
+            "contains",
+            "command_contains",
+            "fields",
+        }
         unknown = sorted(set(matcher).difference(allowed))
         if unknown:
             raise ExecutionPathError("step.match contains unsupported fields: %s" % ", ".join(unknown))
@@ -282,6 +288,10 @@ class ExecutionPathSpec:
             raise ExecutionPathError("execution path steps must have unique ids")
         known = set(ids)
         for step in self.steps:
+            if step.id in step.after:
+                raise ExecutionPathError(
+                    "step %s cannot reference itself as a predecessor" % step.id
+                )
             unknown = set(step.after).difference(known)
             if unknown:
                 raise ExecutionPathError("step %s references unknown predecessors" % step.id)
@@ -361,6 +371,36 @@ def _one_or_many(value: Any) -> Tuple[Any, ...]:
     return (value,)
 
 
+def _command_text(event: Mapping[str, Any]) -> Optional[str]:
+    """Return only executable command/argv fields from a tool-call event.
+
+    Searching the whole event for a command-shaped string is unsafe: an
+    instruction such as "do not run git push" is evidence about policy, not
+    evidence that the command was executed.
+    """
+
+    event_type = str(event.get("kind") or event.get("type") or "")
+    if event_type not in ("tool_call", "tool", "tool_start"):
+        return None
+    values = []
+    for path in (
+        "command",
+        "argv",
+        "payload.command",
+        "payload.argv",
+        "payload.input.command",
+        "payload.input.argv",
+        "arguments.command",
+        "arguments.argv",
+    ):
+        value = _field(event, path)
+        if isinstance(value, str):
+            values.append(value)
+        elif isinstance(value, Sequence) and not isinstance(value, (str, bytes)):
+            values.append(" ".join(str(item) for item in value))
+    return "\n".join(values) if values else None
+
+
 def _matches(event: Mapping[str, Any], matcher: Mapping[str, Any]) -> bool:
     event_type = event.get("kind") or event.get("type")
     tool_name = event.get("tool") or event.get("name") or _field(event, "payload.name")
@@ -371,6 +411,13 @@ def _matches(event: Mapping[str, Any], matcher: Mapping[str, Any]) -> bool:
     text = json.dumps(event, ensure_ascii=False, sort_keys=True, default=str)
     if "contains" in matcher and not all(str(item) in text for item in _one_or_many(matcher["contains"])):
         return False
+    if "command_contains" in matcher:
+        command_text = _command_text(event)
+        if command_text is None or not all(
+            str(item) in command_text
+            for item in _one_or_many(matcher["command_contains"])
+        ):
+            return False
     fields = matcher.get("fields", {})
     if isinstance(fields, Mapping) and any(_field(event, str(path)) != expected for path, expected in fields.items()):
         return False

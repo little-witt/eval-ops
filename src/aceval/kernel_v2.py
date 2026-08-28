@@ -161,8 +161,12 @@ class AttemptVerdict:
 
     @property
     def hard_pass(self) -> bool:
-        return self.evidence_validity.evaluable and all(
-            item.status == "pass" for item in self.dimensions if item.hard
+        hard_dimensions = tuple(item for item in self.dimensions if item.hard)
+        # Match the orchestrator's hard-pass contract: an empty hard-grade
+        # set is not proof of success (``all(())`` would otherwise make an
+        # exploratory/model-only result look like a trusted pass).
+        return self.evidence_validity.status == "valid" and bool(hard_dimensions) and all(
+            item.status == "pass" for item in hard_dimensions
         )
 
     @property
@@ -270,17 +274,75 @@ def _validity(evidence: Mapping[str, Any]) -> EvidenceValidity:
         reasons.append("attempt.remote_not_completed")
     if evidence.get("error"):
         reasons.append("attempt.runtime_error")
+    completeness = evidence.get("log_completeness")
+    partial = []
+    if isinstance(completeness, Mapping):
+        completeness_reasons = [str(item) for item in completeness.get("reason_codes", ()) if item]
+        complete_flag = completeness.get("complete")
+        if complete_flag is not None and not isinstance(complete_flag, bool):
+            completeness_reasons.append("completeness_flag_untyped")
+        legacy_fixture = completeness.get("legacy_event_log") is True and str(evidence.get("source") or "") not in {"catx_session_api", "catx"}
+        if legacy_fixture:
+            # Synthetic/local gateways may not expose the CATX event endpoint;
+            # their explicit legacy marker is informative, not a failure of
+            # the local exploratory run.  Production CATX data never takes
+            # this branch.
+            completeness_reasons = [item for item in completeness_reasons if item != "legacy_event_log"]
+        # A production receipt must carry both the original event array and
+        # the hash calculated over that exact array.  Do not let a stale
+        # ``complete: true`` flag override these concrete omissions.
+        production_source = str(evidence.get("source") or "") in {"catx_session_api", "catx"}
+        if production_source and completeness.get("legacy_event_log") is not True:
+            if completeness.get("raw_events") is not True and "event_log_missing" not in completeness_reasons:
+                completeness_reasons.append("event_log_missing")
+            if not isinstance(completeness.get("event_log_sha256"), str) or not completeness.get("event_log_sha256"):
+                if "event_log_hash_missing" not in completeness_reasons:
+                    completeness_reasons.append("event_log_hash_missing")
+        if complete_flag is False and not completeness_reasons:
+            # A bare ``complete: false`` is still a failed integrity claim;
+            # do not let an empty reason list accidentally make the attempt
+            # appear valid.
+            completeness_reasons.append("incomplete")
+        if complete_flag is False or completeness_reasons:
+            reasons.extend("attempt.log_%s" % item for item in completeness_reasons)
+            if completeness.get("missing_required_event_types"):
+                reasons.append("attempt.required_event_missing")
+            missing.append("complete_event_log")
+        if production_source and completeness.get("legacy_event_log") is True:
+            # Legacy CATX-shaped data is useful for inspection but must not be
+            # used as a trustworthy attempt for candidate authorization.
+            partial.append("attempt.legacy_event_log")
+            missing.append("immutable_event_log")
     path = evidence.get("path_conformance")
     if isinstance(path, Mapping) and path.get("status") == "not_evaluable":
-        reasons.append("attempt.trace_incomplete")
+        partial.append("attempt.trace_incomplete")
         missing.append("trace")
     return EvidenceValidity(
-        status="invalid" if reasons else "valid",
+        status="invalid" if reasons else "partial" if partial else "valid",
         scope="attempt",
-        reason_codes=tuple(reasons),
+        reason_codes=tuple(reasons + partial),
         missing_channels=tuple(missing),
         evidence_refs=refs,
     )
+
+
+def _has_grounded_reference(refs: Sequence[str], artifact_refs: Sequence[str]) -> bool:
+    """Return whether a semantic citation points at this immutable attempt.
+
+    Models may add a fragment (for example ``artifact.json#events[3]``) to
+    deep-link a finding, but a free-standing path or prose token is not proof
+    that the cited evidence belongs to the current attempt.
+    """
+
+    for reference in refs:
+        value = str(reference).strip()
+        if not value:
+            continue
+        for artifact in artifact_refs:
+            anchor = str(artifact).strip()
+            if anchor and (value == anchor or value.startswith(anchor + "#")):
+                return True
+    return False
 
 
 def build_attempt_verdict(
@@ -299,14 +361,131 @@ def build_attempt_verdict(
     artifact_refs = tuple(str(item) for item in (evidence.get("artifact"),) if item)
     dimensions = []
     if validity.evaluable:
+        metadata = case.get("metadata") if isinstance(case.get("metadata"), Mapping) else {}
+        aceval_test = metadata.get("aceval_test") if isinstance(metadata.get("aceval_test"), Mapping) else {}
+        oracle_trust = aceval_test.get("oracle_trust") or metadata.get("oracle_trust")
         exact = evidence.get("exact_expected_match")
         result_status = str(case_result.get("status") or "not_evaluable")
         reason = str(case_result.get("reason") or "case result")
-        if exact is True:
+        formal = evidence.get("formal_grading")
+        formal_grades = formal.get("grades", ()) if isinstance(formal, Mapping) else ()
+        has_formal_grades = isinstance(formal_grades, Sequence) and not isinstance(formal_grades, (str, bytes)) and bool(formal_grades)
+        # ``formal_grading`` is an immutable deterministic signal.  If a
+        # producer claims to have run formal graders but gives us an empty or
+        # malformed grade list, do not silently fall back to a semantic/exact
+        # result.  That fallback could turn a broken grader receipt into a
+        # passing Attempt.  Keep the malformed record visible as a hard,
+        # not-evaluable dimension so the caller can request a fresh run.
+        formal_status = str(formal.get("status") or "") if isinstance(formal, Mapping) else ""
+        formal_present = "formal_grading" in evidence
+        evalpack_mode = metadata.get("expectation_mode") == "evalpack_graders"
+        evalpack_lifecycle = str(metadata.get("evalpack_lifecycle") or "")
+        trusted_evalpack = (
+            evalpack_lifecycle in ("frozen", "legacy")
+            and (evalpack_mode or bool(metadata.get("evalpack_grader_ids")))
+        )
+        # A generated draft may carry an informational ``not_calibrated``
+        # receipt while a user-provided exact expectation or an exploratory
+        # semantic result remains independently evaluable.  Once a Case is
+        # explicitly bound to a trusted EvalPack, however, the formal receipt
+        # is mandatory and cannot be replaced by a softer result.  Explicitly
+        # malformed formal claims (including ``status: pass`` without grades)
+        # are always treated as declared and fail closed.
+        informational_draft = formal_status == "not_calibrated" and not trusted_evalpack
+        formal_declared = evalpack_mode or trusted_evalpack or (
+            isinstance(formal, Mapping)
+            and (
+                formal_status in _STATUSES
+                or ("grades" in formal and formal_status != "not_calibrated")
+            )
+        ) or (
+            formal_present
+            and formal is not None
+            and not informational_draft
+        )
+        formal_contract_errors = []
+        if formal_declared and not isinstance(formal, Mapping):
+            formal_contract_errors.append("formal_grading must be an object")
+        elif formal_declared and not has_formal_grades:
+            formal_contract_errors.append("formal_grading.grades must be a non-empty array")
+        elif has_formal_grades and not all(isinstance(item, Mapping) for item in formal_grades):
+            formal_contract_errors.append("formal_grading.grades contains a non-object item")
+
+        def mark_formal_contract_error(message: str) -> None:
+            # Keep one stable diagnostic dimension even when several malformed
+            # grades are present; duplicate dimension names would make the
+            # whole verdict unparsable and hide the useful failure reason.
+            if any(item.dimension == "outcome:formal_grading_contract" for item in dimensions):
+                return
+            dimensions.append(DimensionGrade(
+                "outcome:formal_grading_contract",
+                "not_evaluable",
+                None,
+                True,
+                "formal_grading_contract/v1",
+                message,
+                artifact_refs,
+            ))
+
+        if formal_contract_errors:
+            mark_formal_contract_error(
+                "formal EvalPack Grader receipt is missing or malformed: %s" % "; ".join(formal_contract_errors)
+            )
+        if has_formal_grades and not formal_contract_errors:
+            dimension_by_type = {
+                "workspace_diff": "safety_side_effect",
+                "trace_assert": "procedure",
+                "source_reference": "evidence_grounding",
+                "artifact_exists": "outcome",
+                "json_schema": "outcome",
+                "json_path": "outcome",
+                "record_match": "outcome",
+                "code_review_findings": "outcome",
+            }
+            seen_formal_dimensions = set()
+            for grade in formal_grades:
+                # The contract check above records malformed entries as
+                # not-evaluable; skip them here to avoid raising while still
+                # preserving any well-formed dimensions for diagnostics.
+                if not isinstance(grade, Mapping):
+                    continue
+                try:
+                    raw_status = str(grade.get("status") or "not_evaluable")
+                    if raw_status not in _STATUSES:
+                        raise ValueError("unsupported formal grade status: %s" % raw_status)
+                    grade_status = raw_status
+                    raw_score = grade.get("score")
+                    score = (
+                        float(raw_score)
+                        if isinstance(raw_score, (int, float)) and not isinstance(raw_score, bool)
+                        else 1.0 if grade_status == "pass" else 0.0 if grade_status == "fail" else None
+                    )
+                    grader_id = str(grade.get("grader_id") or "evalpack-grader")
+                    base_dimension = dimension_by_type.get(str(grade.get("grader_type") or ""), "outcome")
+                    if "hard" in grade and not isinstance(grade.get("hard"), bool):
+                        raise ValueError("formal grade hard flag must be boolean")
+                    dimension = DimensionGrade(
+                        "%s:%s" % (base_dimension, grader_id),
+                        grade_status,
+                        score,
+                        bool(grade.get("hard", True)),
+                        "%s/%s" % (grader_id, str(grade.get("version") or "unknown")),
+                        str(grade.get("message") or "EvalPack Grader result"),
+                        artifact_refs,
+                    )
+                    if dimension.dimension in seen_formal_dimensions:
+                        mark_formal_contract_error("formal EvalPack Grader result contains duplicate dimensions")
+                        break
+                    seen_formal_dimensions.add(dimension.dimension)
+                    dimensions.append(dimension)
+                except (KernelV2Error, TypeError, ValueError) as exc:
+                    mark_formal_contract_error("formal EvalPack Grader result is invalid: %s" % str(exc)[:300])
+                    break
+        elif not formal_declared and exact is True:
             dimensions.append(DimensionGrade("outcome", "pass", 1.0, True, "exact_expected/v1", reason, refs or artifact_refs))
-        elif exact is False:
+        elif not formal_declared and exact is False:
             dimensions.append(DimensionGrade("outcome", "fail", 0.0, True, "exact_expected/v1", reason, refs or artifact_refs))
-        elif result_status in _STATUSES:
+        elif not formal_declared and result_status in _STATUSES:
             dimensions.append(DimensionGrade(
                 "outcome",
                 result_status,
@@ -317,14 +496,44 @@ def build_attempt_verdict(
                 refs,
                 source="inference",
             ))
-        grounded = bool(refs) or exact is not None
+        exploratory_oracle = (
+            metadata.get("expectation_mode") == "model_proposed"
+            or oracle_trust in ("model_proposed", "unobservable")
+        )
+        calibrated_semantic = (
+            metadata.get("expectation_mode") == "semantic"
+            and aceval_test.get("oracle_trust") == "human_confirmed"
+            and aceval_test.get("oracle_ready") is True
+        )
+        # Keep the historical free-form citation behavior for uncalibrated
+        # exploratory/compatibility records, while requiring a citation that
+        # actually anchors this immutable artifact for human-confirmed
+        # semantic judgments.
+        grounded = (
+            exact is not None
+            or _has_grounded_reference(refs, artifact_refs)
+            if calibrated_semantic
+            else bool(refs) or exact is not None
+        )
+        # A semantic pass without an explicit evidence reference is not safe
+        # to use as proof. Explicitly exploratory/model-proposed Cases remain
+        # visible and backwards-compatible: they cannot authorize a Skill edit
+        # via ``_optimization_case_ready`` and do not silently become a trusted
+        # Oracle. Deterministic exact and EvalPack results already carry their
+        # own hard evidence.
+        grounding_hard = (
+            result_status == "pass"
+            and exact is None
+            and not has_formal_grades
+            and not exploratory_oracle
+        )
         dimensions.append(DimensionGrade(
             "grounding",
             "pass" if grounded else "not_evaluable",
             1.0 if grounded else None,
-            False,
+            grounding_hard,
             "evidence_reference/v1",
-            "result is linked to immutable evidence" if grounded else "semantic result did not provide an evidence reference",
+            "result is linked to this immutable attempt" if grounded else "semantic result did not cite this attempt's immutable evidence",
             refs or artifact_refs,
         ))
         trace_summary = evidence.get("trace")
@@ -340,7 +549,6 @@ def build_attempt_verdict(
                 "tool/runtime errors were observed" if has_runtime_errors else "no tool/runtime error was observed in the complete trace",
                 artifact_refs,
             ))
-        metadata = case.get("metadata") if isinstance(case.get("metadata"), Mapping) else {}
         token_budget = metadata.get("max_total_tokens")
         usage = evidence.get("usage") if isinstance(evidence.get("usage"), Mapping) else {}
         total_tokens = usage.get("total_tokens")
@@ -374,6 +582,10 @@ def build_attempt_verdict(
         status = result_status if result_status in _STATUSES else "not_evaluable"
         if any(item.hard and item.status == "fail" for item in dimensions):
             status = "fail"
+        elif any(item.hard and item.status == "not_evaluable" for item in dimensions):
+            status = "not_evaluable"
+        elif validity.status != "valid":
+            status = "not_evaluable"
     else:
         status = "not_evaluable"
     return AttemptVerdict(
@@ -525,8 +737,270 @@ def compile_diagnosis_graph(
     return graph
 
 
+def _aggregate_contract_errors(
+    value: Mapping[str, Any], *, case_id: str
+) -> Tuple[str, ...]:
+    """Validate the minimum immutable shape used by candidate comparison.
+
+    ``compare_candidates`` is an authorization boundary.  It must not trust
+    a producer-provided ``stable_pass``/``pass_rate`` when the underlying
+    attempts or hard dimensions are absent, malformed, or contradictory.
+    Older records may omit optional manifest fields, but they still need a
+    complete attempt/evidence receipt before they can be used as a paired
+    baseline.
+    """
+
+    errors = []
+    if not isinstance(value.get("stable_pass"), bool):
+        errors.append("stable_pass must be boolean")
+    status = value.get("status")
+    if status is not None and status not in _STATUSES:
+        errors.append("status is invalid")
+    pass_rate = value.get("pass_rate")
+    # A CaseAggregate legitimately reports ``null`` when every Attempt is
+    # not-evaluable.  Keep that state distinct from a measured 0% result;
+    # only reject null after inspecting the receipt below when evaluable
+    # attempts are present.
+    if pass_rate is not None and (
+        isinstance(pass_rate, bool) or not isinstance(pass_rate, (int, float))
+    ):
+        errors.append("pass_rate must be null or a finite number")
+    elif pass_rate is not None and (
+        not math.isfinite(float(pass_rate)) or not 0.0 <= float(pass_rate) <= 1.0
+    ):
+        errors.append("pass_rate is outside 0..1")
+
+    # Aggregates emitted before the V2 attempt receipt was introduced may
+    # omit ``attempts`` entirely.  Keep those records indexable for history
+    # and diagnostics, but let the caller mark them as legacy/non-promotable;
+    # an explicitly supplied empty or malformed attempts array remains an
+    # invalid receipt.
+    legacy_without_attempts = "attempts" not in value
+    attempts = value.get("attempts")
+    if legacy_without_attempts:
+        attempts = ()
+    elif not isinstance(attempts, Sequence) or isinstance(attempts, (str, bytes)) or not attempts:
+        errors.append("attempts must be a non-empty array")
+        attempts = ()
+    else:
+        attempt_ids = []
+        attempt_id_fields_present = False
+        for index, attempt in enumerate(attempts):
+            prefix = "attempt[%d]" % index
+            if not isinstance(attempt, Mapping):
+                errors.append("%s must be an object" % prefix)
+                continue
+            # Receipts created before attempt IDs were introduced can still be
+            # inspected in read-only compatibility mode.  If a producer does
+            # provide one ID, however, every receipt must provide a unique,
+            # non-empty ID; otherwise repeated runs could be silently merged
+            # or counted twice at the authorization boundary.
+            if "attempt_id" in attempt:
+                attempt_id_fields_present = True
+                raw_attempt_id = attempt.get("attempt_id")
+                if not isinstance(raw_attempt_id, str) or not raw_attempt_id.strip():
+                    errors.append("%s attempt_id must be a non-empty string" % prefix)
+                else:
+                    attempt_ids.append(raw_attempt_id.strip())
+            attempt_case_id = attempt.get("case_id")
+            if attempt_case_id is not None and str(attempt_case_id) != case_id:
+                errors.append("%s case_id does not match aggregate" % prefix)
+            if attempt.get("status") not in _STATUSES:
+                errors.append("%s status is invalid" % prefix)
+            validity = attempt.get("evidence_validity")
+            if not isinstance(validity, Mapping) or validity.get("status") not in _VALIDITY:
+                errors.append("%s evidence validity is missing or invalid" % prefix)
+            dimensions = attempt.get("dimensions")
+            if not isinstance(dimensions, Sequence) or isinstance(dimensions, (str, bytes)) or not dimensions:
+                errors.append("%s dimensions must be a non-empty array" % prefix)
+                continue
+            names = set()
+            for dimension_index, dimension in enumerate(dimensions):
+                label = "%s.dimensions[%d]" % (prefix, dimension_index)
+                if not isinstance(dimension, Mapping):
+                    errors.append("%s must be an object" % label)
+                    continue
+                name = dimension.get("dimension")
+                if not isinstance(name, str) or not name.strip() or name in names:
+                    errors.append("%s dimension name is missing or duplicated" % label)
+                else:
+                    names.add(name)
+                if dimension.get("status") not in _STATUSES:
+                    errors.append("%s status is invalid" % label)
+                if not isinstance(dimension.get("hard"), bool):
+                    errors.append("%s hard must be boolean" % label)
+                score = dimension.get("score")
+                if score is not None and (
+                    isinstance(score, bool)
+                    or not isinstance(score, (int, float))
+                    or not math.isfinite(float(score))
+                    or not 0.0 <= float(score) <= 1.0
+                ):
+                    errors.append("%s score is invalid" % label)
+
+            # ``hard_pass`` is a derived security property, not a value that
+            # an aggregate producer may assert independently.  Without this
+            # check a forged aggregate could set ``hard_pass: true`` while
+            # carrying only soft dimensions, and candidate comparison would
+            # accept it as a stable hard-gated pass.  Require at least one
+            # well-formed hard dimension and verify the serialized flag
+            # against the same evidence/status rule used by AttemptVerdict.
+            hard_dimensions = tuple(
+                item
+                for item in dimensions
+                if isinstance(item, Mapping) and isinstance(item.get("hard"), bool) and item.get("hard") is True
+            )
+            derived_hard_pass = (
+                isinstance(validity, Mapping)
+                and validity.get("status") == "valid"
+                and bool(hard_dimensions)
+                and all(item.get("status") == "pass" for item in hard_dimensions)
+            )
+            if not isinstance(attempt.get("hard_pass"), bool):
+                errors.append("%s hard_pass must be boolean" % prefix)
+            elif attempt.get("hard_pass") is not derived_hard_pass:
+                errors.append("%s hard_pass does not match hard dimensions/evidence" % prefix)
+
+            # Match the invariant enforced by ``AttemptVerdict`` when a raw
+            # receipt is supplied directly.  A hard dimension failure cannot
+            # be serialized as a passing attempt.
+            if (
+                attempt.get("status") == "pass"
+                and any(
+                    isinstance(item, Mapping)
+                    and item.get("hard") is True
+                    and item.get("status") == "fail"
+                    for item in dimensions
+                )
+            ):
+                errors.append("%s pass status conflicts with hard dimension failure" % prefix)
+
+        if attempt_id_fields_present:
+            if len(attempt_ids) != len(attempts):
+                errors.append("attempt_id is missing from one or more attempts")
+            if len(attempt_ids) != len(set(attempt_ids)):
+                errors.append("attempt_id values must be unique")
+
+    required_k = value.get("required_k")
+    if required_k is not None and (
+        isinstance(required_k, bool) or not isinstance(required_k, int) or not 1 <= required_k <= 20
+    ):
+        errors.append("required_k is invalid")
+    for count_name in ("attempt_count", "evaluable_attempt_count", "successes"):
+        count = value.get(count_name)
+        if count is not None and (isinstance(count, bool) or not isinstance(count, int) or count < 0):
+            errors.append("%s is invalid" % count_name)
+    if not legacy_without_attempts and isinstance(attempts, Sequence) and not isinstance(attempts, (str, bytes)):
+        if value.get("attempt_count") is not None and value.get("attempt_count") != len(attempts):
+            errors.append("attempt_count does not match attempts")
+        evaluable_count = sum(
+            isinstance(item, Mapping) and item.get("status") != "not_evaluable"
+            for item in attempts
+        )
+        if value.get("evaluable_attempt_count") is not None and value.get("evaluable_attempt_count") != evaluable_count:
+            errors.append("evaluable_attempt_count does not match attempts")
+        successes = sum(
+            isinstance(item, Mapping)
+            and item.get("status") == "pass"
+            and item.get("hard_pass") is True
+            for item in attempts
+        )
+        evaluable_attempts = sum(
+            isinstance(item, Mapping) and item.get("status") != "not_evaluable"
+            for item in attempts
+        )
+        derived_pass_rate = (
+            successes / evaluable_attempts if evaluable_attempts else None
+        )
+        # ``pass_rate`` is a derived receipt field.  Comparing it with the
+        # Attempt records prevents a producer from claiming a large paired
+        # improvement while the underlying attempts tell a different story.
+        if derived_pass_rate is None:
+            if pass_rate is not None:
+                errors.append("pass_rate must be null when no attempt is evaluable")
+        elif pass_rate is None or not math.isclose(
+            float(pass_rate), float(derived_pass_rate), rel_tol=0.0, abs_tol=1e-9
+        ):
+            errors.append("pass_rate does not match attempt receipts")
+        if value.get("successes") is not None and value.get("successes") != successes:
+            errors.append("successes does not match attempts")
+        required = required_k if isinstance(required_k, int) and not isinstance(required_k, bool) else None
+        if required is not None:
+            derived_stable = (
+                evaluable_attempts >= required
+                and successes == evaluable_attempts
+                and successes >= required
+            )
+            if value.get("stable_pass") is not derived_stable:
+                errors.append("stable_pass does not match attempt receipts")
+            derived_status = "not_evaluable" if not evaluable_attempts else "pass" if derived_stable else "fail"
+            if value.get("status") is not None and value.get("status") != derived_status:
+                errors.append("status does not match attempt receipts")
+        elif value.get("stable_pass") is True:
+            # Without a repeat budget we cannot establish stability, even if
+            # the one observed attempt passed.  Keep this as a malformed
+            # authorization record rather than treating it as a stable pass.
+            errors.append("stable_pass requires required_k")
+        if value.get("status") == "pass" and value.get("stable_pass") is not True:
+            errors.append("pass status requires stable_pass")
+    return tuple(errors)
+
+
+def _validated_aggregate_map(
+    value: Any,
+) -> Tuple[Mapping[str, Mapping[str, Any]], Tuple[str, ...], Tuple[str, ...]]:
+    """Return only complete, unique aggregates and visible malformed IDs."""
+
+    if not isinstance(value, Sequence) or isinstance(value, (str, bytes)):
+        return {}, ("<invalid-aggregate-list>",), ()
+    result: dict[str, Mapping[str, Any]] = {}
+    malformed = set()
+    legacy = set()
+    for index, item in enumerate(value):
+        if not isinstance(item, Mapping):
+            malformed.add("<invalid-aggregate-%d>" % index)
+            continue
+        raw_id = item.get("case_id")
+        case_id = str(raw_id).strip() if isinstance(raw_id, str) else ""
+        if not case_id:
+            malformed.add("<invalid-aggregate-%d>" % index)
+            continue
+        errors = _aggregate_contract_errors(item, case_id=case_id)
+        if errors:
+            malformed.add(case_id)
+        if case_id in result:
+            malformed.add(case_id)
+            # Keep the first occurrence for deterministic pairing; the
+            # duplicate is represented by the malformed gate above.
+            continue
+        # Retain malformed rows in the map for diagnostics (regressions,
+        # evidence blocks, and manifest mismatches), but never authorize a
+        # promotion when ``malformed`` is non-empty.
+        result[case_id] = item
+        if not errors and "attempts" not in item:
+            legacy.add(case_id)
+    return result, tuple(sorted(malformed)), tuple(sorted(legacy))
+
+
 def _aggregate_map(value: Sequence[Mapping[str, Any]]) -> Mapping[str, Mapping[str, Any]]:
+    """Legacy helper retained for callers that only need ID indexing."""
+
     return {str(item.get("case_id")): item for item in value if isinstance(item, Mapping)}
+
+
+def _sequence_field(value: Mapping[str, Any], field: str) -> Tuple[Any, ...]:
+    """Read a repeatable aggregate field without trusting its producer type.
+
+    Aggregate validation records malformed fields for the fail-closed gate,
+    but comparison still needs to produce diagnostics for those rows.  A
+    malformed ``attempts: null`` or ``dimensions: null`` must therefore not
+    crash the diagnostic path while it is being reported.
+    """
+
+    raw = value.get(field, ())
+    if not isinstance(raw, Sequence) or isinstance(raw, (str, bytes)):
+        return ()
+    return tuple(raw)
 
 
 def compare_candidates(
@@ -536,18 +1010,115 @@ def compare_candidates(
     champion_id: str,
     challenger_id: str,
     minimum_effect: float,
+    champion_context_hash: Optional[str] = None,
+    challenger_context_hash: Optional[str] = None,
 ) -> Mapping[str, Any]:
-    current_map = _aggregate_map(current)
-    previous_map = _aggregate_map(previous)
+    current_map, current_malformed, current_legacy = _validated_aggregate_map(current)
+    previous_map, previous_malformed, previous_legacy = _validated_aggregate_map(previous)
+    malformed_aggregate_case_ids = sorted(
+        set(current_malformed).union(previous_malformed)
+    )
+    legacy_aggregate_case_ids = sorted(set(current_legacy).union(previous_legacy))
     common = sorted(set(current_map).intersection(previous_map))
+    challenger_only = sorted(set(current_map).difference(previous_map))
+    champion_only = sorted(set(previous_map).difference(current_map))
+    # Malformed rows remain in the maps for diagnostics, so a malformed Case
+    # present on both sides is still visibly paired (rather than being
+    # misreported as two different Case sets).  The separate malformed gate
+    # below keeps the comparison fail-closed and prevents promotion.
     regressions = []
     improvements = []
+    champion_evidence_blocked = []
+    challenger_evidence_blocked = []
+    hard_gate_failures = []
+    insufficient_stability = []
+    manifest_mismatches = []
     deltas = []
+    dimension_values = {}
     for case_id in common:
         old = previous_map[case_id]
         new = current_map[case_id]
+        old_attempts = [item for item in _sequence_field(old, "attempts") if isinstance(item, Mapping)]
+        new_attempts = [item for item in _sequence_field(new, "attempts") if isinstance(item, Mapping)]
+        # A paired score is meaningful only when both sides used the same
+        # frozen Case revision, repeat budget, and dimension/grader contract.
+        # Older aggregate records may not carry these optional manifest
+        # fields; in that compatibility mode we retain the historical checks.
+        case_manifest_mismatch = False
+        old_revision = old.get("case_revision")
+        new_revision = new.get("case_revision")
+        if old_revision is not None and new_revision is not None and old_revision != new_revision:
+            case_manifest_mismatch = True
+        old_required_k = old.get("required_k")
+        new_required_k = new.get("required_k")
+        if old_required_k is not None and new_required_k is not None and old_required_k != new_required_k:
+            case_manifest_mismatch = True
+
+        def dimension_signature(attempts: Sequence[Mapping[str, Any]]) -> tuple[tuple[str, str, bool], ...]:
+            values = set()
+            for attempt in attempts:
+                for dimension in _sequence_field(attempt, "dimensions"):
+                    if not isinstance(dimension, Mapping):
+                        continue
+                    name = str(dimension.get("dimension") or "")
+                    grader = str(dimension.get("grader_id") or "")
+                    hard = dimension.get("hard") is True
+                    if name:
+                        values.add((name, grader, hard))
+            return tuple(sorted(values))
+
+        old_dimensions = dimension_signature(old_attempts)
+        new_dimensions = dimension_signature(new_attempts)
+        if old_dimensions != new_dimensions and (old_dimensions or new_dimensions):
+            case_manifest_mismatch = True
+        old_manifest = old.get("attempt_manifest")
+        new_manifest = new.get("attempt_manifest")
+        if isinstance(old_manifest, Mapping) and isinstance(new_manifest, Mapping):
+            # Compare only invariant manifest keys; timestamps and session ids
+            # are expected to differ between Champion and Challenger runs.
+            for key in ("case_revision", "required_k", "dimension_grader_versions", "grader_versions"):
+                if key in old_manifest and key in new_manifest and old_manifest.get(key) != new_manifest.get(key):
+                    case_manifest_mismatch = True
+                    break
+        if case_manifest_mismatch:
+            manifest_mismatches.append(case_id)
+        if (
+            old.get("status") == "not_evaluable"
+            or any(
+                isinstance(item.get("evidence_validity"), Mapping)
+                and item.get("evidence_validity", {}).get("status") != "valid"
+                for item in old_attempts
+            )
+        ):
+            champion_evidence_blocked.append(case_id)
+        if (
+            new.get("status") == "not_evaluable"
+            or any(
+                isinstance(item.get("evidence_validity"), Mapping)
+                and item.get("evidence_validity", {}).get("status") != "valid"
+                for item in new_attempts
+            )
+        ):
+            challenger_evidence_blocked.append(case_id)
+        if any(
+            any(
+                isinstance(dimension, Mapping)
+                and dimension.get("hard") is True
+                and dimension.get("status") == "fail"
+                for dimension in _sequence_field(item, "dimensions")
+            )
+            for item in new_attempts
+        ):
+            hard_gate_failures.append(case_id)
         old_pass = bool(old.get("stable_pass"))
         new_pass = bool(new.get("stable_pass"))
+        # A Challenger is only promotable after it has satisfied its frozen
+        # repeat budget.  A higher one-shot pass rate is not enough: the
+        # comparison must not turn an unfinished/stochastic run into a
+        # published Skill.  Keep this separate from ``hard_regression`` so
+        # the UI can explain that another verification run is needed.
+        if not new_pass and new.get("status") != "not_evaluable":
+            insufficient_stability.append(case_id)
         if old_pass and not new_pass:
             regressions.append(case_id)
         elif not old_pass and new_pass:
@@ -556,22 +1127,97 @@ def compare_candidates(
         new_rate = new.get("pass_rate")
         if isinstance(old_rate, (int, float)) and isinstance(new_rate, (int, float)):
             deltas.append(float(new_rate) - float(old_rate))
+        for side, aggregate in (("champion", old), ("challenger", new)):
+            per_dimension = {}
+            for attempt in _sequence_field(aggregate, "attempts"):
+                if not isinstance(attempt, Mapping):
+                    continue
+                for dimension in _sequence_field(attempt, "dimensions"):
+                    if not isinstance(dimension, Mapping):
+                        continue
+                    score = dimension.get("score")
+                    name = str(dimension.get("dimension") or "")
+                    if not name or isinstance(score, bool) or not isinstance(score, (int, float)):
+                        continue
+                    per_dimension.setdefault(name, []).append(float(score))
+            for name, values in per_dimension.items():
+                dimension_values.setdefault(name, {}).setdefault(side, []).append(sum(values) / len(values))
     mean_delta = sum(deltas) / len(deltas) if deltas else 0.0
-    accepted = not regressions and (bool(improvements) or mean_delta >= minimum_effect)
+    dimension_deltas = {}
+    for name, sides in sorted(dimension_values.items()):
+        champion_values = sides.get("champion", [])
+        challenger_values = sides.get("challenger", [])
+        if not champion_values or not challenger_values:
+            continue
+        champion_score = sum(champion_values) / len(champion_values)
+        challenger_score = sum(challenger_values) / len(challenger_values)
+        dimension_deltas[name] = {
+            "champion": champion_score,
+            "challenger": challenger_score,
+            "delta": challenger_score - champion_score,
+        }
+    context_comparable = (
+        champion_context_hash is None and challenger_context_hash is None
+    ) or (
+        champion_context_hash is not None
+        and challenger_context_hash is not None
+        and champion_context_hash == challenger_context_hash
+    )
+    case_set_comparable = not champion_only and not challenger_only and not manifest_mismatches
+    evidence_blocked = sorted(set(champion_evidence_blocked + challenger_evidence_blocked))
+    # A newly passing Case is useful evidence, but it cannot by itself waive
+    # the paired minimum-effect gate.  The aggregate delta is the frozen
+    # objective for this comparison; requiring it here prevents a candidate
+    # from being promoted when one Case improves while the rest materially
+    # regress (without crossing a hard gate).
+    accepted = bool(common) and not malformed_aggregate_case_ids and not legacy_aggregate_case_ids and case_set_comparable and context_comparable and not regressions and not evidence_blocked and not hard_gate_failures and not insufficient_stability and (
+        mean_delta >= minimum_effect
+    )
     reasons = []
+    if not common:
+        reasons.append("no_comparable_cases")
+    if not case_set_comparable:
+        reasons.append("case_set_mismatch" if champion_only or challenger_only else "attempt_manifest_mismatch")
+    if not context_comparable:
+        reasons.append("comparison_context_mismatch")
+    if malformed_aggregate_case_ids:
+        reasons.append("malformed_aggregate")
+    if legacy_aggregate_case_ids:
+        reasons.append("legacy_aggregate")
     if regressions:
         reasons.append("critical_regression")
-    if not improvements and mean_delta < minimum_effect:
+    if evidence_blocked:
+        reasons.append("insufficient_evidence")
+    if hard_gate_failures:
+        reasons.append("hard_gate_failure")
+    if insufficient_stability:
+        reasons.append("insufficient_stability")
+    if mean_delta < minimum_effect:
         reasons.append("minimum_effect_not_met")
     result = {
         "api_version": CANDIDATE_COMPARISON_API_VERSION,
         "champion_id": champion_id,
         "challenger_id": challenger_id,
         "comparable_case_ids": common,
+        "champion_only_case_ids": champion_only,
+        "challenger_only_case_ids": challenger_only,
+        "malformed_aggregate_case_ids": malformed_aggregate_case_ids,
+        "legacy_aggregate_case_ids": legacy_aggregate_case_ids,
+        "case_set_comparable": case_set_comparable,
+        "attempt_manifest_mismatch_case_ids": sorted(set(manifest_mismatches)),
         "hard_regression_case_ids": regressions,
+        "evidence_blocked_case_ids": evidence_blocked,
+        "champion_evidence_blocked_case_ids": champion_evidence_blocked,
+        "challenger_evidence_blocked_case_ids": challenger_evidence_blocked,
+        "hard_gate_failure_case_ids": hard_gate_failures,
+        "insufficient_stability_case_ids": sorted(set(insufficient_stability)),
         "improved_case_ids": improvements,
         "paired_mean_delta": mean_delta,
+        "dimension_deltas": dimension_deltas,
         "minimum_effect": minimum_effect,
+        "champion_context_hash": champion_context_hash,
+        "challenger_context_hash": challenger_context_hash,
+        "context_comparable": context_comparable,
         "accepted": accepted,
         "reasons": reasons,
     }
@@ -591,8 +1237,22 @@ def convergence_state(
     patience: int,
     minimum_effect: float = 0.0,
     budget_exhausted: bool = False,
+    required_case_ids: Optional[Sequence[str]] = None,
 ) -> Mapping[str, Any]:
-    aggregates = tuple(case_aggregates)
+    all_aggregates = tuple(case_aggregates)
+    if required_case_ids is None:
+        aggregates = all_aggregates
+    else:
+        required = {str(item) for item in required_case_ids}
+        # Exploratory/model-proposed Cases remain visible in the report, but
+        # they do not become a hidden convergence blocker once the trusted
+        # authorizable set has independently met its stability gate.  If no
+        # trusted ids are supplied, retain the conservative all-Cases rule.
+        aggregates = (
+            tuple(item for item in all_aggregates if str(item.get("case_id")) in required)
+            if required
+            else all_aggregates
+        )
     stable = bool(aggregates) and all(item.get("stable_pass") is True for item in aggregates)
     reason = None
     if stable and not failed_case_ids:

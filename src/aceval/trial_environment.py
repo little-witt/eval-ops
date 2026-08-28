@@ -15,6 +15,7 @@ import subprocess
 from typing import Any, Mapping, Optional, Sequence
 
 from .kernel_contracts import contract_hash
+from .subjects import SkillMarkdownSubjectAdapter
 
 
 TRIAL_ENVIRONMENT_CONTRACT_API_VERSION = "aceval.trial-environment-contract/v1"
@@ -76,6 +77,27 @@ def _tree_hash(path_value: Optional[str]) -> Optional[str]:
     return "sha256:" + digest.hexdigest()
 
 
+def _skill_subject_hash(path_value: Optional[str]) -> Optional[str]:
+    """Hash the complete active Skill tree used by this trial.
+
+    The evaluation design keeps the hash of the Skill that produced the Case
+    suite.  A later Challenger intentionally has a different hash, so remote
+    execution binding must use the active repository bytes frozen for this
+    iteration instead of reusing the design-time hash.
+    """
+
+    if not path_value:
+        return None
+    root = Path(path_value).expanduser().resolve()
+    if root.is_file():
+        root = root.parent
+    try:
+        digest = SkillMarkdownSubjectAdapter().snapshot(str(root)).content_hash
+    except Exception:
+        return None
+    return "sha256:" + digest
+
+
 def git_revision(path_value: Optional[str]) -> Optional[str]:
     if not path_value:
         return None
@@ -135,7 +157,7 @@ def build_trial_environment_contract(
         if value is None:
             return {"role": role, "present": False}
         local = getattr(value, "local_path", None)
-        return {
+        result = {
             "role": role,
             "ssh_url": getattr(value, "ssh_url", None),
             "branch": getattr(value, "branch", None),
@@ -143,6 +165,9 @@ def build_trial_environment_contract(
             "revision": git_revision(local) or state.get("challenger_commit") if role == "skill" else git_revision(local),
             "working_tree_hash": _tree_hash(local),
         }
+        if role == "skill":
+            result["subject_hash"] = _skill_subject_hash(local)
+        return result
 
     payload = {
         "api_version": TRIAL_ENVIRONMENT_CONTRACT_API_VERSION,
@@ -175,4 +200,34 @@ def verify_contract_hash(contract: Mapping[str, Any]) -> str:
     return actual
 
 
-__all__ = ["TRIAL_ENVIRONMENT_CONTRACT_API_VERSION", "TrialEnvironmentContract", "TrialEnvironmentContractError", "build_trial_environment_contract", "verify_contract_hash", "git_revision"]
+def comparison_context_hash(contract: Mapping[str, Any]) -> str:
+    """Hash trial inputs that must stay fixed across Champion/Challenger.
+
+    The Skill revision and tree are the experimental variable. Code fixtures,
+    profile/model/tool settings, Case/design revisions, mounts, and runtime
+    parameters are comparison controls and must remain identical.
+    """
+
+    verify_contract_hash(contract)
+    skill = contract.get("skill") if isinstance(contract.get("skill"), Mapping) else {}
+    skill_identity = {
+        key: skill.get(key)
+        for key in ("role", "present", "ssh_url", "branch", "mount_path")
+        if key in skill
+    }
+    identity = {
+        "api_version": contract.get("api_version"),
+        "provider": contract.get("provider"),
+        "profile": contract.get("profile"),
+        "skill": skill_identity,
+        "code": contract.get("code"),
+        "fixture_revisions": contract.get("fixture_revisions"),
+        "repository_bindings": contract.get("repository_bindings"),
+        "design_hash": contract.get("design_hash"),
+        "case_revision_set": contract.get("case_revision_set"),
+        "runtime_parameters": contract.get("runtime_parameters"),
+    }
+    return contract_hash(identity)
+
+
+__all__ = ["TRIAL_ENVIRONMENT_CONTRACT_API_VERSION", "TrialEnvironmentContract", "TrialEnvironmentContractError", "build_trial_environment_contract", "comparison_context_hash", "verify_contract_hash", "git_revision"]

@@ -2,13 +2,15 @@
 
 ## 路径契约驱动的 Case 生成、严格执行与证据分析方案
 
-> 状态：提议中的下一版评测方案（2026-08-28）  
+> 状态：V3 目标架构；当前分支已完成部分 V2/P0 可信性加固和只读兼容，尚未完成原生 Path IR、完整 EventJournal、Case/Suite Gate 与 Trace overlay（2026-08-28）
 > 适用范围：包含 `SKILL.md`、脚本、引用资料、模板、配置和外部工具的 Skill 评测与自迭代  
 > 与现有架构关系：保留“设计 → 评测 → 日志 → 分析 → 候选 → 回归 → 收敛”的外层节点；本文件细化并替换其中的路径分析、Case 生成、执行证据和评分内核。
 
 ## 1. 先给结论：这版要改变什么
 
-当前实现已经具备能力图、风险加权测试规划、语义路径、CATX 多会话、日志拉取与截断标记底座、分层 Verdict 和 Champion/Challenger。但仍有两个根本问题：一是路径大多在 Case 生成后才被启发式补出，因而容易出现“Case 看起来覆盖了，真正的分支、命令参数、失败恢复和禁止动作没有被覆盖”的假覆盖；二是 CATX 事件目前还缺少可证明拉全的分页/cursor、序号连续性、工具调用配对和 hash 链，不能把“已拉取一页日志”直接称为“完整日志”。
+当前实现已经具备能力图、风险加权测试规划、Skill 资源闭包冻结、语义路径、CATX 多会话、cursor 分页与 `total` 校验、部分序号和工具调用配对检查、Attempt 历史、日志整体 SHA-256、分层 Verdict、可信 EvalPack Grader 以及 Champion/Challenger 比较。它已经能在本地模拟和单元测试中完成“设计 → Case → 证据 → 多维评分 → 修改授权 → 候选比较”的关键控制链，但这仍不是完整 V3。
+
+剩余的两个根本问题没有改变：一是路径大多仍在 Case 生成后由 V1 语义步骤补出，容易出现“Case 看起来覆盖了，真正的条件分支、命令参数、失败恢复、状态迁移和禁止副作用没有被覆盖”的假覆盖；二是当前日志完整性只做到分页证明、部分序号检查、工具调用配对和整体内容 seal，尚无逐事件 hash chain、强制 terminal 配对、原始日志/规范化 Trace 分层和有界补抓状态机，不能称为完整可重放 EventJournal。
 
 V3 将评测设计改成下面的单向编译链：
 
@@ -37,15 +39,15 @@ Skill 全量冻结
 
 ## 2. 对当前实现的审计结论
 
-| 当前组件 | 已有价值 | V3 必须补足的部分 |
+| 当前组件 | 当前分支已落地 | V3 仍需补足 |
 |---|---|---|
-| `skill_analysis.py` | 能从冻结 Markdown 提取章节、能力、声明分支、工具和 source ref | 递归分析 `scripts/`、`references/`、模板、配置和被引用资源；补充控制流、命令参数、退出码、重试、状态和副作用；显式区分“原文声明”和“推断” |
-| `test_planning.py` | 能按风险生成正常、负向、恢复、幂等、状态和顺序义务 | 输入应是完整 Path IR + Universal Rule IR，而不是只从能力列表推导；增加分支/条件/参数/故障覆盖和覆盖缺口证明 |
-| `model_case_generation.py` | 有严格 JSON、source refs 和 planner-owned id 校验 | 模型不得创建新的分支或路径语义；生成后要做可执行性、可观察性、命令/参数和反作弊验证；模型路径只能作为候选草稿 |
-| `execution_path.py` | 支持 required、recommended、alternative、forbidden 和局部顺序 | 增加步骤输入输出、参数约束、exit code、重试、超时、状态、失败边和证据引用；支持循环上限与分支终点；避免仅用 `contains` 命中字符串 |
-| `remote_batch.py` / CATX | 有多 Case 调度、绑定校验、日志拉取、截断标记和失败重试入口 | 先补分页/cursor、total/seq、tool call-result/terminal 配对和有界补抓；再统一事件信封、重试原因、attempt 序号、日志 hash 链、原始/规范化 Trace、成本指标和全局/维度级证据完整性 |
-| `evidence_analysis.py` | 已有确定性优先、语义模型补充和 Case 聚合 | 统一通用评分矩阵；把 CLI 参数、重试策略、状态迁移和副作用纳入 Grader；明确置信区间和样本不足状态 |
-| 客户端 Case/日志页 | 可展示 Case 文本、简单路径树和日志入口 | 增加 Path Graph、预期/实际 Trace 叠加、首次偏离、分支覆盖、逐维评分、重试/Token/耗时和证据深链 |
+| `skill_analysis.py` / `subjects.py` | 已冻结 `SKILL.md`、`scripts/`、`references/`、模板、配置和资源目录；递归跟踪本地引用，显式记录缺失/越界引用，并把资源变化纳入 subject hash 与候选物化 | 对脚本、配置和模板做真正的控制流、参数、退出码、重试、状态和副作用分析；显式区分原文声明与推断 |
+| `test_planning.py` | 已按风险生成正常、负向、恢复、幂等、状态和顺序义务；保留 Case 身份、source refs、Oracle 等级和人工校准状态 | 输入改为完整 Path IR + Universal Rule IR；补分支/条件/参数/故障覆盖证明、Reference Run 和 Suite Gate |
+| `model_case_generation.py` | 已有严格 JSON、source refs、planner-owned id 和失败回退；模型生成与种子/确定性补充分开记录 | 模型路径仍只能作为草稿；补可执行性、可解性、可观察性、公平性、命令参数和反作弊的完整 preflight |
+| `execution_path.py` | 支持 required、recommended、alternative、forbidden、局部顺序和仅从真实命令字段匹配 `command_contains`；可只读归一化少量 V3 `nodes/edges` | 原生实现条件边、exit code、retry、timeout、状态迁移、失败边、副作用、cleanup、循环上限与分支终点；V3 兼容输入在此之前必须 `not_evaluable` |
+| `remote_batch.py` / CATX | 已有多 Case 调度、绑定检查、cursor 分页、`total`、部分 seq gap/duplicate、工具调用/返回配对、整体日志 SHA-256、Attempt 编号、重试原因和历史 artifact；Trial Environment 冻结当前实际 Skill subject hash，下一轮 binding 不再沿用设计期旧 hash | 补逐事件 hash chain、强制 terminal 配对、seq 缺失时的明确策略、有界补抓、原始不可变日志/规范化 Trace 分层和真实远端验证 |
+| `evidence_analysis.py` / `kernel_v2.py` | 已有严格证据有效性、日志 hash 复核、frozen/legacy EvalPack 内置 Grader、多维分数、hard gate、事实/假设分层和成对比较；draft/漂移 Pack 不能授权修改 | 补统一 0–4 锚点、风险自适应 `k`、置信区间及 retry/recovery/robustness/observability 完整维度 |
+| 桌面客户端 / 静态 Console | 已展示 Case 来源、测试目的、Oracle 资格、人工通过标准、路径步骤、初测/复验、多维分数、证据、候选 Diff、发布审批、逐轮历史和远端 Attempt/重试原因；主要内部状态码已翻译成人话 | 补可交互 Path Graph、实际 Trace overlay、首次偏离、Mermaid/SVG/PNG 导出、维度到事件范围的深链和完整视觉 E2E |
 
 因此，V3 不是推倒重写，而是把现有对象重新排列为：
 
@@ -898,6 +900,19 @@ promotion:
 
 P0 完成标志：任何 Case 都能回答“覆盖哪条分支、哪几个步骤、依据是什么、如何判定、日志在哪里”。
 
+截至 2026-08-28，当前分支的实际状态如下。这里的“本地已验证”不代表真实 CATX 远端验收。
+
+| P0 子项 | 当前状态 | 本地已验证 | 仍需完成 |
+|---|---|---|---|
+| EventJournal | **部分完成** | cursor 分页、`total`、部分 seq、工具配对、整体日志 SHA-256、Attempt/重试单测 | 逐事件 hash chain、terminal、seq 缺失策略、有界补抓、原始/规范化分层和真实远端验证 |
+| V3 数据契约 | **兼容原型** | 少量 `nodes/edges` 可只读解析，无法忠实执行时 fail-closed | 原生 Path/Case/Trace v3 编译、迁移和执行 |
+| Skill 资源闭包 | **冻结完成，分析部分完成** | 递归引用、缺失/越界记录、资源 hash、候选物化 | 脚本/配置/模板的控制流和副作用分析 |
+| Path Evaluator | **部分完成** | V1 路径、顺序、禁止动作和真实命令字段匹配 | 条件、exit、retry、timeout、state、side effect、cleanup 和循环语义 |
+| Oracle / Case Gate | **部分完成** | Oracle 等级、探索 Case、Blueprint 模型预期保持未校准、逐 Case 人工通过标准、EvalPack lifecycle/hash 纵深门和修改授权过滤 | Reference Run、完整 preflight、专家一致性和 Suite Gate |
+| 评分与候选比较 | **本地主链已实现** | 内置 Grader、多维向量、hard gate、Case 集/证据/上下文比较、发布审批和拒绝恢复 | 统一 0–4 锚点、风险自适应重复、区间、Holdout 和真实两轮验收 |
+| Path Graph / 证据深链 | **未完成** | 当前为卡片、列表和只读 read model | 图形、Trace overlay、首次偏离、导出和事件范围跳转 |
+| 产品验证 | **本地关键链路通过** | 关键 Python 测试、JS 语法、renderer contract 和 diff 格式检查 | 真实 CATX 两轮、桌面视觉 E2E、20–50 Case 性能与恢复测试 |
+
 ### P1：Case 检测力与真实分支
 
 1. Mock/Stub contract 和 fault injection matrix；
@@ -944,16 +959,33 @@ P0 完成标志：任何 Case 都能回答“覆盖哪条分支、哪几个步�
 - 20–50 Case 任务首屏、日志分页和图渲染满足客户端性能目标；
 - 设计、执行、分析和重启恢复均有端到端回归测试。
 
-## 16.1 当前分支的增量原型边界
+## 16.1 当前分支的增量实现边界
 
-为先验证信息架构，本轮在不改变旧 Graph API 和 Kernel 状态机的前提下增加了一个只读原型：
+当前分支已经不只是 UI 原型：它补上了资源冻结、CATX 日志分页和完整性收据、证据 fail-closed、可信 EvalPack Grader、多维评分、人工 Case 校准、候选二次发布审批及成对比较等本地控制面。`optimization_graph.py`、静态 Console 和桌面端也已能展示 authored path、path conformance、日志完整性、初测/复验、逐维评分、证据引用和 Champion/Challenger 差异。
 
-- `optimization_graph.py` 暴露 authored path、Path Graph、path conformance、Trace 完整性摘要、重试/成本和逐 Run score vector；
-- `reporting.py` 在报告摘要中暴露 `case_scores` 与 `process_evidence`；
-- 静态 Console 和桌面 Case 卡片增加路径分析、Baseline/Candidate 对比、逐维评分和证据引用；
-- 对应单元测试覆盖旧数据兼容、路径/Trace/评分字段和报告汇总。
+但这些能力仍处在 V2/P0 加固与 V3 兼容过渡期：
 
-这些字段是 Read Model 的兼容性探针，不等同于 V3 的执行硬门：当前仍需要按第 15 节顺序补齐 EventJournal 分页、Path IR 编译、Case preflight、统一 Grader 和真实 Trace overlay；在此之前，UI 中的“评分”只能作为观测摘要，不能替代 Kernel 的晋升裁决。
+- `execution_path.py` 只能只读归一化少量 V3 `nodes/edges`；任何需要条件分支、重试或状态语义的 V3 路径仍强制 `not_evaluable`，不得授权修改 Skill；
+- CATX 已实现分页、`total`、部分 seq、工具配对和整体日志 seal，但还不是逐事件可重放 EventJournal；
+- EvalPack 内置 Grader 和多维比较已经进入 Kernel 决策链，但完整 Case/Suite Gate、Reference Run、Judge 校准和统一 V3 评分标尺尚未完成；
+- UI 中的卡片和列表是清晰的证据 read model，不等同于 Path Graph、实际 Trace overlay 或维度到原始事件的深链；
+- 跨轮比较已排除 Skill revision 这一实验变量对比较上下文的影响；Trial Environment 同时冻结当前实际被测 Skill 快照 hash，下一轮 CATX binding 不再沿用初始设计的 source hash。该行为已有本地单测，仍待真实 CATX 回显验证。
+
+因此，当前 UI 中的“评分”和“完整日志”只能按已实现的 V2/P0 契约解释，不能作为“完整 V3 已验收”的证据。
+
+## 16.2 本轮验收边界
+
+本轮可以诚实声明：
+
+- 本地关键链路已覆盖资源冻结、Case 规划/生成、路径命令匹配、日志分页与完整性收据、证据 fail-closed、可信 EvalPack Grader、多维评分、修改授权过滤、候选静态校验、成对比较和 UI read model；
+- 本次环境中的 Python `unittest` 回归测试共 `464 tests`，全部通过，覆盖 CATX、remote batch、路径、证据、迭代 Kernel、EvalPack Grader、候选比较和资源分析；测试通过临时依赖目录提供 `tomli` 兼容包，以支持当前 Python 3.9 环境；
+- `node --check desktop/renderer/app.js`、桌面 renderer contract 和 `git diff --check` 通过。
+
+本轮不能声明：
+
+- 真实 CATX Session 创建、远端日志回收以及“首轮评测 → 修改 → 第二轮评测 → 晋升/拒绝”已经通过；当前环境不在内网，因此未执行这项验收；
+- 所有事件已经具备 hash chain 并可重放，或原生 V3 Path-first、Reference Run、Judge 校准、Case/Suite Gate 已完成；
+- 桌面 Playwright 视觉 E2E、20–50 Case 性能和真实业务实用性已经验收。
 
 ## 17. 最终决策
 

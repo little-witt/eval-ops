@@ -9,6 +9,7 @@ from aceval.evaluation_compiler import (
     profile_catalog,
 )
 from aceval.pack_builder import freeze_evalpack
+from aceval.skill_analysis import analyze_skill
 
 
 class EvaluationCompilerTest(unittest.TestCase):
@@ -160,6 +161,79 @@ Return the requested answer as JSON.
         self.assertEqual(output_hint.resolve(), first.pack.root)
         self.assertNotEqual(first.pack.root, second.pack.root)
         self.assertTrue(second.pack.root.name.startswith("automatic-"))
+
+    def test_compilation_from_skill_file_and_directory_uses_same_subject_closure(self):
+        subject = self.skill()
+        (subject / "references").mkdir()
+        (subject / "references" / "rules.md").write_text(
+            "Use the reviewed rules.\n", encoding="utf-8"
+        )
+        (subject / "subject.json").write_text(
+            '{"metadata":{"id":"answer","version":"1"}}',
+            encoding="utf-8",
+        )
+
+        directory = compile_evaluation(
+            subject,
+            "Return a correct answer.",
+            self.root / "directory-pack",
+            standards="The answer must equal 42.",
+            prompt="Return JSON.",
+            expected_output={"answer": 42},
+            has_expected_output=True,
+            reuse=False,
+        )
+        file_path = compile_evaluation(
+            subject / "SKILL.md",
+            "Return a correct answer.",
+            self.root / "file-pack",
+            standards="The answer must equal 42.",
+            prompt="Return JSON.",
+            expected_output={"answer": 42},
+            has_expected_output=True,
+            reuse=False,
+        )
+
+        self.assertEqual(directory.profile, file_path.profile)
+        self.assertEqual(directory.signature, file_path.signature)
+
+    def test_reuse_signature_is_bound_to_subject_resource_closure(self):
+        subject = self.skill()
+        first = compile_evaluation(
+            subject,
+            "Return a correct answer.",
+            self.root / "subject-a-pack",
+            standards="The answer must equal 42.",
+            prompt="Return JSON.",
+            expected_output={"answer": 42},
+            has_expected_output=True,
+            reuse=False,
+        )
+        freeze_evalpack(first.pack.root, approve=True)
+
+        # A different Skill with otherwise identical profile, standards and
+        # Case contract must not reuse the first Skill's Suite.
+        other = self.skill()
+        (other / "SKILL.md").write_text(
+            (other / "SKILL.md").read_text(encoding="utf-8")
+            + "\nThis instruction is intentionally different.\n",
+            encoding="utf-8",
+        )
+        second = compile_evaluation(
+            other,
+            "Return a correct answer.",
+            self.root / "subject-b-pack",
+            standards="The answer must equal 42.",
+            prompt="Return JSON.",
+            expected_output={"answer": 42},
+            has_expected_output=True,
+            reuse_roots=(self.root,),
+        )
+
+        self.assertEqual("generated", second.source)
+        self.assertNotEqual(first.signature, second.signature)
+        profile = second.pack.manifest.metadata.extra["evaluation_profile"]
+        self.assertEqual(analyze_skill(other).subject_hash, profile["subject_hash"])
 
     def test_common_work_profiles_are_inferred_internally(self):
         scenarios = {

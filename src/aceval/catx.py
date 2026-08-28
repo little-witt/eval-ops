@@ -10,6 +10,7 @@ terminal state through the optional Supabase SSE proxy.
 from __future__ import annotations
 
 import json
+import hashlib
 import math
 import os
 import re
@@ -814,6 +815,7 @@ class CatxAgentClient:
         )
         self._binding_adapter = binding_adapter
         self.last_binding_evidence: Optional[CatxBindingEvidence] = None
+        self._event_logs: dict[Tuple[str, Optional[str]], Mapping[str, Any]] = {}
 
     def _redact_event(self, event: Mapping[str, Any]) -> Mapping[str, Any]:
         redacted = _redact_sensitive(event, self._sensitive_values)
@@ -1031,18 +1033,196 @@ class CatxAgentClient:
         encoded = urllib.parse.quote(session, safe="")
         return self._request_json("GET", "/sessions/%s" % encoded)
 
+    @staticmethod
+    def _page_cursor(response: Mapping[str, Any]) -> Tuple[Optional[str], Optional[bool], Optional[int]]:
+        containers = [response]
+        for key in ("pagination", "page", "meta"):
+            value = response.get(key)
+            if isinstance(value, Mapping):
+                containers.append(value)
+        next_cursor = None
+        has_more = None
+        total = None
+        for value in containers:
+            if next_cursor is None:
+                candidate = value.get("next_cursor", value.get("nextCursor"))
+                if isinstance(candidate, str) and candidate:
+                    next_cursor = candidate
+            if has_more is None:
+                candidate = value.get("has_more", value.get("hasMore"))
+                if isinstance(candidate, bool):
+                    has_more = candidate
+            if total is None:
+                candidate = value.get("total")
+                if isinstance(candidate, int) and not isinstance(candidate, bool) and candidate >= 0:
+                    total = candidate
+        return next_cursor, has_more, total
+
+    @staticmethod
+    def _event_log_integrity(
+        events: Sequence[Mapping[str, Any]],
+        *,
+        page_count: int,
+        pagination_complete: bool,
+        declared_total: Optional[int],
+    ) -> Mapping[str, Any]:
+        reasons = []
+        if not pagination_complete:
+            reasons.append("pagination_not_proven_complete")
+        if declared_total is not None and declared_total != len(events):
+            reasons.append("declared_total_mismatch")
+
+        sequences = []
+        sequence_missing = False
+        for event in events:
+            raw = event.get("seq", event.get("sequence"))
+            if raw is None:
+                sequence_missing = True
+                continue
+            if isinstance(raw, bool) or not isinstance(raw, int):
+                reasons.append("invalid_sequence")
+                continue
+            sequences.append(raw)
+        sequence_status = "not_provided"
+        if sequences:
+            sequence_status = "complete"
+            if sequence_missing:
+                sequence_status = "partial"
+                reasons.append("partial_sequence_numbers")
+            if len(sequences) != len(set(sequences)):
+                sequence_status = "duplicate"
+                reasons.append("duplicate_sequence")
+            ordered = sorted(set(sequences))
+            if ordered and ordered != list(range(ordered[0], ordered[-1] + 1)):
+                sequence_status = "gap"
+                reasons.append("sequence_gap")
+
+        event_ids = [
+            str(event.get("event_id"))
+            for event in events
+            if isinstance(event.get("event_id"), str) and event.get("event_id")
+        ]
+        if len(event_ids) != len(set(event_ids)):
+            reasons.append("duplicate_event_id")
+
+        calls = set()
+        results = set()
+        for event in events:
+            kind = str(event.get("type") or event.get("kind") or "")
+            if kind in ("agent.tool_use", "tool.call", "tool_call"):
+                call_id = event.get("id") or event.get("tool_use_id") or event.get("tool_call_id")
+                if call_id:
+                    calls.add(str(call_id))
+            elif kind in ("agent.tool_result", "tool.result", "tool_result"):
+                call_id = event.get("tool_use_id") or event.get("tool_call_id") or event.get("parent_event_id")
+                if call_id:
+                    results.add(str(call_id))
+        unmatched_calls = sorted(calls.difference(results))
+        orphan_results = sorted(results.difference(calls))
+        if unmatched_calls:
+            reasons.append("tool_result_missing")
+        if orphan_results:
+            reasons.append("orphan_tool_result")
+
+        required = ("user.message", "agent.message")
+        event_types = sorted(
+            {str(event.get("type") or event.get("kind") or "") for event in events}
+        )
+        missing_required = [kind for kind in required if kind not in event_types]
+        if missing_required:
+            reasons.append("required_event_type_missing")
+        canonical = json.dumps(
+            list(events),
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+        return {
+            "complete": not reasons,
+            "reason_codes": list(dict.fromkeys(reasons)),
+            "page_count": page_count,
+            "event_count": len(events),
+            "declared_total": declared_total,
+            "event_types": event_types,
+            "required_event_types": list(required),
+            "missing_required_event_types": missing_required,
+            "sequence_status": sequence_status,
+            "unmatched_tool_call_ids": unmatched_calls,
+            "orphan_tool_result_ids": orphan_results,
+            "event_log_sha256": hashlib.sha256(canonical).hexdigest(),
+        }
+
     def fetch_events(self, session_id: str, *, event_type: Optional[str] = None) -> Tuple[Mapping[str, Any], ...]:
         session = _safe_session_id(session_id)
         encoded = urllib.parse.quote(session, safe="")
-        query = {"order": "asc", "limit": str(self.profile.events_limit)}
-        if event_type is not None:
-            query["eventType"] = _trimmed(event_type, "event_type")
-        path = "/sessions/%s/events?%s" % (encoded, urllib.parse.urlencode(query))
-        response = self._request_json("GET", path)
-        events = response.get("data")
-        if not isinstance(events, list) or any(not isinstance(item, Mapping) for item in events):
-            raise CompanyApiRequestError("CATX events response data must be an array of objects")
-        return tuple(dict(self._redact_event(item)) for item in events)
+        normalized_type = _trimmed(event_type, "event_type") if event_type is not None else None
+        cursor = None
+        seen_cursors = set()
+        pages = 0
+        all_events = []
+        declared_total = None
+        pagination_complete = False
+        while True:
+            query = {"order": "asc", "limit": str(self.profile.events_limit)}
+            if normalized_type is not None:
+                query["eventType"] = normalized_type
+            if cursor is not None:
+                query["cursor"] = cursor
+            path = "/sessions/%s/events?%s" % (encoded, urllib.parse.urlencode(query))
+            response = self._request_json("GET", path)
+            page_events = response.get("data")
+            if not isinstance(page_events, list) or any(not isinstance(item, Mapping) for item in page_events):
+                raise CompanyApiRequestError("CATX events response data must be an array of objects")
+            all_events.extend(dict(self._redact_event(item)) for item in page_events)
+            pages += 1
+            next_cursor, has_more, total = self._page_cursor(response)
+            if total is not None:
+                if declared_total is not None and total != declared_total:
+                    raise CompanyApiRequestError("CATX events pagination total changed between pages")
+                declared_total = total
+            if has_more is True or next_cursor is not None:
+                if not next_cursor:
+                    raise CompanyApiRequestError("CATX events page declares more data without a cursor")
+                if next_cursor in seen_cursors or pages >= 100:
+                    raise CompanyApiRequestError("CATX events pagination cursor did not make progress")
+                seen_cursors.add(next_cursor)
+                cursor = next_cursor
+                continue
+            # A short legacy page is complete. A full page is also complete
+            # when the server-declared total exactly matches the events already
+            # collected; otherwise missing cursor metadata remains ambiguous.
+            pagination_complete = (
+                has_more is False
+                or len(page_events) < self.profile.events_limit
+                or (declared_total is not None and declared_total == len(all_events))
+            )
+            break
+        events = tuple(all_events)
+        integrity = self._event_log_integrity(
+            events,
+            page_count=pages,
+            pagination_complete=pagination_complete,
+            declared_total=declared_total,
+        )
+        self._event_logs[(session, normalized_type)] = {
+            "events": events,
+            "integrity": integrity,
+        }
+        return events
+
+    def last_event_log(
+        self, session_id: str, *, event_type: Optional[str] = None
+    ) -> Optional[Mapping[str, Any]]:
+        session = _safe_session_id(session_id)
+        normalized_type = _trimmed(event_type, "event_type") if event_type is not None else None
+        value = self._event_logs.get((session, normalized_type))
+        if value is None:
+            return None
+        return {
+            "events": tuple(dict(item) for item in value.get("events", ())),
+            "integrity": dict(value.get("integrity", {})),
+        }
 
     def poll_session(self, session_id: str) -> Mapping[str, Any]:
         status_document = self.get_status(session_id)
@@ -1114,6 +1294,12 @@ class CatxAgentClient:
         session = _safe_session_id(session_id)
         status_document = self.get_status(session)
         events = self.fetch_events(session)
+        event_log = self.last_event_log(session) or {}
+        event_integrity = (
+            event_log.get("integrity", {})
+            if isinstance(event_log.get("integrity"), Mapping)
+            else {}
+        )
         output = last_effective_agent_message(events)
         status = status_document.get("status")
         if not isinstance(status, str) or not status:
@@ -1133,7 +1319,7 @@ class CatxAgentClient:
             error = "CATX session terminated without an effective agent message"
         usage = _catx_usage(status_document.get("usage", {}))
         trace = _catx_trace(events)
-        truncated = len(events) >= self.profile.events_limit
+        truncated = event_integrity.get("complete") is not True
         expected_fields = frozenset(("output", "trace", "usage", "error", "metadata"))
         observed_fields = expected_fields if not truncated else frozenset(("output", "usage", "error", "metadata"))
         completeness = ObservationCompleteness(expected=expected_fields, observed=observed_fields)
@@ -1150,8 +1336,9 @@ class CatxAgentClient:
                 "events_limit": self.profile.events_limit,
                 "trace_may_be_truncated": truncated,
                 "raw_event_count": len(events),
-                "required_event_types": ["user.message", "agent.message"],
-                "missing_required_event_types": [kind for kind in ("user.message", "agent.message") if not any(event.get("type") == kind for event in events)],
+                "required_event_types": event_integrity.get("required_event_types", ["user.message", "agent.message"]),
+                "missing_required_event_types": event_integrity.get("missing_required_event_types", []),
+                "event_log_integrity": event_integrity,
                 "observation_completeness": completeness.as_dict(),
             },
         )

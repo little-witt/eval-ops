@@ -153,6 +153,12 @@ class OnlineCodeReviewTest(unittest.TestCase):
         self.assertEqual(
             {item.id: "path-%s" % item.id for item in selected}, observed
         )
+        first_metadata = json.loads(
+            next(workspace.glob("eval-*/eval_metadata.json")).read_text(encoding="utf-8")
+        )
+        first_case = next(item for item in selected if item.id == first_metadata["eval_name"])
+        self.assertEqual(first_case.stack, first_metadata["stack"])
+        self.assertEqual(first_case.case_type, first_metadata["case_type"])
 
     def test_online_suite_validates_all_catalog_paths_before_starting_sessions(self):
         selected = load_online_review_cases(self.lab)[:2]

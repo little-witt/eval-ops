@@ -321,18 +321,25 @@ def _score_dimensions(
         if item.get("measured") and item.get("score") is not None and float(item.get("weight", 0)) > 0
     ]
     weight_total = sum(weight for _, weight in weighted)
-    overall = sum(score * weight for score, weight in weighted) / weight_total if weight_total else None
-    # Fail closed when a completed-looking artifact omits the primary outcome.
-    # Optional path/binding/trace dimensions remain backward-compatible: if a
-    # producer did not emit that artifact they are unknown rather than an
-    # invented pass.
+    # The primary outcome is the minimum semantic signal for an overall
+    # quality score.  Optional dimensions (format/binding/path) can still be
+    # shown individually, but must not make a run with no outcome receipt look
+    # like a complete 100% result.
+    overall = (
+        sum(score * weight for score, weight in weighted) / weight_total
+        if weight_total and outcome is not None
+        else None
+    )
+    # UI summaries consume the same fail-closed evidence rules as the Kernel.
+    # Missing path, binding, or complete Trace evidence is visibly unknown and
+    # can never be rendered as a passed promotion gate.
     hard_gate = (
         formal.get("status") == "pass"
         and outcome is not None
         and outcome >= 1.0
-        and (path_status in (None, "pass"))
-        and (binding_value in (None, True))
-        and (trace_complete in (None, True))
+        and path_status == "pass"
+        and binding_value is True
+        and trace_complete is True
     )
     return {
         "dimensions": dimensions,
@@ -570,9 +577,14 @@ def _run_payload(run_dir: Path) -> Mapping[str, Any]:
     )
     total_tokens = int(_number(timing.get("total_tokens"), 0) or 0)
     duration_seconds = _number(timing.get("total_duration_seconds"), 0.0) or 0.0
+    raw_pass_rate = _number(summary.get("pass_rate"))
     return {
         "status": status,
-        "pass_rate": _number(summary.get("pass_rate"), 0.0) or 0.0,
+        # Preserve an omitted/invalid rate as unknown.  A missing summary is
+        # not the same thing as a measured 0%; collapsing it to zero would
+        # make an incomplete run look like a real quality failure in both the
+        # console and candidate comparison read models.
+        "pass_rate": raw_pass_rate,
         "formal_pass": formal.get("status") == "pass",
         "tokens": total_tokens,
         "duration_seconds": duration_seconds,
@@ -612,20 +624,32 @@ def _run_payload(run_dir: Path) -> Mapping[str, Any]:
     }
 
 
-def _case_group(case_id: str) -> str:
-    if case_id.startswith("ts-web-"):
-        return "TypeScript Web"
-    if case_id.startswith("rn-"):
-        return "React Native"
-    if case_id.startswith("mini-"):
-        return "微信小程序"
-    if case_id.startswith("java-"):
-        return "Java Backend"
-    return "Other"
+_STACK_LABELS = {
+    "typescript-web": "TypeScript Web",
+    "react-native": "React Native",
+    "wechat-miniprogram": "微信小程序",
+    "java-backend": "Java Backend",
+}
 
 
-def _case_type(case_id: str) -> str:
-    return "clean-control" if "clean" in case_id else "defect"
+def _case_group(metadata: Mapping[str, Any]) -> str:
+    """Use authored metadata instead of guessing a stack from the Case id."""
+
+    stack = metadata.get("stack")
+    if not isinstance(stack, str) or not stack.strip():
+        return "未分组"
+    normalized = stack.strip()
+    return _STACK_LABELS.get(normalized, normalized)
+
+
+def _case_type(metadata: Mapping[str, Any]) -> str:
+    """Use the fixture's declared role; unknown legacy rows stay explicit."""
+
+    value = metadata.get("case_type")
+    if not isinstance(value, str) or not value.strip():
+        return "未标注"
+    normalized = value.strip()
+    return "clean-control" if normalized == "clean" else normalized
 
 
 def _configuration_for(eval_dir: Path, preferred: str) -> Optional[Path]:
@@ -657,8 +681,8 @@ def _collect_cases(iteration: Path, root: Path) -> List[Mapping[str, Any]]:
         cases.append({
             "id": case_id,
             "eval_id": metadata.get("eval_id"),
-            "group": _case_group(case_id),
-            "type": _case_type(case_id),
+            "group": _case_group(metadata),
+            "type": _case_type(metadata),
             "prompt": str(metadata.get("prompt", "")),
             "assertions": list(assertions) if isinstance(assertions, list) else [],
             # Keep the authored semantic path separate from observed
@@ -700,8 +724,9 @@ def _aggregate_run(iteration: Path, configuration: str) -> Mapping[str, Any]:
         "cases": len(values),
         "completed": len(completed),
         "pass_rate": (
-            sum(float(item["pass_rate"]) for item in completed) / len(completed)
-            if completed else None
+            sum(float(item["pass_rate"]) for item in completed if item.get("pass_rate") is not None)
+            / len([item for item in completed if item.get("pass_rate") is not None])
+            if any(item.get("pass_rate") is not None for item in completed) else None
         ),
         "formal_passes": sum(bool(item["formal_pass"]) for item in completed),
         "strict_json_passes": sum(

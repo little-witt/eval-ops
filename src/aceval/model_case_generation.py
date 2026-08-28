@@ -132,7 +132,7 @@ def build_case_generation_prompt(
         "所有面向用户展示的字段必须使用简体中文，包括 title、prompt、family、generation_reason、expected_observables、"
         "oracle_strategy、path purpose 和 step label；文件名、工具名、Case/Requirement/source ref 等技术标识可保留原文。"
         "只返回严格 JSON，不要 Markdown 或代码围栏；JSON 字符串内部的双引号必须使用反斜杠转义，不能原样嵌入。"
-        "每个 path step 的 match 只允许 event_type、tool_name、contains、fields 四种键，例如 "
+        "每个 path step 的 match 只允许 event_type、tool_name、contains、command_contains、fields 五种键，例如 "
         "{\"event_type\":\"agent.tool_use\",\"tool_name\":\"read_file\",\"contains\":\"SKILL.md\"}；"
         "禁止使用 tool、pattern、output、regex 等其它键。\n\n"
         "返回结构：{\"api_version\":\"aceval.model-case-design/v1\",\"cases\":["
@@ -164,7 +164,7 @@ def build_case_generation_repair_prompt(
         "只修复 JSON 语法或 schema 字段，不要解释，不要使用 Markdown，不要省略任何 Case 或 Path。"
         "所有面向用户展示的字段继续使用简体中文。"
         "必须返回完整 aceval.model-case-design/v1 对象；保留原 target Case ids、Requirement ids 和 source_refs，"
-        "每个 Case 的真实任务 Prompt 必须保持互异。path step.match 仍只允许 event_type、tool_name、contains、fields。"
+        "每个 Case 的真实任务 Prompt 必须保持互异。path step.match 仍只允许 event_type、tool_name、contains、command_contains、fields。"
         "修复后的结果会从头重新经过 JSON、Case 覆盖、Requirement、Skill source refs、runtime 和 Path 校验。\n\n"
         "校验错误：%s\n\n待修复的模型输出：\n%s" % (error, response)
     )
@@ -269,12 +269,16 @@ def parse_model_case_design(
             match = step.get("match", {})
             if not isinstance(match, Mapping):
                 raise ModelCaseGenerationError("path step match must be an object")
-            unknown_match = set(match).difference({"event_type", "tool_name", "contains", "fields"})
+            unknown_match = set(match).difference(
+                {"event_type", "tool_name", "contains", "command_contains", "fields"}
+            )
             if unknown_match or not match:
                 raise ModelCaseGenerationError("path step match contains unsupported or empty fields")
             if "fields" in match and not isinstance(match["fields"], Mapping):
                 raise ModelCaseGenerationError("path step match.fields must be an object")
             after = _strings(step.get("after", ()), "path step after", required=False)
+            if step_id in after:
+                raise ModelCaseGenerationError("path step cannot reference itself as a predecessor")
             if set(after).difference(ids):
                 raise ModelCaseGenerationError("path step references a future or unknown predecessor")
             if kind == "alternative" and not isinstance(step.get("alternative_group"), str):

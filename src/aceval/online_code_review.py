@@ -444,6 +444,8 @@ def run_online_review_suite(
         metadata = {
             "eval_id": index,
             "eval_name": case.id,
+            "stack": case.stack,
+            "case_type": case.case_type,
             "prompt": case.prompt,
             "assertions": list(EXPECTATIONS),
         }

@@ -13,6 +13,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import subprocess
 from typing import Any, Callable, Mapping, Optional, Sequence, Tuple, Union
 import uuid
@@ -62,6 +63,7 @@ from .task_center import TaskStore
 from .trial_environment import (
     TrialEnvironmentContractError,
     build_trial_environment_contract,
+    comparison_context_hash,
     verify_contract_hash,
 )
 
@@ -177,6 +179,124 @@ def _normalize_case_identity(
     return result
 
 
+def _human_calibration_criteria(value: Any, case_id: str) -> Tuple[str, ...]:
+    """Validate the concrete pass criteria a person confirms for one Case."""
+
+    if isinstance(value, str):
+        items = value.splitlines()
+    elif isinstance(value, Sequence) and not isinstance(value, (str, bytes)):
+        items = value
+    else:
+        raise IterationKernelError(
+            "case calibration for %s must be text or an array of pass criteria" % case_id
+        )
+    criteria = []
+    for item in items:
+        if not isinstance(item, str):
+            raise IterationKernelError("case calibration criteria must be text")
+        text = item.strip()
+        if not text:
+            continue
+        if "\x00" in text or len(text) > 2000:
+            raise IterationKernelError(
+                "each case calibration criterion must be at most 2000 characters"
+            )
+        if text not in criteria:
+            criteria.append(text)
+    if not criteria:
+        raise IterationKernelError(
+            "case calibration for %s requires at least one observable pass criterion" % case_id
+        )
+    if len(criteria) > 32 or sum(len(item) for item in criteria) > 16_000:
+        raise IterationKernelError("case calibration exceeds the safety limit")
+    return tuple(criteria)
+
+
+def _execution_subject_hash(
+    design: Mapping[str, Any],
+    state: Mapping[str, Any],
+    skill_contract: Mapping[str, Any],
+) -> str:
+    """Return the active Skill hash frozen in the trial contract.
+
+    ``source_subject_hash`` identifies the Skill used to compile the design.
+    It is deliberately stable across iterations and therefore cannot identify
+    a published Challenger.  New contracts carry the active subject hash; old
+    Champion-only contracts retain a narrow compatibility fallback.
+    """
+
+    active = skill_contract.get("subject_hash")
+    if isinstance(active, str) and active:
+        return active
+    if state.get("challenger_commit") or state.get("candidate_status") == "evaluating":
+        raise IterationKernelError(
+            "trial environment contract is missing the active Challenger subject hash"
+        )
+    fallback = design.get("source_subject_hash")
+    if fallback is None and isinstance(design.get("capability_summary"), Mapping):
+        fallback = design.get("capability_summary", {}).get("subject_hash")
+    if not isinstance(fallback, str) or not fallback:
+        raise IterationKernelError("evaluation design is missing its source subject hash")
+    return fallback
+
+
+def _require_catx_binding_material(
+    skill_contract: Mapping[str, Any],
+    repository_contract: Mapping[str, Any],
+) -> None:
+    """Reject a CATX dispatch whose local snapshot cannot be authenticated.
+
+    Returning ``None`` from a best-effort filesystem hash helper is useful for
+    read-only diagnostics, but it is not safe at the authorization boundary.
+    A CATX run must carry a full active Skill subject hash, repository tree
+    hash, and immutable commit; otherwise a design-time hash could be reused
+    for a different or unreadable working tree.
+    """
+
+    digest_pattern = re.compile(r"^sha256:[0-9a-f]{64}$")
+    for label, value in (
+        ("active Skill subject hash", skill_contract.get("subject_hash")),
+        ("repository working-tree hash", repository_contract.get("working_tree_hash")),
+    ):
+        if not isinstance(value, str) or not digest_pattern.fullmatch(value):
+            raise IterationKernelError(
+                "cannot construct CATX binding: %s is missing or invalid" % label
+            )
+    revision = repository_contract.get("revision")
+    if (
+        not isinstance(revision, str)
+        or len(revision) != 40
+        or not re.fullmatch(r"[0-9a-f]{40}", revision)
+    ):
+        raise IterationKernelError(
+            "cannot construct CATX binding: repository commit is missing or invalid"
+        )
+
+
+def _comparison_requires_more_evidence(comparison: Mapping[str, Any]) -> bool:
+    """Distinguish an inconclusive comparison from a rejected Challenger."""
+
+    reasons = {str(item) for item in comparison.get("reasons", ())}
+    decisive_failures = {"critical_regression", "hard_gate_failure"}
+    inconclusive = {
+        "no_comparable_cases",
+        "case_set_mismatch",
+        "attempt_manifest_mismatch",
+        "comparison_context_mismatch",
+        "insufficient_evidence",
+        "insufficient_stability",
+        "malformed_aggregate",
+        # Historical aggregates without attempt receipts are retained for
+        # diagnostics, but are explicitly non-promotable.  Treat that state
+        # as inconclusive evidence rather than rejecting/restoring a live
+        # Challenger on the basis of an old baseline.
+        "legacy_aggregate",
+    }
+    return bool(reasons.intersection(inconclusive)) and not bool(
+        reasons.intersection(decisive_failures)
+    )
+
+
 def _default_seed(user_input: KernelInput) -> Tuple[Mapping[str, Any], ...]:
     if user_input.cases:
         return tuple(_case_document(item) for item in user_input.cases)
@@ -197,14 +317,21 @@ def _custom_evalpack_seed(path: str) -> Tuple[Any, Tuple[Mapping[str, Any], ...]
     cases = []
     for item in scenarios:
         metadata = dict(as_primitive(item.scenario.metadata))
-        metadata.update({"source": "custom_evalpack", "eval_split": item.split, "fixture_refs": list(item.fixtures)})
+        metadata.update({
+            "source": "custom_evalpack",
+            "eval_split": item.split,
+            "fixture_refs": list(item.fixtures),
+            "expectation_mode": "evalpack_graders",
+            "evalpack_scenario_id": item.id,
+            "evalpack_scenario_hash": item.content_hash,
+            "evalpack_grader_ids": list(item.grader_ids),
+        })
         case: dict[str, Any] = {"id": item.id, "prompt": item.prompt, "metadata": metadata}
         oracle = as_primitive(item.oracle.data) if item.oracle is not None else None
         if isinstance(oracle, Mapping) and "expected_output" in oracle:
             case["expected_output"] = oracle["expected_output"]
         elif oracle is not None:
             case["expected_output"] = oracle
-            metadata["expectation_mode"] = "semantic"
         cases.append(case)
     if not cases:
         raise IterationKernelError("custom EvalPack has no executable non-holdout scenarios")
@@ -214,7 +341,6 @@ def _custom_evalpack_seed(path: str) -> Tuple[Any, Tuple[Mapping[str, Any], ...]
 def _path_for_case(case: Mapping[str, Any], graph: Mapping[str, Any]) -> Mapping[str, Any]:
     metadata = case.get("metadata", {}) if isinstance(case.get("metadata"), Mapping) else {}
     test = metadata.get("aceval_test", {}) if isinstance(metadata.get("aceval_test"), Mapping) else {}
-    kind = str(test.get("kind") or metadata.get("harness_case_kind") or "happy_path")
     title = str(test.get("title") or case.get("title") or case.get("id") or "Case")
     if metadata.get("harness_case_kind") == "negative_trigger":
         return {
@@ -225,6 +351,12 @@ def _path_for_case(case: Mapping[str, Any], graph: Mapping[str, Any]) -> Mapping
                 "label": "近似请求不应触发候选 Skill",
                 "kind": "forbidden",
                 "match": {"event_type": "tool_call", "contains": "SKILL.md"},
+                "after": [],
+            }, {
+                "id": "no-skill-publish",
+                "label": "评测会话不得发布或改写 Skill",
+                "kind": "forbidden",
+                "match": {"command_contains": "git push"},
                 "after": [],
             }],
         }
@@ -241,7 +373,6 @@ def _path_for_case(case: Mapping[str, Any], graph: Mapping[str, Any]) -> Mapping
     # requirement/capability instead of repeating the entire Skill tool list.
     source_tool_names = set()
     capability_ids = test.get("capability_ids", ()) if isinstance(test.get("capability_ids"), list) else ()
-    requirement_ids = test.get("requirement_ids", ()) if isinstance(test.get("requirement_ids"), list) else ()
     requirements = graph.get("capabilities", ()) if isinstance(graph.get("capabilities"), list) else ()
     for capability in requirements:
         if not isinstance(capability, Mapping):
@@ -271,30 +402,17 @@ def _path_for_case(case: Mapping[str, Any], graph: Mapping[str, Any]) -> Mapping
                 "after": ["load-skill"],
             }
         )
-    expected = test.get("expected_observables", ()) if isinstance(test.get("expected_observables"), list) else ()
-    model_validated = isinstance(metadata.get("generation_provenance"), Mapping) and metadata.get("generation_provenance", {}).get("strategy") == "cc-switch-model"
-    if expected and model_validated:
-        steps.append({
-            "id": "assert-observable",
-            "label": "核对该 Case 的预期可观察结果",
-            "kind": "required",
-            "match": {"contains": str(expected[0])[:500]},
-            "after": ["load-skill"],
-        })
-    if kind in ("negative", "boundary", "recovery", "idempotency", "state_transition"):
-        steps.append({
-            "id": "exercise-boundary",
-            "label": "执行 %s 边界并记录安全结果" % kind,
-            "kind": "required",
-            "match": {"contains": kind},
-            "after": ["load-skill"],
-        })
+    # Expected outcomes belong to outcome/semantic graders, not the execution
+    # path. Likewise, labels such as "negative" or "recovery" are planning
+    # categories rather than observable runtime behavior. Adding them as
+    # required trace substrings would turn ordinary prompt text into false
+    # path evidence and could incorrectly authorize a Skill change.
     steps.append(
         {
             "id": "no-skill-publish",
             "label": "评测会话不得发布或改写 Skill",
             "kind": "forbidden",
-            "match": {"contains": "git push"},
+            "match": {"command_contains": "git push"},
             "after": [],
         }
     )
@@ -304,6 +422,113 @@ def _path_for_case(case: Mapping[str, Any], graph: Mapping[str, Any]) -> Mapping
         "trace_completeness_required": True,
         "steps": steps,
     }
+
+
+def _merge_model_path(
+    case: Mapping[str, Any],
+    model_path: Mapping[str, Any],
+    graph: Mapping[str, Any],
+) -> Mapping[str, Any]:
+    """Merge model-observed checkpoints without weakening system safeguards.
+
+    The planner owns the safety contract.  A model may add useful business
+    checkpoints and readable purpose text, but it cannot delete, rename, or
+    change the matcher/kind of deterministic ``load-skill``, negative-trigger,
+    or ``no-skill-publish`` steps.  Conflicting model steps are retained only
+    as auditable rejection metadata, never as executable path requirements.
+    """
+
+    deterministic = _path_for_case(case, graph)
+    merged = {key: value for key, value in deterministic.items() if key != "steps"}
+    merged["purpose"] = str(model_path.get("purpose") or deterministic.get("purpose") or "评测执行路径")
+    merged["api_version"] = EXECUTION_PATH_SPEC_API_VERSION
+    merged["trace_completeness_required"] = True
+    system_steps = [dict(item) for item in deterministic.get("steps", ()) if isinstance(item, Mapping)]
+    merged_steps = list(system_steps)
+    reserved = {str(item.get("id")) for item in system_steps if item.get("id")}
+    model_ids: list[str] = []
+    rejected: list[Mapping[str, Any]] = []
+    raw_steps = model_path.get("steps", ()) if isinstance(model_path, Mapping) else ()
+    if not isinstance(raw_steps, Sequence) or isinstance(raw_steps, (str, bytes)):
+        raw_steps = ()
+    id_map: dict[str, str] = {}
+    # Allocate stable ids first so model ``after`` references remain valid.
+    for raw in raw_steps:
+        if not isinstance(raw, Mapping):
+            continue
+        original = str(raw.get("id") or "").strip()
+        if not original:
+            continue
+        candidate = original
+        if candidate in reserved or candidate in id_map.values():
+            candidate = "model-" + candidate
+            suffix = 2
+            while candidate in reserved or candidate in id_map.values():
+                candidate = "model-%s-%d" % (original, suffix)
+                suffix += 1
+        id_map[original] = candidate
+    for raw in raw_steps:
+        if not isinstance(raw, Mapping):
+            continue
+        original = str(raw.get("id") or "").strip()
+        candidate_id = id_map.get(original)
+        if not candidate_id:
+            continue
+        # A model step colliding with a system id is deliberately not allowed
+        # to replace it.  Keep the proposed version visible for diagnostics,
+        # but do not append it as a second hard requirement when it would make
+        # the security contract ambiguous.
+        if original in reserved:
+            rejected.append({"id": original, "reason": "system_step_id_reserved"})
+            continue
+        kind = str(raw.get("kind") or "")
+        if kind not in ("required", "recommended", "alternative", "forbidden"):
+            rejected.append({"id": original, "reason": "invalid_step_kind"})
+            continue
+        item = dict(raw)
+        item["id"] = candidate_id
+        after = item.get("after", ())
+        if not isinstance(after, Sequence) or isinstance(after, (str, bytes)):
+            after = ()
+        normalized_after = []
+        unknown_after = False
+        for predecessor in after:
+            predecessor_id = str(predecessor)
+            mapped = id_map.get(predecessor_id, predecessor_id)
+            if mapped not in reserved and mapped not in id_map.values():
+                unknown_after = True
+                break
+            if mapped not in normalized_after:
+                normalized_after.append(mapped)
+        if unknown_after:
+            rejected.append({"id": original, "reason": "unknown_model_predecessor"})
+            continue
+        # Keep the model's proposed ordering for audit/display, but do not
+        # feed it into the executable v1 contract.  Even a ``recommended``
+        # step can otherwise create a hard violation when the evaluator sees
+        # a missing predecessor; only deterministic planner-owned ordering is
+        # allowed to affect path conformance.
+        item["model_after"] = normalized_after
+        item["after"] = []
+        # Model-generated checkpoints are suggestions, never hard path
+        # obligations.  Required/alternative/forbidden semantics must come
+        # from the deterministic planner or an explicit human calibration;
+        # otherwise the model could invent a missing step and manufacture a
+        # failure (or a forbidden-action gate) that authorizes a mutation.
+        if kind != "recommended":
+            item["model_requested_kind"] = kind
+            item["kind"] = "recommended"
+        # Prefix model-only labels in the read model so people can tell which
+        # checkpoints are suggestions rather than frozen safety requirements.
+        item["provenance"] = "model_supplement"
+        merged_steps.append(item)
+        model_ids.append(candidate_id)
+    merged["steps"] = merged_steps
+    merged["system_step_ids"] = sorted(reserved)
+    merged["model_step_ids"] = model_ids
+    merged["rejected_model_steps"] = rejected
+    merged["path_provenance"] = "deterministic_with_model_supplements"
+    return merged
 
 
 def _model_generated_cases(
@@ -422,7 +647,23 @@ def _model_generated_cases(
                 metadata["generation_provenance"] = {"strategy": "cc-switch-model", "model_id": base_provenance["model_id"], "status": "validated"}
                 value.update({"title": design["title"], "prompt": design["prompt"], "metadata": metadata})
             updated.append(value)
-        path_by_case = {str(item["case_id"]): item for item in parsed["paths"]}
+        case_by_id = {str(item.get("id")): item for item in cases if isinstance(item, Mapping)}
+        path_by_case = {
+            str(item["case_id"]): _merge_model_path(
+                case_by_id.get(str(item["case_id"]), {}),
+                item,
+                graph,
+            )
+            for item in parsed["paths"]
+        }
+        base_provenance["path_safety"] = {
+            case_id: {
+                "system_step_ids": list(path.get("system_step_ids", ())),
+                "model_step_ids": list(path.get("model_step_ids", ())),
+                "rejected_model_steps": list(path.get("rejected_model_steps", ())),
+            }
+            for case_id, path in path_by_case.items()
+        }
         base_provenance.update({
             "strategy": "cc-switch-model",
             "status": "validated",
@@ -646,9 +887,19 @@ class IterationKernel:
                         "binding_evidence": case.get("binding_evidence"),
                         "message_status": case.get("message_status"),
                         "log_completeness": case.get("log_completeness"),
+                        "attempt_number": case.get("attempt_number"),
+                        "attempts": [
+                            dict(item)
+                            for item in case.get("attempts", ())
+                            if isinstance(item, Mapping)
+                        ],
+                        "retry_reason": case.get("retry_reason"),
+                        "error": case.get("error"),
+                        "fetch_error": case.get("fetch_error"),
                     }
                     for case in batch.get("cases", ())
-                    if isinstance(case, Mapping) and case.get("artifact")
+                    if isinstance(case, Mapping)
+                    and (case.get("artifact") or case.get("attempts"))
                 )
             decision_path = directory / "analysis-decision.json"
             if decision_path.is_file():
@@ -762,6 +1013,7 @@ class IterationKernel:
         selected_capability_ids: Sequence[str] = (),
         selected_case_ids: Sequence[str] = (),
         selected_change_ids: Sequence[str] = (),
+        case_calibrations: Optional[Mapping[str, Any]] = None,
         user_feedback: Optional[str] = None,
     ) -> Mapping[str, Any]:
         state = state or self.state(task_id)
@@ -780,6 +1032,7 @@ class IterationKernel:
             "selected_capability_ids": list(selected_capability_ids),
             "selected_case_ids": list(selected_case_ids),
             "selected_change_ids": list(selected_change_ids),
+            "case_calibrations": dict(case_calibrations or {}),
             "user_feedback": user_feedback,
             "recorded_at": _now(),
         }
@@ -908,6 +1161,7 @@ class IterationKernel:
             "champion_commit": _git_head(config.skill_repository.local_path),
             "challenger_commit": None,
             "candidate_status": None,
+            "candidate_publish_approved": False,
             "intent_mode": intent_mode,
             "blueprint": None,
             "blueprint_approved": False,
@@ -989,7 +1243,30 @@ class IterationKernel:
             known_case_ids = {str(item.get("id")) for item in seeds if isinstance(item, Mapping)}
             for case in selected_blueprint_cases(blueprint):
                 if str(case.get("id")) not in known_case_ids:
-                    seeds.append(case)
+                    # Capability planning is model-authored.  Its suggested
+                    # expected result remains useful review material, but
+                    # approving the capability itself is not a Case/Oracle
+                    # calibration decision.  The later design-review gate can
+                    # turn concrete, visible pass criteria into a
+                    # human-confirmed semantic Oracle.
+                    blueprint_case = dict(case)
+                    blueprint_case["oracle_level"] = "model_proposed"
+                    metadata = (
+                        dict(blueprint_case.get("metadata", {}))
+                        if isinstance(blueprint_case.get("metadata"), Mapping)
+                        else {}
+                    )
+                    metadata.update(
+                        {
+                            "source": "blueprint",
+                            "expectation_mode": "model_proposed",
+                            "blueprint_expectation_requires_calibration": (
+                                "expected_output" in blueprint_case
+                            ),
+                        }
+                    )
+                    blueprint_case["metadata"] = metadata
+                    seeds.append(blueprint_case)
                     known_case_ids.add(str(case.get("id")))
         standards = list(dict.fromkeys(standards))
         seeds = tuple(seeds)
@@ -1001,7 +1278,7 @@ class IterationKernel:
                 raise IterationKernelError("user Case ids conflict with custom EvalPack: %s" % ", ".join(sorted(duplicate_ids)))
             seeds = tuple(seeds) + tuple(pack_seeds) if (user_input.cases or (blueprint and blueprint.get("selected_proposal_ids"))) else tuple(pack_seeds)
         planning = create_planning_artifacts(
-            _skill_file(str(config.skill_repository.local_path)),
+            _skill_root(str(config.skill_repository.local_path)),
             {"name": "%s-kernel" % user_input.skill_name, "version": "0.1.0", "cases": list(seeds)},
             goal,
             root / "planning",
@@ -1084,6 +1361,19 @@ class IterationKernel:
             for index, ref in enumerate(capability.get("source_refs", ()) if isinstance(capability.get("source_refs"), list) else ()):
                 if isinstance(ref, Mapping):
                     source_ref_details["%s#source-%d" % (cap_id, index)] = dict(ref)
+            for branch in capability.get("branches", ()) if isinstance(capability.get("branches"), list) else ():
+                if not isinstance(branch, Mapping) or not isinstance(branch.get("source_ref"), Mapping):
+                    continue
+                branch_id = str(branch.get("id") or "")
+                if branch_id:
+                    source_ref_details[branch_id] = dict(branch["source_ref"])
+        for tool in graph.get("tools", ()) if isinstance(graph.get("tools"), list) else ():
+            if not isinstance(tool, Mapping):
+                continue
+            tool_name = str(tool.get("name") or "")
+            for index, ref in enumerate(tool.get("source_refs", ()) if isinstance(tool.get("source_refs"), list) else ()):
+                if tool_name and isinstance(ref, Mapping):
+                    source_ref_details["tool.%s#source-%d" % (tool_name, index)] = dict(ref)
         for case in cases:
             metadata = dict(case.get("metadata", {})) if isinstance(case.get("metadata"), Mapping) else {}
             test = dict(metadata.get("aceval_test", {})) if isinstance(metadata.get("aceval_test"), Mapping) else {}
@@ -1150,6 +1440,37 @@ class IterationKernel:
                 "runtime_gaps": [],
                 "artifacts": {"evaluation_suite": pack_ref, "experiment_plan": None},
             }
+        active_pack = custom_pack if custom_pack is not None else compilation.pack
+        scenarios_by_id = {
+            str(item.id): item
+            for item in active_pack.scenarios
+            if item.split != "holdout"
+        }
+        active_pack_lifecycle = pack_calibration_status(active_pack)
+        custom_pack_trusted = custom_pack is not None and active_pack_lifecycle in ("frozen", "legacy")
+        for case in cases:
+            scenario = scenarios_by_id.get(str(case.get("id")))
+            if scenario is None:
+                continue
+            metadata = dict(case.get("metadata", {})) if isinstance(case.get("metadata"), Mapping) else {}
+            metadata.update({
+                "evalpack_scenario_id": scenario.id,
+                "evalpack_scenario_hash": scenario.content_hash,
+                "evalpack_grader_ids": list(scenario.grader_ids),
+                "evalpack_pack_hash": active_pack.pack_hash,
+                "evalpack_lifecycle": active_pack_lifecycle,
+            })
+            if custom_pack_trusted:
+                metadata["expectation_mode"] = "evalpack_graders"
+                test = dict(metadata.get("aceval_test", {})) if isinstance(metadata.get("aceval_test"), Mapping) else {}
+                test.update({
+                    "oracle_ready": True,
+                    "oracle_trust": "deterministic",
+                    "executable": True,
+                    "needs_user_input": False,
+                })
+                metadata["aceval_test"] = test
+            case["metadata"] = metadata
         design = {
             "api_version": EVALUATION_DESIGN_API_VERSION,
             "revision": revision,
@@ -1163,11 +1484,13 @@ class IterationKernel:
             "cases": cases,
             "case_ids": [str(case.get("id")) for case in cases],
             "execution_paths": paths,
+            "source_ref_catalog": source_ref_details,
             "capability_summary": graph,
             "planning": planning.summary(),
             "test_design": planning.test_design(),
             "case_generation": model_case_provenance,
             "evalpack": evalpack_value,
+            "evalpack_ref": pack_ref,
             "source_subject_hash": graph.get("subject_hash"),
             "generated_at": _now(),
         }
@@ -1298,11 +1621,19 @@ class IterationKernel:
             binding_repo = config.code_repository if config.code_repository is not None else config.skill_repository
             repository_contract = code_contract if config.code_repository is not None else skill_contract
             repository_ref = str(repository_contract.get("ssh_url") or binding_repo.ssh_url or "").strip()
-            if repository_ref:
-                try:
-                    execution_binding = CatxExecutionBinding(
+            if not repository_ref:
+                raise IterationKernelError(
+                    "cannot construct CATX binding without a repository reference"
+                )
+            try:
+                _require_catx_binding_material(skill_contract, repository_contract)
+                execution_binding = CatxExecutionBinding(
                         api_version=CATX_EXECUTION_BINDING_API_VERSION,
-                        subject_hash=str(design.get("source_subject_hash") or design.get("capability_summary", {}).get("subject_hash")),
+                        subject_hash=_execution_subject_hash(
+                            design,
+                            state,
+                            skill_contract,
+                        ),
                         skill_ref=str(skill_contract.get("ssh_url") or config.skill_repository.ssh_url or ""),
                         repository_ref=repository_ref,
                         repository_hash=repository_contract.get("working_tree_hash"),
@@ -1323,9 +1654,9 @@ class IterationKernel:
                                 }] if config.code_repository is not None else []),
                             ],
                         },
-                    )
-                except Exception as exc:
-                    raise IterationKernelError("cannot construct immutable CATX repository binding: %s" % exc) from exc
+                )
+            except Exception as exc:
+                raise IterationKernelError("cannot construct immutable CATX repository binding: %s" % exc) from exc
         batch = coordinator.dispatch(
             task_id,
             int(state.get("iteration", 0)),
@@ -1402,9 +1733,16 @@ class IterationKernel:
                     binding_repo = self._config(task_id).code_repository if self._config(task_id).code_repository is not None else self._config(task_id).skill_repository
                     repository_contract = code_contract if self._config(task_id).code_repository is not None else skill_contract
                     repository_ref = str(repository_contract.get("ssh_url") or binding_repo.ssh_url or "").strip()
+                    if not repository_ref:
+                        raise IterationKernelError("cannot reconstruct CATX binding without a repository reference")
+                    _require_catx_binding_material(skill_contract, repository_contract)
                     execution_binding = CatxExecutionBinding(
                         api_version=CATX_EXECUTION_BINDING_API_VERSION,
-                        subject_hash=str(self._design(task_id).get("source_subject_hash") or self._design(task_id).get("capability_summary", {}).get("subject_hash")),
+                        subject_hash=_execution_subject_hash(
+                            self._design(task_id),
+                            state,
+                            skill_contract,
+                        ),
                         skill_ref=str(skill_contract.get("ssh_url") or self._config(task_id).skill_repository.ssh_url or ""),
                         repository_ref=repository_ref,
                         repository_hash=repository_contract.get("working_tree_hash"),
@@ -1497,6 +1835,7 @@ class IterationKernel:
         environment_hashes = {str(item.get("environment_contract_hash")) for item in compared_batches}
         if environment_hashes != {expected_environment_hash}:
             raise IterationKernelError("evaluation and pass verification must use the same frozen environment contract")
+        paired_context_hash = comparison_context_hash(environment_contract)
         model = self.model_factory(config)
         graph = design.get("capability_summary", {}) if isinstance(design.get("capability_summary"), Mapping) else {}
         skill_root = _skill_root(str(config.skill_repository.local_path))
@@ -1516,6 +1855,7 @@ class IterationKernel:
             max_retries=0,
             max_prompt_chars=config.local_analysis.max_prompt_chars,
             max_evidence_chars_per_case=config.policy.max_analysis_evidence_chars_per_case,
+            required_k=1 + int(config.policy.pass_verification_runs),
             stage_callback=lambda stage: self._transition(task_id, stage, brain_stage=stage),
         ).analyze(
             task_id=task_id,
@@ -1529,6 +1869,8 @@ class IterationKernel:
             comparison_baseline_batch=comparison_baseline,
             capability_summary=graph,
             editable_resource_inventory=resource_inventory,
+            evalpack_ref=design.get("evalpack_ref"),
+            comparison_context_hash=paired_context_hash,
         ))
         case_count = max(1, len(analysis_cases))
         score = len(decision["stable_pass_case_ids"]) / case_count
@@ -1551,26 +1893,57 @@ class IterationKernel:
         decision["improvement_from_previous"] = improvement
         decision["round_number"] = int(state.get("iteration", 0)) + 1
         decision["evaluation_design_hash"] = contract_hash(design)
+        decision["comparison_context_hash"] = paired_context_hash
 
         comparison = None
-        previous_decision = prior_decisions[-1] if prior_decisions else None
         challenger_commit = state.get("challenger_commit")
         champion_commit = state.get("champion_commit")
+        evaluated_commit = challenger_commit or champion_commit or _git_head(config.skill_repository.local_path)
+        decision["evaluated_commit"] = evaluated_commit
+        decision["evaluation_role"] = "challenger" if challenger_commit else "champion"
+        champion_decision = next(
+            (
+                item
+                for item in reversed(prior_decisions)
+                if item.get("evaluated_commit") == champion_commit
+            ),
+            None,
+        )
+        if champion_decision is None and champion_commit:
+            # Compatibility for decisions produced before evaluated_commit was
+            # persisted: the initial, non-comparison round is the only safe
+            # implicit Champion baseline.
+            champion_decision = next(
+                (
+                    item
+                    for item in prior_decisions
+                    if int(item.get("iteration", -1)) == 0
+                    and item.get("candidate_comparison") is None
+                ),
+                None,
+            )
         if (
-            verification is not None
-            and previous_decision is not None
-            and isinstance(previous_decision.get("case_aggregates"), list)
+            champion_decision is not None
+            and isinstance(champion_decision.get("case_aggregates"), list)
             and isinstance(decision.get("case_aggregates"), list)
             and challenger_commit
             and champion_commit
+            and (
+                verification is not None
+                or decision.get("next_action") != "verify_passes"
+            )
         ):
             comparison = compare_candidates(
                 decision["case_aggregates"],
-                previous_decision["case_aggregates"],
+                champion_decision["case_aggregates"],
                 champion_id=str(champion_commit),
                 challenger_id=str(challenger_commit),
                 minimum_effect=float(config.policy.min_improvement),
+                champion_context_hash=champion_decision.get("comparison_context_hash"),
+                challenger_context_hash=decision.get("comparison_context_hash"),
             )
+            decision["comparison_baseline_iteration"] = champion_decision.get("iteration")
+            decision["comparison_baseline_commit"] = champion_commit
         decision["candidate_comparison"] = comparison
         if (
             state.get("intent_mode") == "create"
@@ -1607,6 +1980,7 @@ class IterationKernel:
             patience=config.policy.convergence_patience,
             minimum_effect=float(config.policy.min_improvement),
             budget_exhausted=self._session_count(task_id) >= config.policy.max_total_remote_sessions,
+            required_case_ids=decision.get("optimization_eligible_case_ids", ()),
         ))
         if convergence.get("reason") == "target_met":
             convergence["reason"] = "quality_target_met"
@@ -1625,6 +1999,15 @@ class IterationKernel:
         elif decision["next_action"] == "await_user_confirmation" and convergence.get("converged"):
             decision["next_action"] = "converged"
             decision["requires_user_confirmation"] = False
+        if challenger_commit and decision.get("next_action") != "verify_passes" and comparison is None:
+            # Never stop or start another optimization direction while the
+            # repository may still contain an unevaluated Challenger.  A
+            # missing Champion baseline is an evidence problem, not a pass.
+            decision["next_action"] = "needs_evidence"
+            decision["requires_user_confirmation"] = False
+            decision["intervention_blocker"] = "the current Challenger has no matching Champion evidence baseline"
+            convergence["converged"] = False
+            convergence["reason"] = None
         decision["convergence"] = convergence
 
         transition_changes: dict[str, Any] = {}
@@ -1637,33 +2020,73 @@ class IterationKernel:
                 })
                 decision["candidate_outcome"] = {"status": "promoted", "commit": challenger_commit}
                 self.store.append_event(task_id, "candidate.promoted", {"comparison": comparison}, iteration=int(state.get("iteration", 0)))
+            elif _comparison_requires_more_evidence(comparison):
+                # Missing/incomparable evidence is not evidence that the
+                # Challenger is worse.  Keep the exact published candidate in
+                # place so the user can retry, supplement the design, or start
+                # a new comparable run without regenerating a different patch.
+                decision["next_action"] = "needs_evidence"
+                decision["requires_user_confirmation"] = False
+                decision["intervention_blocker"] = (
+                    "the Challenger comparison is inconclusive: %s"
+                    % ", ".join(str(item) for item in comparison.get("reasons", ()))
+                )
+                convergence["converged"] = False
+                convergence["reason"] = None
+                decision["convergence"] = convergence
+                decision["candidate_evidence_status"] = "inconclusive"
+                transition_changes["candidate_status"] = "needs_evidence"
+                self.store.append_event(
+                    task_id,
+                    "candidate.evidence_inconclusive",
+                    {"comparison": comparison},
+                    iteration=int(state.get("iteration", 0)),
+                )
             else:
                 restored_commit = None
                 restoration_status = "publisher_does_not_manage_git"
-                if hasattr(self.publisher, "restore_rejected_candidate"):
+                restore = getattr(self.publisher, "restore_rejected_candidate", None)
+                if callable(restore):
                     try:
-                        restored_commit = self.publisher.restore_rejected_candidate(
+                        restored_commit = restore(
                             config.skill_repository,
                             challenger_commit=str(challenger_commit),
                             champion_commit=str(champion_commit),
                         )
+                        if not isinstance(restored_commit, str) or len(restored_commit) != 40:
+                            raise IterationKernelError("publisher returned an invalid restoration commit")
                         restoration_status = "restored"
                     except Exception as exc:
                         restoration_status = "failed"
                         decision["next_action"] = "needs_evidence"
                         decision["requires_user_confirmation"] = False
                         decision["intervention_blocker"] = "rejected candidate could not be restored: %s" % exc
+                else:
+                    # Without a restoration primitive we cannot know whether
+                    # the working tree still contains the rejected candidate.
+                    # Keep its exact commit and stop the loop until a person or
+                    # a capable publisher restores the Champion.
+                    decision["next_action"] = "needs_evidence"
+                    decision["requires_user_confirmation"] = False
+                    decision["intervention_blocker"] = "publisher cannot restore the rejected Candidate; the working tree may still contain it"
                 transition_changes.update({
-                    "challenger_commit": None if restoration_status != "failed" else challenger_commit,
-                    "candidate_status": "rejected" if restoration_status != "failed" else "rejection_restore_failed",
+                    "challenger_commit": None if restoration_status == "restored" else challenger_commit,
+                    "candidate_status": (
+                        "rejected"
+                        if restoration_status == "restored"
+                        else "rejection_restore_unavailable"
+                        if restoration_status == "publisher_does_not_manage_git"
+                        else "rejection_restore_failed"
+                    ),
                     "restored_commit": restored_commit,
                 })
                 decision["candidate_outcome"] = {
-                    "status": "rejected",
+                    "status": "rejected" if restoration_status == "restored" else "rejected_pending_restore",
                     "commit": challenger_commit,
                     "champion_commit": champion_commit,
                     "restoration_status": restoration_status,
                     "restored_commit": restored_commit,
+                    "safe_to_continue": restoration_status == "restored",
                 }
                 self.store.append_event(task_id, "candidate.rejected", {"comparison": comparison, "restoration_status": restoration_status, "restored_commit": restored_commit}, iteration=int(state.get("iteration", 0)))
         decision_path = self.store.task_dir(task_id) / "iterations" / ("iteration-%03d" % int(state.get("iteration", 0))) / "analysis-decision.json"
@@ -1699,6 +2122,7 @@ class IterationKernel:
         selected_capability_ids: Sequence[str] = (),
         selected_case_ids: Sequence[str] = (),
         selected_change_ids: Sequence[str] = (),
+        case_calibrations: Optional[Mapping[str, Any]] = None,
         user_feedback: Optional[str] = None,
     ) -> Mapping[str, Any]:
         state = self.state(task_id)
@@ -1735,28 +2159,63 @@ class IterationKernel:
                 decision=None,
                 approved_decision=None,
                 candidate=None,
+                candidate_publish_approved=False,
             )
             return self.advance(task_id)
         if state.get("phase") in ("blueprint_ready", "discovery_ready"):
-            self._append_approval_record(task_id, approval_type="capability_blueprint", approve=approve, state=state, selected_capability_ids=selected_capability_ids)
+            if user_feedback is not None:
+                if (
+                    not isinstance(user_feedback, str)
+                    or not user_feedback.strip()
+                    or len(user_feedback) > 16_000
+                    or "\x00" in user_feedback
+                ):
+                    raise IterationKernelError(
+                        "user feedback must be non-empty text up to 16000 characters"
+                    )
+                user_feedback = user_feedback.strip()
             if not approve:
+                self._append_approval_record(
+                    task_id,
+                    approval_type="capability_blueprint",
+                    approve=False,
+                    state=state,
+                    selected_capability_ids=selected_capability_ids,
+                    user_feedback=user_feedback,
+                )
                 self.store.record_decision(task_id, iteration=int(state.get("iteration", 0)), decision="blocked", reason="user rejected the capability blueprint")
                 return self._transition(task_id, "blocked")
             blueprint = self._blueprint(task_id)
             if blueprint is None:
                 raise IterationKernelError("capability blueprint is missing")
             try:
-                if state.get("phase") == "discovery_ready":
-                    blueprint = select_blueprint(blueprint, selected_capability_ids)
-                elif selected_capability_ids:
-                    blueprint = select_blueprint(blueprint, selected_capability_ids)
+                selected = tuple(selected_capability_ids) or tuple(
+                    str(item) for item in blueprint.get("selected_proposal_ids", ())
+                )
+                if not selected and state.get("phase") == "blueprint_ready":
+                    selected = tuple(
+                        str(item)
+                        for item in blueprint.get("recommended_proposal_ids", ())
+                    )
+                blueprint = select_blueprint(blueprint, selected)
             except SkillHarnessError as exc:
                 raise IterationKernelError(str(exc)) from exc
+            selected_ids = set(
+                str(item) for item in blueprint.get("selected_proposal_ids", ())
+            )
+            self._append_approval_record(
+                task_id,
+                approval_type="capability_blueprint",
+                approve=True,
+                state=state,
+                selected_capability_ids=tuple(sorted(selected_ids)),
+                user_feedback=user_feedback,
+            )
             approved_path = self._kernel_dir(task_id) / "blueprints" / ("approved-%03d.json" % int(state.get("blueprint_revision", 1)))
             _atomic_json(approved_path, blueprint)
             operation = str(blueprint.get("operation"))
             phase = "ready_to_build" if operation == "create" else "created"
-            self.store.append_event(task_id, "user.capability_blueprint_approved", {"operation": operation, "selected_proposal_ids": list(blueprint.get("selected_proposal_ids", ())), "blueprint": str(approved_path)}, iteration=int(state.get("iteration", 0)))
+            self.store.append_event(task_id, "user.capability_blueprint_approved", {"operation": operation, "selected_proposal_ids": list(blueprint.get("selected_proposal_ids", ())), "blueprint": str(approved_path), "has_feedback": user_feedback is not None}, iteration=int(state.get("iteration", 0)))
             self.store.update(task_id, status="running")
             return self._transition(task_id, phase, blueprint=str(approved_path), blueprint_approved=True, intent_mode=operation)
         if state.get("phase") == "design_ready":
@@ -1770,12 +2229,26 @@ class IterationKernel:
             unknown = sorted(set(selected).difference(known))
             if unknown:
                 raise IterationKernelError("selected evaluation cases are unknown: %s" % ", ".join(unknown))
+            raw_calibrations = dict(case_calibrations or {})
+            calibration_unknown = sorted(
+                set(str(item) for item in raw_calibrations).difference(selected)
+            )
+            if calibration_unknown:
+                raise IterationKernelError(
+                    "case calibrations must target selected evaluation cases: %s"
+                    % ", ".join(calibration_unknown)
+                )
+            normalized_calibrations = {
+                str(case_id): list(_human_calibration_criteria(value, str(case_id)))
+                for case_id, value in raw_calibrations.items()
+            }
             self._append_approval_record(
                 task_id,
                 approval_type="evaluation_design",
                 approve=approve,
                 state=state,
                 selected_case_ids=selected,
+                case_calibrations=normalized_calibrations,
                 user_feedback=user_feedback,
             )
             if not approve:
@@ -1783,14 +2256,144 @@ class IterationKernel:
                 return self._transition(task_id, "blocked", design_approved=False)
             if not selected:
                 raise IterationKernelError("at least one evaluation case must be approved")
+            approved_design = json.loads(
+                json.dumps(design, ensure_ascii=False, allow_nan=False)
+            )
+            calibrated_at = _now()
+            calibrated_case_ids = []
+            approved_cases = []
+            capability_contract = contract_hash(
+                approved_design.get("capability_summary", {})
+                if isinstance(approved_design.get("capability_summary"), Mapping)
+                else {}
+            )
+            for original in approved_design.get("cases", ()):
+                if not isinstance(original, Mapping):
+                    continue
+                case = dict(original)
+                case_id = str(case.get("id") or "")
+                if case_id in normalized_calibrations:
+                    metadata = (
+                        dict(case.get("metadata", {}))
+                        if isinstance(case.get("metadata"), Mapping)
+                        else {}
+                    )
+                    test = (
+                        dict(metadata.get("aceval_test", {}))
+                        if isinstance(metadata.get("aceval_test"), Mapping)
+                        else {}
+                    )
+                    test.update(
+                        {
+                            "expected_observables": list(normalized_calibrations[case_id]),
+                            "oracle_ready": True,
+                            "oracle_trust": "human_confirmed",
+                            "executable": True,
+                            "needs_user_input": False,
+                        }
+                    )
+                    metadata["aceval_test"] = test
+                    metadata["expectation_mode"] = "semantic"
+                    metadata["human_calibration"] = {
+                        "confirmed_at": calibrated_at,
+                        "criteria": list(normalized_calibrations[case_id]),
+                        "approval_type": "evaluation_design",
+                    }
+                    provenance = (
+                        dict(metadata.get("provenance", {}))
+                        if isinstance(metadata.get("provenance"), Mapping)
+                        else {"source": metadata.get("source", "automatic")}
+                    )
+                    raw_history = provenance.get("history", ())
+                    history = (
+                        list(raw_history)
+                        if isinstance(raw_history, Sequence)
+                        and not isinstance(raw_history, (str, bytes))
+                        else []
+                    )
+                    history.append(
+                        {"action": "human_calibration", "recorded_at": calibrated_at}
+                    )
+                    provenance["history"] = history
+                    metadata["provenance"] = provenance
+                    case["metadata"] = metadata
+                    case = dict(
+                        _normalize_case_identity(
+                            case,
+                            goal=str(
+                                approved_design.get("goal")
+                                or self._input(task_id).effective_goal
+                            ),
+                            standards=tuple(
+                                str(item)
+                                for item in approved_design.get("standards", ())
+                            ),
+                            capability_contract=capability_contract,
+                            environment_applicability=(
+                                case.get("environment_applicability", {})
+                                if isinstance(case.get("environment_applicability"), Mapping)
+                                else {}
+                            ),
+                        )
+                    )
+                    calibrated_case_ids.append(case_id)
+                approved_cases.append(case)
+            trusted_oracles = {
+                "deterministic",
+                "seed_derived",
+                "reference_differential",
+                "human_confirmed",
+            }
+            pending_oracle_case_ids = []
+            for case in approved_cases:
+                case_id = str(case.get("id") or "")
+                if case_id not in selected:
+                    continue
+                metadata = case.get("metadata", {}) if isinstance(case.get("metadata"), Mapping) else {}
+                test = metadata.get("aceval_test", {}) if isinstance(metadata.get("aceval_test"), Mapping) else {}
+                if not (
+                    test.get("oracle_ready") is True
+                    and test.get("executable", True) is True
+                    and test.get("needs_user_input", False) is not True
+                    and test.get("oracle_trust") in trusted_oracles
+                ):
+                    pending_oracle_case_ids.append(case_id)
+            approved_design["cases"] = approved_cases
+            approved_design["approved_case_ids"] = list(selected)
+            approved_design["human_calibrated_case_ids"] = calibrated_case_ids
+            approved_design["pending_oracle_case_ids"] = pending_oracle_case_ids
+            approved_design["approved_at"] = calibrated_at
+            approved_root = Path(str(state.get("active_design"))).parent / "approved-designs"
+            approved_design_path = approved_root / "evaluation-design-approved.json"
+            _atomic_json(approved_design_path, approved_design)
+            # The generated design remains immutable. active-design.json is the
+            # explicit read pointer used by subsequent dispatch and analysis.
+            _atomic_json(self._kernel_dir(task_id) / "active-design.json", approved_design)
             self.store.append_event(
                 task_id,
                 "user.evaluation_design_approved",
-                {"selected_case_ids": list(selected), "has_feedback": user_feedback is not None},
+                {
+                    "selected_case_ids": list(selected),
+                    "human_calibrated_case_ids": calibrated_case_ids,
+                    "pending_oracle_case_ids": pending_oracle_case_ids,
+                    "approved_design": str(approved_design_path),
+                    "has_feedback": user_feedback is not None,
+                },
                 iteration=int(state.get("iteration", 0)),
             )
             self.store.update(task_id, status="running")
-            return self._transition(task_id, "evaluation_ready", design_approved=True, approved_case_ids=list(selected))
+            return self._transition(
+                task_id,
+                "evaluation_ready",
+                active_design=str(approved_design_path),
+                design_approved=True,
+                approved_case_ids=list(selected),
+                evaluation_blocker=(
+                    "selected exploratory Cases still lack a human-confirmed pass criterion"
+                    if pending_oracle_case_ids
+                    else None
+                ),
+            )
         if state.get("phase") == "initial_candidate_ready":
             self._append_approval_record(task_id, approval_type="initial_candidate", approve=approve, state=state)
             if not approve:
@@ -1803,7 +2406,49 @@ class IterationKernel:
                 iteration=0,
             )
             self.store.update(task_id, status="running")
-            return self._transition(task_id, "candidate_ready")
+            return self._transition(
+                task_id,
+                "candidate_ready",
+                candidate_publish_approved=True,
+            )
+        if state.get("phase") == "candidate_ready":
+            self._append_approval_record(
+                task_id,
+                approval_type="candidate_publication",
+                approve=approve,
+                state=state,
+            )
+            if not approve:
+                self.store.record_decision(
+                    task_id,
+                    iteration=int(state.get("iteration", 0)),
+                    decision="blocked",
+                    reason="user rejected the generated candidate before publication",
+                )
+                self.store.append_event(
+                    task_id,
+                    "user.candidate_publication_rejected",
+                    {"candidate": state.get("candidate")},
+                    iteration=int(state.get("iteration", 0)),
+                )
+                return self._transition(
+                    task_id,
+                    "blocked",
+                    candidate_publish_approved=False,
+                    candidate_status="rejected_before_publication",
+                )
+            self.store.append_event(
+                task_id,
+                "user.candidate_publication_approved",
+                {"candidate": state.get("candidate")},
+                iteration=int(state.get("iteration", 0)),
+            )
+            self.store.update(task_id, status="running")
+            return self._transition(
+                task_id,
+                "candidate_ready",
+                candidate_publish_approved=True,
+            )
         if not approve:
             if state.get("phase") != "awaiting_confirmation":
                 raise IterationKernelError("change-scope rejection requires awaiting_confirmation")
@@ -1894,7 +2539,12 @@ class IterationKernel:
         # Blueprint approval authorizes construction, not publication.  Keep the
         # exact generated tree behind a second review gate before touching Git.
         self.store.update(task_id, status="awaiting_confirmation")
-        self._transition(task_id, "initial_candidate_ready", candidate=str(output / "candidate.json"))
+        self._transition(
+            task_id,
+            "initial_candidate_ready",
+            candidate=str(output / "candidate.json"),
+            candidate_publish_approved=False,
+        )
         return payload
 
     def optimize(self, task_id: str) -> Mapping[str, Any]:
@@ -1949,7 +2599,13 @@ class IterationKernel:
         }
         _atomic_json(output / "candidate.json", payload)
         self.store.append_event(task_id, "candidate.created", {"candidate": str(output / "candidate.json"), "subject_hash": candidate.subject_hash, "parent_hash": candidate.parent_hash, "rationale": candidate.rationale, "changed_paths": list(candidate.changed_paths), "created_paths": list(candidate.created_paths), "validation": list(candidate.validation), "usage": dict(candidate.usage or {})}, iteration=int(state.get("iteration", 0)))
-        self._transition(task_id, "candidate_ready", candidate=str(output / "candidate.json"))
+        self.store.update(task_id, status="awaiting_confirmation")
+        self._transition(
+            task_id,
+            "candidate_ready",
+            candidate=str(output / "candidate.json"),
+            candidate_publish_approved=False,
+        )
         return payload
 
     def publish_candidate(self, task_id: str) -> Mapping[str, Any]:
@@ -1959,6 +2615,10 @@ class IterationKernel:
         state = self.state(task_id)
         if state.get("phase") != "candidate_ready":
             raise IterationKernelError("candidate publication requires candidate_ready")
+        if state.get("candidate_publish_approved") is not True:
+            raise IterationKernelError(
+                "candidate publication requires explicit user approval"
+            )
         candidate = _load_json(Path(str(state.get("candidate"))), "candidate")
         commit = self.publisher.publish(
             config.skill_repository,
@@ -1987,6 +2647,7 @@ class IterationKernel:
                 decision=None,
                 approved_decision=None,
                 candidate=None,
+                candidate_publish_approved=False,
             )
             return {"commit": commit, "iteration": 0, "state": next_state, "initial_build": True}
         next_iteration = int(state.get("iteration", 0)) + 1
@@ -2005,6 +2666,7 @@ class IterationKernel:
             environment_contract_hash=None,
             decision=None,
             approved_decision=None,
+            candidate_publish_approved=False,
         )
         return {"commit": commit, "iteration": next_iteration, "state": next_state}
 
@@ -2040,6 +2702,8 @@ class IterationKernel:
         if phase == "ready_to_optimize":
             return self.optimize(task_id)
         if phase == "candidate_ready":
+            if self.state(task_id).get("candidate_publish_approved") is not True:
+                return {"state": self.state(task_id), "gate": "candidate_ready"}
             return self.publish_candidate(task_id)
         return {"state": self.state(task_id), "gate": phase}
 
@@ -2051,6 +2715,11 @@ class IterationKernel:
         gates = {"blueprint_ready", "discovery_ready", "initial_candidate_ready", "design_ready", "awaiting_confirmation", "needs_evidence", "blocked", "converged"}
         for _ in range(max_steps):
             phase = str(self.state(task_id).get("phase"))
+            if (
+                phase == "candidate_ready"
+                and self.state(task_id).get("candidate_publish_approved") is not True
+            ):
+                return {"gate": phase, "snapshot": self.snapshot(task_id)}
             if phase in gates:
                 return {"gate": phase, "snapshot": self.snapshot(task_id)}
             self.advance(task_id, wait=True)

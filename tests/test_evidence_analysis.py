@@ -4,7 +4,7 @@ import unittest
 from pathlib import Path
 
 from aceval.agent_runtime import ModelReply
-from aceval.evidence_analysis import CrossCaseAnalyzer
+from aceval.evidence_analysis import CrossCaseAnalyzer, compact_case_evidence
 from aceval.execution_path import EXECUTION_PATH_SPEC_API_VERSION
 
 
@@ -118,6 +118,105 @@ class EvidenceAnalysisTests(unittest.TestCase):
         self.assertEqual("needs_evidence", decision["next_action"])
         self.assertEqual([], decision["failed_case_ids"])
         self.assertEqual(["infra"], decision["not_evaluable_case_ids"])
+
+    def test_string_false_does_not_pass_trace_completeness_gate(self):
+        cases = ({"id": "typed-completeness", "prompt": "Do it", "expected_output": "ok"},)
+        primary = {
+            "cases": [
+                {
+                    "case_id": "typed-completeness",
+                    "status": "completed",
+                    "artifact": self.artifact("typed-completeness", "ok", trace="false"),
+                }
+            ]
+        }
+        decision = CrossCaseAnalyzer(None).analyze(
+            task_id="task",
+            iteration=0,
+            goal="goal",
+            standards=("correct",),
+            cases=cases,
+            primary_batch=primary,
+        )
+        self.assertEqual("needs_evidence", decision["next_action"])
+        self.assertEqual(["typed-completeness"], decision["not_evaluable_case_ids"])
+
+    def test_versioned_catx_artifact_without_raw_events_or_hash_is_not_evaluable(self):
+        path = self.root / "catx-missing-log.json"
+        path.write_text(
+            json.dumps(
+                {
+                    "api_version": "aceval.kernel-case-run/v1",
+                    "session": {
+                        "source": "catx_session_api",
+                        "completeness": {"trace": True, "output": True},
+                        "observation": {
+                            "output": "ok",
+                            "trace": [{"kind": "tool_call", "name": "read_file", "path": "SKILL.md"}],
+                            "metadata": {},
+                            "error": None,
+                        },
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        evidence = compact_case_evidence(
+            {"id": "catx", "prompt": "Do it", "expected_output": "ok"},
+            {"case_id": "catx", "status": "completed", "artifact": str(path)},
+            max_chars=1000,
+        )
+        self.assertFalse(evidence["trace_complete"])
+        self.assertFalse(evidence["log_completeness"]["complete"])
+        self.assertIn("event_log_missing", evidence["log_completeness"]["reason_codes"])
+        self.assertIn("event_log_hash_missing", evidence["log_completeness"]["reason_codes"])
+        decision = CrossCaseAnalyzer(None).analyze(
+            task_id="task",
+            iteration=0,
+            goal="goal",
+            standards=("correct",),
+            cases=({"id": "catx", "prompt": "Do it", "expected_output": "ok"},),
+            primary_batch={"cases": [{"case_id": "catx", "status": "completed", "artifact": str(path)}]},
+        )
+        self.assertEqual("needs_evidence", decision["next_action"])
+        self.assertEqual(["catx"], decision["not_evaluable_case_ids"])
+
+    def test_completed_row_without_artifact_cannot_be_overridden_by_semantic_model(self):
+        model = CountingModel(
+            {
+                "case_results": [
+                    {
+                        "case_id": "missing-artifact",
+                        "status": "pass",
+                        "verification_status": "pass",
+                        "reason": "model guessed a pass",
+                        "evidence_refs": [],
+                    }
+                ],
+                "failure_clusters": [],
+                "conflicts": [],
+                "proposed_changes": [],
+                "target_scope": [],
+            }
+        )
+        decision = CrossCaseAnalyzer(model).analyze(
+            task_id="task",
+            iteration=0,
+            goal="goal",
+            standards=("correct",),
+            cases=({"id": "missing-artifact", "prompt": "Do it"},),
+            primary_batch={
+                "cases": [
+                    {
+                        "case_id": "missing-artifact",
+                        "status": "completed",
+                        "artifact": None,
+                    }
+                ]
+            },
+        )
+        self.assertEqual(["missing-artifact"], decision["not_evaluable_case_ids"])
+        self.assertEqual("needs_evidence", decision["next_action"])
 
     def test_failed_pass_verification_becomes_an_optimizable_flake_cluster(self):
         cases = ({"id": "flaky", "prompt": "Do it", "expected_output": "ok"},)

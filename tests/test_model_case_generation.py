@@ -58,6 +58,16 @@ class ModelCaseGenerationTests(unittest.TestCase):
         with self.assertRaisesRegex(ModelCaseGenerationError, "duplicate Case prompts"):
             parse_model_case_design(json.dumps(self._design(duplicate=True)), plan=self.plan, target_case_ids=[item.id for item in self.plan.cases])
 
+    def test_parser_rejects_self_referencing_path_step(self):
+        design = self._design()
+        design["paths"][0]["steps"][0]["after"] = [design["paths"][0]["steps"][0]["id"]]
+        with self.assertRaisesRegex(ModelCaseGenerationError, "cannot reference itself"):
+            parse_model_case_design(
+                json.dumps(design),
+                plan=self.plan,
+                target_case_ids=[item.id for item in self.plan.cases],
+            )
+
     def test_parser_normalizes_readable_family_and_planner_owned_dimension(self):
         design = self._design()
         design["cases"][0]["family"] = "代码审查 · 证据引用"

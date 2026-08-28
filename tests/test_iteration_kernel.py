@@ -1,11 +1,14 @@
 import json
+import shutil
+import subprocess
 import tempfile
 import unittest
 from dataclasses import replace
 from pathlib import Path
 
 from aceval.agent_runtime import ModelReply
-from aceval.iteration_kernel import IterationKernel, IterationKernelError
+from aceval.catx_bindings import CatxBindingEvidence
+from aceval.iteration_kernel import IterationKernel, IterationKernelError, _merge_model_path, _path_for_case
 from aceval.kernel_contracts import KERNEL_CONFIG_API_VERSION, KERNEL_INPUT_API_VERSION, KernelConfig, KernelInput
 
 
@@ -27,6 +30,44 @@ class PassingGateway:
             "completeness": {"trace": True, "output": True},
             "observation": {
                 "output": "ok",
+                "trace": [{"kind": "tool_call", "name": "read_file", "path": "SKILL.md"}],
+                "metadata": {},
+                "usage": {"total_tokens": 12},
+                "error": None,
+            },
+        }
+
+
+class ImprovingGateway(PassingGateway):
+    """Fail the Champion once, then return the expected result for Challenger runs."""
+
+    def __init__(self):
+        super().__init__()
+        self.bindings = []
+
+    def start_session(self, request, *, binding=None):
+        self.counter += 1
+        self.bindings.append(binding)
+        return "session-%d" % self.counter
+
+    def verify_binding(self, session_id, binding):
+        return CatxBindingEvidence(
+            verified=True,
+            requested_binding_hash=binding.binding_hash,
+            actual_subject_hash=binding.subject_hash,
+            actual_repository_hash=binding.repository_hash,
+            actual_base_commit=binding.base_commit,
+            actual_head_commit=binding.head_commit,
+        )
+
+    def fetch_session(self, session_id):
+        first_round = session_id == "session-1"
+        return {
+            "schema_version": "aceval.imported-session/v1",
+            "session_id": session_id,
+            "completeness": {"trace": True, "output": True},
+            "observation": {
+                "output": "not grounded" if first_round else "grounded review",
                 "trace": [{"kind": "tool_call", "name": "read_file", "path": "SKILL.md"}],
                 "metadata": {},
                 "usage": {"total_tokens": 12},
@@ -118,6 +159,22 @@ class FakePublisher:
         return "a" * 40
 
 
+class ApplyingFakePublisher(FakePublisher):
+    """Apply the approved candidate bytes without requiring a network push."""
+
+    def publish(self, repository, candidate_root, *, message):
+        self.calls.append((repository, candidate_root, message))
+        manifest = json.loads(
+            (Path(candidate_root) / "candidate.manifest.json").read_text(encoding="utf-8")
+        )
+        skill_root = Path(repository.local_path)
+        for relative in manifest["changed_paths"]:
+            target = skill_root / relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(Path(candidate_root) / relative, target)
+        return "a" * 40
+
+
 class FakeCheckoutManager:
     def __init__(self, skill_path):
         self.skill_path = skill_path
@@ -189,6 +246,46 @@ Steps:
     def tearDown(self):
         self.temporary.cleanup()
 
+    def test_model_path_cannot_remove_locked_skill_loading_or_publish_guards(self):
+        case = {
+            "id": "near-miss",
+            "prompt": "Write a story",
+            "metadata": {"harness_case_kind": "negative_trigger", "aceval_test": {"title": "触发边界"}},
+        }
+        model_path = {
+            "case_id": "near-miss",
+            "purpose": "模型建议路径",
+            "steps": [
+                {
+                    "id": "do-not-load-skill",
+                    "label": "允许读取 Skill",
+                    "kind": "recommended",
+                    "match": {"contains": "SKILL.md"},
+                    "after": [],
+                },
+                {
+                    "id": "business-check",
+                    "label": "检查用户任务",
+                    "kind": "required",
+                    "match": {"tool_name": "read_file"},
+                    "after": [],
+                },
+            ],
+        }
+        merged = _merge_model_path(case, model_path, {})
+        by_id = {step["id"]: step for step in merged["steps"]}
+        self.assertEqual("forbidden", by_id["do-not-load-skill"]["kind"])
+        self.assertEqual("forbidden", by_id["no-skill-publish"]["kind"])
+        self.assertIn("business-check", by_id)
+        self.assertEqual("recommended", by_id["business-check"]["kind"])
+        self.assertEqual("required", by_id["business-check"]["model_requested_kind"])
+        self.assertTrue(merged["rejected_model_steps"])
+        deterministic = _path_for_case(case, {})
+        self.assertEqual(
+            {step["id"] for step in deterministic["steps"]},
+            set(merged["system_step_ids"]),
+        )
+
     def test_complete_evaluation_and_stability_verification_converges(self):
         created = self.kernel.create_task(self.config, self.user_input, task_id="kernel-task-001")
         self.assertEqual("created", created["state"]["phase"])
@@ -209,6 +306,11 @@ Steps:
         self.assertEqual("converged", snapshot["task"]["status"])
         self.assertIn("design", snapshot)
         self.assertIn("decision", snapshot)
+        session_logs = snapshot["iterations"][0]["session_logs"]
+        self.assertEqual(2 * len(snapshot["design"]["case_ids"]), len(session_logs))
+        self.assertEqual({"evaluation", "pass-verification"}, {item["purpose"] for item in session_logs})
+        self.assertTrue(all(item["attempt_number"] == 1 for item in session_logs))
+        self.assertTrue(all(len(item["attempts"]) == 1 for item in session_logs))
 
     def test_analysis_can_resume_from_every_persisted_brain_stage(self):
         for index, phase in enumerate(("evidence_ready", "semantic_grading", "attribution", "proposal"), start=1):
@@ -248,6 +350,18 @@ Steps:
                 case_ids=decision["verification_required_case_ids"],
             )
 
+    def test_catx_binding_requires_a_real_commit_and_active_subject_snapshot(self):
+        task_id = "binding-material"
+        kernel = IterationKernel(
+            self.root / "binding-material-tasks",
+            gateway_factory=lambda config: ImprovingGateway(),
+            model_factory=lambda config: self.model,
+        )
+        kernel.create_task(self.config, self.user_input, task_id=task_id)
+        kernel.compile_design(task_id)
+        with self.assertRaisesRegex(IterationKernelError, "repository commit is missing or invalid"):
+            kernel.dispatch(task_id)
+
     def test_generated_cases_have_reusable_identity_and_applicability(self):
         task_id = "case-identity"
         self.kernel.create_task(self.config, self.user_input, task_id=task_id)
@@ -261,13 +375,28 @@ Steps:
 
     def test_failed_cases_require_confirmation_before_candidate_and_next_round(self):
         publisher = FakePublisher()
+        failing_input = KernelInput.from_mapping(
+            {
+                "api_version": KERNEL_INPUT_API_VERSION,
+                "skill_name": "reviewer",
+                "goal": "Produce an evidence-backed review",
+                "standards": ["Return the expected result"],
+                "cases": [
+                    {
+                        "id": "review-1",
+                        "prompt": "Review the fixture",
+                        "expected_output": "grounded review",
+                    }
+                ],
+            }
+        )
         kernel = IterationKernel(
             self.root / "repair-tasks",
             gateway_factory=lambda config: self.gateway,
             model_factory=lambda config: RepairModel(),
             publisher=publisher,
         )
-        kernel.create_task(self.config, self.user_input, task_id="repair-task-001")
+        kernel.create_task(self.config, failing_input, task_id="repair-task-001")
         kernel.compile_design("repair-task-001")
         kernel.dispatch("repair-task-001")
         kernel.collect("repair-task-001")
@@ -288,6 +417,13 @@ Steps:
         self.assertTrue(kernel.state("repair-task-001")["approved_decision"])
         candidate = kernel.optimize("repair-task-001")
         self.assertTrue(Path(candidate["path"], "SKILL.md").is_file())
+        self.assertEqual("candidate_ready", kernel.state("repair-task-001")["phase"])
+        with self.assertRaisesRegex(IterationKernelError, "explicit user approval"):
+            kernel.publish_candidate("repair-task-001")
+        self.assertEqual([], publisher.calls)
+        gate = kernel.run_until_gate("repair-task-001")
+        self.assertEqual("candidate_ready", gate["gate"])
+        kernel.confirm("repair-task-001", approve=True)
         published = kernel.publish_candidate("repair-task-001")
         self.assertEqual(1, published["iteration"])
         self.assertEqual("evaluation_ready", published["state"]["phase"])
@@ -297,7 +433,129 @@ Steps:
         self.assertEqual("remote_running", kernel.state("repair-task-001")["phase"])
         self.assertEqual(1, len(publisher.calls))
 
+    def test_approved_candidate_is_promoted_after_paired_next_round_evaluation(self):
+        subprocess.run(
+            ("git", "init", "-b", "feature/eval"),
+            cwd=self.skill,
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        subprocess.run(("git", "config", "user.name", "Aceval Test"), cwd=self.skill, check=True)
+        subprocess.run(("git", "config", "user.email", "aceval@example.invalid"), cwd=self.skill, check=True)
+        subprocess.run(("git", "add", "SKILL.md"), cwd=self.skill, check=True)
+        subprocess.run(
+            ("git", "commit", "-m", "champion"),
+            cwd=self.skill,
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        champion = subprocess.run(
+            ("git", "rev-parse", "HEAD"),
+            cwd=self.skill,
+            check=True,
+            stdout=subprocess.PIPE,
+        ).stdout.decode("ascii").strip()
+        gateway = ImprovingGateway()
+        publisher = ApplyingFakePublisher()
+        kernel = IterationKernel(
+            self.root / "promotion-tasks",
+            gateway_factory=lambda config: gateway,
+            model_factory=lambda config: RepairModel(),
+            publisher=publisher,
+        )
+        evaluation = KernelInput.from_mapping(
+            {
+                "api_version": KERNEL_INPUT_API_VERSION,
+                "skill_name": "reviewer",
+                "goal": "Produce an evidence-backed review",
+                "standards": ["Return the expected result"],
+                "cases": [
+                    {
+                        "id": "review-1",
+                        "prompt": "Review the fixture",
+                        "expected_output": "grounded review",
+                    }
+                ],
+            }
+        )
+        task_id = "promotion-cycle"
+
+        created = kernel.create_task(self.config, evaluation, task_id=task_id)
+        self.assertEqual(champion, created["state"]["champion_commit"])
+        design = kernel.compile_design(task_id)
+        self.assertIn("review-1", design["case_ids"])
+        kernel.confirm(task_id, approve=True, selected_case_ids=("review-1",))
+        kernel.dispatch(task_id)
+        kernel.collect(task_id)
+        first_round = kernel.analyze(task_id)
+        self.assertEqual("await_user_confirmation", first_round["next_action"])
+        self.assertEqual(["review-1"], first_round["failed_case_ids"])
+
+        kernel.confirm(task_id, approve=True)
+        candidate = kernel.optimize(task_id)
+        self.assertIn("SKILL.md", candidate["changed_paths"])
+        kernel.confirm(task_id, approve=True)
+        published = kernel.publish_candidate(task_id)
+        self.assertEqual(1, published["iteration"])
+        self.assertEqual("a" * 40, published["state"]["challenger_commit"])
+
+        kernel.dispatch(task_id)
+        kernel.collect(task_id)
+        next_round = kernel.analyze(task_id)
+        self.assertEqual("verify_passes", next_round["next_action"])
+        kernel.dispatch(
+            task_id,
+            purpose="pass-verification",
+            case_ids=next_round["verification_required_case_ids"],
+        )
+        kernel.collect(task_id)
+        final = kernel.analyze(task_id)
+
+        comparison = final["candidate_comparison"]
+        self.assertTrue(comparison["accepted"])
+        self.assertTrue(comparison["case_set_comparable"])
+        self.assertTrue(comparison["context_comparable"])
+        self.assertEqual(["review-1"], comparison["improved_case_ids"])
+        self.assertEqual([], comparison["hard_regression_case_ids"])
+        self.assertEqual("promoted", final["candidate_outcome"]["status"])
+        final_state = kernel.state(task_id)
+        self.assertEqual("a" * 40, final_state["champion_commit"])
+        self.assertIsNone(final_state["challenger_commit"])
+        self.assertEqual("promoted", final_state["candidate_status"])
+        snapshot = kernel.snapshot(task_id)
+        self.assertEqual(2, len(snapshot["iterations"]))
+        self.assertEqual(3, len(gateway.bindings))
+        self.assertNotEqual(
+            gateway.bindings[0].subject_hash,
+            gateway.bindings[1].subject_hash,
+        )
+        self.assertEqual(
+            gateway.bindings[1].subject_hash,
+            gateway.bindings[2].subject_hash,
+        )
+        self.assertEqual(
+            gateway.bindings[1].subject_hash,
+            snapshot["iterations"][1]["environment_contract"]["skill"]["subject_hash"],
+        )
+        self.assertEqual(1, len(publisher.calls))
+
     def test_supplement_after_evaluation_starts_a_clean_iteration(self):
+        failing_input = KernelInput.from_mapping(
+            {
+                "api_version": KERNEL_INPUT_API_VERSION,
+                "skill_name": "reviewer",
+                "goal": "Produce an evidence-backed review",
+                "cases": [
+                    {
+                        "id": "review-1",
+                        "prompt": "Review the fixture",
+                        "expected_output": "grounded review",
+                    }
+                ],
+            }
+        )
         kernel = IterationKernel(
             self.root / "supplement-tasks",
             gateway_factory=lambda config: self.gateway,
@@ -305,7 +563,7 @@ Steps:
             publisher=FakePublisher(),
         )
         task_id = "supplement-task"
-        kernel.create_task(self.config, self.user_input, task_id=task_id)
+        kernel.create_task(self.config, failing_input, task_id=task_id)
         kernel.compile_design(task_id)
         kernel.dispatch(task_id)
         kernel.collect(task_id)
@@ -330,6 +588,54 @@ Steps:
         batch = kernel.dispatch(task_id)
         self.assertEqual("running", batch["status"])
         self.assertEqual("remote_running", kernel.state(task_id)["phase"])
+
+    def test_human_confirmed_semantic_case_can_authorize_iteration(self):
+        exploratory = KernelInput.from_mapping(
+            {
+                "api_version": KERNEL_INPUT_API_VERSION,
+                "skill_name": "reviewer",
+                "goal": "Find unsupported review conclusions",
+            }
+        )
+        kernel = IterationKernel(
+            self.root / "calibrated-tasks",
+            gateway_factory=lambda config: self.gateway,
+            model_factory=lambda config: RepairModel(),
+        )
+        task_id = "human-calibration"
+        kernel.create_task(self.config, exploratory, task_id=task_id)
+        design = kernel.compile_design(task_id)
+        case_id = design["case_ids"][0]
+        original_path = Path(kernel.state(task_id)["active_design"])
+        original_bytes = original_path.read_bytes()
+
+        approved = kernel.confirm(
+            task_id,
+            approve=True,
+            selected_case_ids=(case_id,),
+            case_calibrations={
+                case_id: [
+                    "结论必须引用实际读取到的源码位置",
+                    "没有证据时明确说明无法判断",
+                ]
+            },
+        )
+
+        self.assertEqual("evaluation_ready", approved["phase"])
+        self.assertEqual(original_bytes, original_path.read_bytes())
+        active_case = kernel.snapshot(task_id)["design"]["cases"][0]
+        test = active_case["metadata"]["aceval_test"]
+        self.assertEqual("human_confirmed", test["oracle_trust"])
+        self.assertTrue(test["oracle_ready"])
+        self.assertEqual("semantic", active_case["metadata"]["expectation_mode"])
+        self.assertNotEqual(design["cases"][0]["content_hash"], active_case["content_hash"])
+
+        kernel.dispatch(task_id)
+        kernel.collect(task_id)
+        decision = kernel.analyze(task_id)
+        self.assertEqual("await_user_confirmation", decision["next_action"])
+        self.assertEqual([case_id], decision["optimization_eligible_case_ids"])
+        self.assertEqual([case_id], decision["authorizable_failure_case_ids"])
 
     def test_kernel_optimizes_approved_scripts_and_references_together(self):
         (self.skill / "scripts").mkdir()

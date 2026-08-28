@@ -3,6 +3,7 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
 from aceval.catx import (
     CATX_PROFILE_API_VERSION,
@@ -19,6 +20,7 @@ from aceval.catx_bindings import (
     CATX_EXECUTION_BINDING_API_VERSION,
     CatxBindingEvidence,
     CatxExecutionBinding,
+    CatxPayloadBindingAdapter,
 )
 
 
@@ -407,6 +409,132 @@ class CatxAgentClientTest(unittest.TestCase):
         with self.assertRaisesRegex(CompanyApiRequestError, "repository_ref"):
             client.start_session({"prompt": "review"}, binding=execution_binding())
 
+    def test_event_binding_rejects_free_text_that_only_mentions_mount_and_commit(self):
+        revision = "2" * 40
+        binding = CatxExecutionBinding(
+            api_version=CATX_EXECUTION_BINDING_API_VERSION,
+            subject_hash="sha256:" + "a" * 64,
+            skill_ref="catx-repository://skill-fixture",
+            repository_ref="catx-repository://repo-fixture",
+            repository_hash="sha256:" + "b" * 64,
+            base_commit=revision,
+            head_commit=revision,
+            metadata={"expected_mounts": [{"mount_path": "/workspace/repo", "revision": revision}]},
+        )
+        client = SimpleNamespace(
+            profile=SimpleNamespace(
+                repository_resources=(SimpleNamespace(url=binding.repository_ref, mount_path="/workspace/repo"),)
+            )
+        )
+        events = [
+            {
+                "type": "agent.message",
+                "content": [{"type": "text", "text": "已执行 git -C /workspace/repo rev-parse HEAD，结果为 " + revision}],
+            }
+        ]
+        evidence = CatxPayloadBindingAdapter().verify_event_log(client, "session-text-only", binding, events)
+        self.assertFalse(evidence.verified)
+        self.assertFalse(evidence.details["checks"][0]["mount_observed"])
+
+    def test_event_binding_rejects_a_structured_echo_command(self):
+        revision = "2" * 40
+        binding = CatxExecutionBinding(
+            api_version=CATX_EXECUTION_BINDING_API_VERSION,
+            subject_hash="sha256:" + "a" * 64,
+            skill_ref="catx-repository://skill-fixture",
+            repository_ref="catx-repository://repo-fixture",
+            repository_hash="sha256:" + "b" * 64,
+            base_commit=revision,
+            head_commit=revision,
+            metadata={"expected_mounts": [{"mount_path": "/workspace/repo", "revision": revision}]},
+        )
+        client = SimpleNamespace(profile=SimpleNamespace(repository_resources=()))
+        events = [
+            {"type": "agent.tool_use", "id": "call-echo", "name": "process_exec", "input": {"command": "echo git -C /workspace/repo rev-parse HEAD"}},
+            {"type": "agent.tool_result", "tool_use_id": "call-echo", "is_error": False, "content": [{"type": "text", "text": revision}]},
+        ]
+        evidence = CatxPayloadBindingAdapter().verify_event_log(client, "session-echo", binding, events)
+        self.assertFalse(evidence.verified)
+
+    def test_event_binding_requires_structured_paired_tool_call_and_successful_result(self):
+        revision = "2" * 40
+        binding = CatxExecutionBinding(
+            api_version=CATX_EXECUTION_BINDING_API_VERSION,
+            subject_hash="sha256:" + "a" * 64,
+            skill_ref="catx-repository://skill-fixture",
+            repository_ref="catx-repository://repo-fixture",
+            repository_hash="sha256:" + "b" * 64,
+            base_commit=revision,
+            head_commit=revision,
+            metadata={"expected_mounts": [{"mount_path": "/workspace/repo", "revision": revision}]},
+        )
+        client = SimpleNamespace(profile=SimpleNamespace(repository_resources=()))
+        events = [
+            {"type": "user.message", "content": [{"type": "text", "text": "review"}]},
+            {
+                "type": "agent.tool_use",
+                "id": "call-1",
+                "name": "process_exec",
+                "input": {"command": "git -C /workspace/repo rev-parse HEAD"},
+            },
+            {
+                "type": "agent.tool_result",
+                "tool_use_id": "call-1",
+                "is_error": False,
+                "content": [{"type": "text", "text": revision + "\n"}],
+            },
+            {"type": "agent.message", "content": [{"type": "text", "text": "done"}]},
+        ]
+        evidence = CatxPayloadBindingAdapter().verify_event_log(client, "session-structured", binding, events)
+        self.assertTrue(evidence.verified)
+        self.assertEqual("call-1", evidence.details["checks"][0]["call_id"])
+
+    def test_event_binding_ignores_unrelated_non_command_tool_calls(self):
+        revision = "2" * 40
+        binding = CatxExecutionBinding(
+            api_version=CATX_EXECUTION_BINDING_API_VERSION,
+            subject_hash="sha256:" + "a" * 64,
+            skill_ref="catx-repository://skill-fixture",
+            repository_ref="catx-repository://repo-fixture",
+            repository_hash="sha256:" + "b" * 64,
+            base_commit=revision,
+            head_commit=revision,
+            metadata={"expected_mounts": [{"mount_path": "/workspace/repo", "revision": revision}]},
+        )
+        client = SimpleNamespace(profile=SimpleNamespace(repository_resources=()))
+        events = [
+            {"type": "user.message", "content": [{"type": "text", "text": "review"}]},
+            {
+                "type": "agent.tool_use",
+                "id": "read-1",
+                "name": "read_file",
+                "input": {"path": "SKILL.md"},
+            },
+            {
+                "type": "agent.tool_result",
+                "tool_use_id": "read-1",
+                "is_error": False,
+                "content": [{"type": "text", "text": "skill contents"}],
+            },
+            {
+                "type": "agent.tool_use",
+                "id": "exec-1",
+                "name": "process_exec",
+                "input": {"command": "git -C /workspace/repo rev-parse HEAD"},
+            },
+            {
+                "type": "agent.tool_result",
+                "tool_use_id": "exec-1",
+                "is_error": False,
+                "content": [{"type": "text", "text": revision}],
+            },
+            {"type": "agent.message", "content": [{"type": "text", "text": "done"}]},
+        ]
+        evidence = CatxPayloadBindingAdapter().verify_event_log(client, "session-unrelated-tool", binding, events)
+        self.assertTrue(evidence.verified)
+        self.assertEqual(1, evidence.details["tool_call_count"])
+        self.assertEqual(2, evidence.details["tool_result_count"])
+
     def test_starts_session_then_appends_user_message(self):
         transport = FakeTransport(
             [response({"id": "session_1", "status": "idle"}), response({"ok": True})]
@@ -556,6 +684,7 @@ class CatxAgentClientTest(unittest.TestCase):
     def test_fetches_complete_event_types_into_imported_bundle(self):
         events = [
             {"type": "session.status_running"},
+            {"type": "user.message", "content": [{"type": "text", "text": "review"}]},
             {
                 "type": "agent.tool_use",
                 "id": "tool-1",
@@ -599,17 +728,101 @@ class CatxAgentClientTest(unittest.TestCase):
         bundle = client.fetch_session("session_2")
 
         self.assertEqual("done", bundle.output)
-        self.assertEqual("tool_call", bundle.trace[1].kind)
-        self.assertEqual("read_file", bundle.trace[1].tool)
-        self.assertEqual("tool_result", bundle.trace[2].kind)
+        self.assertEqual("tool_call", bundle.trace[2].kind)
         self.assertEqual("read_file", bundle.trace[2].tool)
-        self.assertTrue(bundle.trace[2].payload["ok"])
-        self.assertEqual("2026-08-20T18:00:01+08:00", bundle.trace[2].timestamp)
+        self.assertEqual("tool_result", bundle.trace[3].kind)
+        self.assertEqual("read_file", bundle.trace[3].tool)
+        self.assertTrue(bundle.trace[3].payload["ok"])
+        self.assertEqual("2026-08-20T18:00:01+08:00", bundle.trace[3].timestamp)
         self.assertEqual(9, bundle.usage["output_tokens"])
         self.assertEqual(7, bundle.usage["cache_creation_input_tokens"])
         self.assertEqual(24, bundle.usage["total_tokens"])
         self.assertTrue(bundle.completeness.complete)
         self.assertEqual("catx_session_api", bundle.source)
+
+    def test_fetch_session_paginates_events_and_seals_one_complete_log(self):
+        first_page = [
+            {"event_id": "e1", "seq": 1, "type": "user.message", "content": [{"type": "text", "text": "review"}]},
+            {"event_id": "e2", "seq": 2, "type": "agent.tool_use", "id": "tool-1", "name": "read_file", "input": {"path": "SKILL.md"}},
+        ]
+        second_page = [
+            {"event_id": "e3", "seq": 3, "type": "agent.tool_result", "tool_use_id": "tool-1", "content": [{"type": "text", "text": "ok"}]},
+            {"event_id": "e4", "seq": 4, "type": "agent.message", "content": [{"type": "text", "text": "done"}]},
+        ]
+        transport = FakeTransport(
+            [
+                response({"status": "idle", "usage": {}}),
+                response({"data": first_page, "pagination": {"has_more": True, "next_cursor": "page-2", "total": 4}}),
+                response({"data": second_page, "pagination": {"has_more": False, "total": 4}}),
+            ]
+        )
+        client = CatxAgentClient(profile(events_limit=2), transport=transport, environment=ENVIRONMENT)
+
+        bundle = client.fetch_session("session_paged")
+        receipt = bundle.observation.metadata["event_log_integrity"]
+
+        self.assertTrue(bundle.completeness.complete)
+        self.assertTrue(receipt["complete"])
+        self.assertEqual(2, receipt["page_count"])
+        self.assertEqual(4, receipt["event_count"])
+        self.assertEqual("complete", receipt["sequence_status"])
+        self.assertIn("cursor=page-2", transport.calls[2]["url"])
+        self.assertEqual(64, len(receipt["event_log_sha256"]))
+
+    def test_full_page_is_complete_when_declared_total_matches(self):
+        events = [
+            {
+                "event_id": "e1",
+                "seq": 1,
+                "type": "user.message",
+                "content": [{"type": "text", "text": "review"}],
+            },
+            {
+                "event_id": "e2",
+                "seq": 2,
+                "type": "agent.message",
+                "content": [{"type": "text", "text": "done"}],
+            },
+        ]
+        client = CatxAgentClient(
+            profile(events_limit=2),
+            transport=FakeTransport(
+                [
+                    response({"status": "idle", "usage": {}}),
+                    response({"data": events, "total": 2}),
+                ]
+            ),
+            environment=ENVIRONMENT,
+        )
+
+        bundle = client.fetch_session("session_total_proves_complete")
+        receipt = bundle.observation.metadata["event_log_integrity"]
+
+        self.assertTrue(receipt["complete"])
+        self.assertEqual(2, receipt["declared_total"])
+        self.assertTrue(bundle.completeness.trace)
+
+    def test_sequence_gap_and_unpaired_tool_call_make_trace_not_evaluable(self):
+        events = [
+            {"event_id": "e1", "seq": 1, "type": "user.message", "content": [{"type": "text", "text": "review"}]},
+            {"event_id": "e2", "seq": 3, "type": "agent.tool_use", "id": "tool-1", "name": "read_file"},
+            {"event_id": "e3", "seq": 4, "type": "agent.message", "content": [{"type": "text", "text": "done"}]},
+        ]
+        client = CatxAgentClient(
+            profile(),
+            transport=FakeTransport(
+                [response({"status": "idle", "usage": {}}), response({"data": events})]
+            ),
+            environment=ENVIRONMENT,
+        )
+
+        bundle = client.fetch_session("session_incomplete")
+        receipt = bundle.observation.metadata["event_log_integrity"]
+
+        self.assertFalse(bundle.completeness.trace)
+        self.assertFalse(receipt["complete"])
+        self.assertIn("sequence_gap", receipt["reason_codes"])
+        self.assertIn("tool_result_missing", receipt["reason_codes"])
 
     def test_fetch_redacts_repository_token_and_url_userinfo_from_log(self):
         environment = dict(ENVIRONMENT, CATX_REPOSITORY_TOKEN="pat_secret")
