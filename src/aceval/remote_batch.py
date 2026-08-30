@@ -43,6 +43,20 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _duration_ms(started_at: Any, completed_at: Any) -> Optional[int]:
+    """Compute a best-effort wall duration without weakening evidence."""
+
+    if not isinstance(started_at, str) or not isinstance(completed_at, str):
+        return None
+    try:
+        start = datetime.fromisoformat(started_at.replace("Z", "+00:00"))
+        end = datetime.fromisoformat(completed_at.replace("Z", "+00:00"))
+        value = int((end - start).total_seconds() * 1000)
+        return max(0, value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
 def _atomic_json(path: Path, value: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(".%s.%s.tmp" % (path.name, uuid.uuid4().hex))
@@ -86,6 +100,7 @@ def _request_fingerprint(
     standards: Sequence[str],
     repository_bindings: Sequence[Mapping[str, Any]],
     environment_contract_hash: Optional[str],
+    execution_bindings: Optional[Mapping[str, CatxExecutionBinding]] = None,
 ) -> str:
     """Identify the exact immutable inputs of a persisted remote batch."""
 
@@ -99,6 +114,10 @@ def _request_fingerprint(
         "standards": [str(item) for item in standards],
         "repository_bindings": [dict(item) for item in repository_bindings],
         "environment_contract_hash": environment_contract_hash,
+        "execution_bindings": {
+            str(case_id): _binding_evidence_payload(binding)
+            for case_id, binding in sorted((execution_bindings or {}).items())
+        },
     }
     encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False).encode("utf-8")
     return "sha256:" + hashlib.sha256(encoded).hexdigest()
@@ -136,6 +155,7 @@ def _archive_attempt(row: dict[str, Any], *, retry_reason: Optional[str] = None)
             "status": row.get("status"),
             "started_at": row.get("started_at"),
             "completed_at": row.get("completed_at"),
+            "duration_ms": row.get("duration_ms"),
             "terminal": row.get("terminal"),
             "artifact": row.get("artifact"),
             "error": row.get("error"),
@@ -188,12 +208,18 @@ def compact_remote_prompt(
     standards: Sequence[str],
     repository_bindings: Sequence[Mapping[str, Any]] = (),
 ) -> str:
-    """Keep the online prompt small; Skill instructions remain in its mounted repository."""
+    """Build an evaluation-blind online prompt.
+
+    The remote worker receives the concrete Case and immutable repository
+    bindings only.  The optimization goal and acceptance standards belong to
+    the local control plane and must never bias the worker's answer.
+    """
+
+    del goal, standards
 
     prompt = str(case.get("prompt") or "").strip()
     if not prompt:
         raise RemoteBatchError("remote case prompt must not be empty")
-    standard_text = "\n".join("- " + str(item) for item in standards)
     metadata = case.get("metadata", {}) if isinstance(case.get("metadata"), Mapping) else {}
     repository_lines = []
     repository_checks = []
@@ -202,8 +228,8 @@ def compact_remote_prompt(
         if role not in ("skill", "code"):
             raise RemoteBatchError("repository binding role is invalid")
         branch = str(binding.get("branch") or "").strip()
-        if role == "code" and metadata.get("fixture_branch"):
-            branch = str(metadata["fixture_branch"]).strip()
+        if role == "code" and (metadata.get("head_ref") or metadata.get("fixture_branch")):
+            branch = str(metadata.get("head_ref") or metadata.get("fixture_branch")).strip()
         mount_path = str(binding.get("mount_path") or "").strip()
         revision = str(binding.get("revision") or "").strip().lower()
         if (
@@ -224,6 +250,30 @@ def compact_remote_prompt(
         if branch and mount_path:
             quoted_mount = shlex.quote(mount_path)
             quoted_branch = shlex.quote(branch)
+            base_commit = str(metadata.get("base_commit") or "").strip().lower() if role == "code" else ""
+            head_commit = str(metadata.get("head_commit") or "").strip().lower() if role == "code" else ""
+            if bool(base_commit) != bool(head_commit):
+                raise RemoteBatchError("code-review Case must provide both base_commit and head_commit")
+            if base_commit and (not _SAFE_REVISION.fullmatch(base_commit) or not _SAFE_REVISION.fullmatch(head_commit)):
+                raise RemoteBatchError("code-review Case commits must be full Git commit SHAs")
+            if base_commit == head_commit and base_commit:
+                raise RemoteBatchError("code-review Case base_commit and head_commit must differ")
+            if role == "code" and base_commit and head_commit:
+                repository_lines.append(
+                    "- code: 在 %s 评审 PR %s..%s（远端分支 %s）"
+                    % (mount_path, base_commit, head_commit, branch)
+                )
+                repository_checks.append(
+                    "- 必须依次执行 `git -C %s fetch --no-tags origin %s` 和 `git -C %s rev-parse FETCH_HEAD`，确认结果等于 `%s`；"
+                    "再执行 `git -C %s checkout --detach %s` 和 `git -C %s rev-parse HEAD`，确认结果等于 `%s`；"
+                    "最后执行 `git -C %s diff --binary %s %s | git -C %s apply`，仅评审工作区中的 PR diff，不得修改源码。"
+                    % (
+                        quoted_mount, quoted_branch, quoted_mount, head_commit,
+                        quoted_mount, base_commit, quoted_mount, base_commit,
+                        quoted_mount, base_commit, head_commit, quoted_mount,
+                    )
+                )
+                continue
             if revision:
                 repository_lines.append("- %s: 在 %s 检出提交 %s（分支 %s 仅用于定位仓库）" % (role, mount_path, revision, branch))
                 repository_checks.append(
@@ -245,23 +295,20 @@ def compact_remote_prompt(
     ) if repository_lines else ""
     if metadata.get("harness_baseline") == "without_skill":
         return (
-            "这是新 Skill 的无 Skill 对照运行。请自然完成下面任务，但不得读取或使用挂载仓库中的 SKILL.md、references 或 scripts；"
-            "完整保留工具证据，以测量通用 Agent 本身能达到的结果。\n\n"
-            "任务：\n%s%s\n\n总体目标：%s\n\n验收标准：\n%s"
-            % (prompt, repository_text, goal, standard_text)
+            "请自然完成下面任务，但不得读取或使用挂载仓库中的 SKILL.md、references 或 scripts。"
+            "完整保留工具调用与结果。\n\n任务：\n%s%s" % (prompt, repository_text)
         )
     if metadata.get("harness_case_kind") == "negative_trigger":
         return (
-            "这是 Skill 触发边界评测。请自然完成下面任务；只有当挂载 Skill 的描述确实适用于任务时才读取并使用它，"
-            "不适用时不得读取 SKILL.md，也不得强行套用其流程。完整保留工具证据。\n\n"
-            "任务：\n%s%s\n\n总体目标：%s\n\n验收标准：\n%s"
-            % (prompt, repository_text, goal, standard_text)
+            "请自然完成下面任务；只有当挂载 Skill 的描述确实适用于任务时才读取并使用它，"
+            "不适用时不得读取 SKILL.md，也不得强行套用其流程。完整保留工具调用与结果。\n\n"
+            "任务：\n%s%s" % (prompt, repository_text)
         )
+    task_kind = "使用目标 Skill 评审下面 PR（测试仓库的独立 Case 分支）" if metadata.get("base_commit") and metadata.get("head_commit") else "使用目标 Skill 完成下面 Case"
     return (
-        "请按当前会话挂载的候选 Skill 严格完成下面任务。先准备下列仓库并从 skill 挂载点读取 SKILL.md（若入口位于 src/SKILL.md 则读取该文件），按其关键步骤执行，"
-        "不要修改或发布 Skill 本身。完整保留工具证据。\n\n"
-        "任务：\n%s%s\n\n总体目标：%s\n\n验收标准：\n%s"
-        % (prompt, repository_text, goal, standard_text)
+        "%s。先准备下列仓库并从 skill 挂载点读取 SKILL.md（若入口位于 src/SKILL.md 则读取该文件），"
+        "按其关键步骤执行；不要修改或发布 Skill，不要修改被评审源码。完整保留工具调用与结果。\n\n"
+        "Case：\n%s%s" % (task_kind, prompt, repository_text)
     )
 
 
@@ -309,6 +356,7 @@ class RemoteBatchCoordinator:
         repository_bindings: Sequence[Mapping[str, Any]] = (),
         environment_contract_hash: Optional[str] = None,
         execution_binding: Optional[CatxExecutionBinding] = None,
+        execution_bindings: Optional[Mapping[str, CatxExecutionBinding]] = None,
     ) -> Mapping[str, Any]:
         if not cases:
             raise RemoteBatchError("remote batch requires at least one case")
@@ -324,6 +372,13 @@ class RemoteBatchCoordinator:
         requested_ids = [item[0] for item in prepared_cases]
         if len(requested_ids) != len(set(requested_ids)):
             raise RemoteBatchError("remote batch case ids must be unique")
+        case_bindings = dict(execution_bindings or {})
+        if execution_binding is not None:
+            for case_id in requested_ids:
+                case_bindings.setdefault(case_id, execution_binding)
+        unknown_binding_ids = sorted(set(case_bindings).difference(requested_ids))
+        if unknown_binding_ids:
+            raise RemoteBatchError("execution bindings reference unknown cases: %s" % ", ".join(unknown_binding_ids))
         request_fingerprint = _request_fingerprint(
             purpose=purpose,
             prepared_cases=prepared_cases,
@@ -331,6 +386,7 @@ class RemoteBatchCoordinator:
             standards=standards,
             repository_bindings=repository_bindings,
             environment_contract_hash=environment_contract_hash,
+            execution_bindings=case_bindings,
         )
         path = self.batch_path(task_id, iteration, purpose)
         if path.is_file():
@@ -338,12 +394,44 @@ class RemoteBatchCoordinator:
             if loaded.get("environment_contract_hash") != environment_contract_hash:
                 raise RemoteBatchError("persisted batch environment contract does not match requested contract")
             persisted_ids = [str(row.get("case_id") or "") for row in loaded.get("cases", ()) if isinstance(row, Mapping)]
-            if loaded.get("request_fingerprint") and loaded.get("request_fingerprint") != request_fingerprint:
-                raise RemoteBatchError("persisted batch request does not match the requested cases, prompts, or repository bindings")
             if any(case_id not in requested_ids for case_id in persisted_ids):
                 raise RemoteBatchError("persisted batch does not match requested cases")
             if loaded.get("status") != "dispatching" and set(persisted_ids) != set(requested_ids):
                 raise RemoteBatchError("completed persisted batch does not contain exactly the requested cases")
+            persisted_rows = [row for row in loaded.get("cases", ()) if isinstance(row, Mapping)]
+            # A previous process can have persisted a terminal batch whose
+            # every Case failed before a session id was created (for example,
+            # an old run that did not yet have per-Case PR bindings).  Once
+            # the missing fixture/binding material is available, that batch
+            # must be recoverable instead of being treated as an idempotent
+            # success.  Successful or still-running rows remain immutable and
+            # continue to reject input drift.
+            fingerprint_changed = bool(
+                loaded.get("request_fingerprint")
+                and loaded.get("request_fingerprint") != request_fingerprint
+            )
+            all_terminal_failures = bool(persisted_rows) and all(
+                str(row.get("status") or "") == "failed" for row in persisted_rows
+            )
+            if fingerprint_changed and not (
+                loaded.get("status") == "completed"
+                and all_terminal_failures
+                and set(persisted_ids) == set(requested_ids)
+            ):
+                raise RemoteBatchError("persisted batch request does not match the requested cases, prompts, or repository bindings")
+            if fingerprint_changed and all_terminal_failures:
+                requested_by_id = {case_id: (prompt, title) for case_id, prompt, title in prepared_cases}
+                for row in persisted_rows:
+                    case_id = str(row.get("case_id") or "")
+                    prompt, title = requested_by_id[case_id]
+                    row.update({
+                        "case_title": title,
+                        "prompt": prompt,
+                        "repository_bindings": [dict(item) for item in repository_bindings],
+                        "execution_binding": _binding_evidence_payload(case_bindings.get(case_id)),
+                    })
+                loaded["cases"] = persisted_rows
+                loaded["request_fingerprint"] = request_fingerprint
             if loaded.get("status") == "dispatching":
                 persisted_prompts = {
                     str(row.get("case_id")): str(row.get("prompt"))
@@ -356,6 +444,20 @@ class RemoteBatchCoordinator:
                 if any(case_id in persisted_prompts and persisted_prompts[case_id] != prompt for case_id, prompt in requested_prompts.items()):
                     raise RemoteBatchError("interrupted persisted batch prompt does not match the requested Case")
             if loaded.get("status") != "dispatching":
+                if loaded.get("status") == "completed" and any(
+                    str(row.get("status") or "") == "failed" for row in persisted_rows
+                ):
+                    # Retry only failed rows; completed evidence is never
+                    # recreated.  This is the continuation path for legacy
+                    # batches that reached the remote node without creating
+                    # sessions.
+                    _atomic_json(path, loaded)
+                    return self.retry_failed(
+                        task_id,
+                        iteration,
+                        purpose,
+                        execution_bindings=case_bindings,
+                    )
                 return loaded
             batch = loaded
             case_states = [dict(item) for item in loaded.get("cases", ()) if isinstance(item, Mapping)]
@@ -384,8 +486,13 @@ class RemoteBatchCoordinator:
                 "deadline_at_epoch": time.time() + self.max_wait_seconds,
                 "cases": case_states,
             }
-            if execution_binding is not None:
+            if execution_binding is not None and not execution_bindings:
                 batch["execution_binding"] = _binding_evidence_payload(execution_binding)
+            if case_bindings:
+                batch["execution_bindings"] = {
+                    case_id: _binding_evidence_payload(binding)
+                    for case_id, binding in case_bindings.items()
+                }
             _atomic_json(path, batch)
         # Starting every session before polling gives real fan-out without
         # adding thread-safety assumptions to a company API client.
@@ -393,6 +500,7 @@ class RemoteBatchCoordinator:
         for case_id, prompt, case_title in prepared_cases:
             if case_id in persisted_ids:
                 continue
+            case_binding = case_bindings.get(case_id)
             row = {
                 "case_id": case_id,
                 "case_title": case_title,
@@ -406,8 +514,9 @@ class RemoteBatchCoordinator:
                 "artifact": None,
                 "error": None,
                 "repository_bindings": [dict(item) for item in repository_bindings],
-                "binding_status": "pending" if execution_binding is not None else "not_requested",
+                "binding_status": "pending" if case_binding is not None else "not_requested",
                 "binding_evidence": None,
+                "execution_binding": _binding_evidence_payload(case_binding),
                 "message_status": "pending",
                 "log_completeness": None,
                 "attempt_number": 1,
@@ -418,19 +527,19 @@ class RemoteBatchCoordinator:
             _atomic_json(path, batch)
             try:
                 request = {"title": "aceval %s %s" % (purpose, case_id), "prompt": prompt}
-                if execution_binding is not None:
+                if case_binding is not None:
                     start = getattr(self.gateway, "start_session", None)
                     if not callable(start):
                         raise RemoteBatchError("session gateway cannot create a bound session")
-                    session_id = start(request, binding=execution_binding)
+                    session_id = start(request, binding=case_binding)
                     evidence = getattr(self.gateway, "last_binding_evidence", None)
                     verify = getattr(self.gateway, "verify_binding", None)
                     if callable(verify):
-                        evidence = verify(session_id, execution_binding)
+                        evidence = verify(session_id, case_binding)
                     if evidence is None:
                         raise RemoteBatchError("session binding was not verified")
                     if hasattr(evidence, "assert_matches"):
-                        evidence.assert_matches(execution_binding)
+                        evidence.assert_matches(case_binding)
                     row.update({"binding_status": "verified", "binding_evidence": _binding_evidence_payload(evidence)})
                 else:
                     session_id = self.gateway.start_session(request)
@@ -438,7 +547,7 @@ class RemoteBatchCoordinator:
                 row.update({"session_id": session_id, "status": "running"})
                 self.store.append_event(task_id, "case_run.started", {"purpose": purpose, "session_id": session_id, "binding_status": row.get("binding_status"), "message_status": row.get("message_status")}, iteration=iteration, case_id=case_id, run_id=purpose)
             except Exception as exc:
-                row.update({"status": "failed", "error": str(exc), "binding_status": "failed" if execution_binding is not None else row.get("binding_status"), "message_status": "failed", "completed_at": _now()})
+                row.update({"status": "failed", "error": str(exc), "binding_status": "failed" if case_binding is not None else row.get("binding_status"), "message_status": "failed", "completed_at": _now()})
                 _archive_attempt(row)
                 self.store.append_event(task_id, "case_run.failed", {"purpose": purpose, "error": str(exc)}, iteration=iteration, case_id=case_id, run_id=purpose)
             batch["updated_at"] = _now()
@@ -644,6 +753,7 @@ class RemoteBatchCoordinator:
                     "error": final_error,
                     "log_completeness": completeness,
                 })
+                row["duration_ms"] = _duration_ms(row.get("started_at"), row.get("completed_at"))
                 _archive_attempt(row)
                 self.store.append_event(task_id, "trace.captured", {"purpose": purpose, "session_id": row["session_id"], "session_log": str(artifact), "completeness": payload["session"].get("completeness")}, iteration=iteration, case_id=case_id, run_id=purpose)
                 self.store.append_event(task_id, "case_run.completed" if row["status"] == "completed" else "case_run.failed", {"purpose": purpose, "session_id": row["session_id"], "status": row["status"], "session_log": str(artifact), "binding_status": row.get("binding_status"), "message_status": row.get("message_status"), "log_completeness": row.get("log_completeness")}, iteration=iteration, case_id=case_id, run_id=purpose)
@@ -675,20 +785,46 @@ class RemoteBatchCoordinator:
         )
         return batch
 
-    def retry_failed(self, task_id: str, iteration: int, purpose: str, *, execution_binding: Optional[CatxExecutionBinding] = None) -> Mapping[str, Any]:
-        """Recreate only failed sessions while preserving successful evidence."""
+    def retry_failed(
+        self,
+        task_id: str,
+        iteration: int,
+        purpose: str,
+        *,
+        execution_binding: Optional[CatxExecutionBinding] = None,
+        execution_bindings: Optional[Mapping[str, CatxExecutionBinding]] = None,
+        case_ids: Sequence[str] = (),
+    ) -> Mapping[str, Any]:
+        """Recreate selected or transport-failed sessions and preserve history.
+
+        ``case_ids`` is used for targeted evidence recovery.  It may include a
+        completed session whose artifact was incomplete or otherwise invalid;
+        the prior Attempt remains archived and only those Cases are rerun.
+        """
 
         path = self.batch_path(task_id, iteration, purpose)
         batch = dict(_load(path))
         rows = [dict(item) for item in batch.get("cases", ()) if isinstance(item, Mapping)]
-        failed = [row for row in rows if row.get("status") == "failed"]
+        selected = {str(item) for item in case_ids if str(item)}
+        known = {str(row.get("case_id") or "") for row in rows}
+        if selected.difference(known):
+            raise RemoteBatchError("retry references unknown cases: %s" % ", ".join(sorted(selected.difference(known))))
+        failed = [
+            row for row in rows
+            if str(row.get("case_id") or "") in selected
+            or (not selected and row.get("status") == "failed")
+        ]
         if not failed:
-            raise RemoteBatchError("remote batch has no failed cases to retry")
+            raise RemoteBatchError("remote batch has no selected or failed cases to retry")
+        per_case_bindings = dict(execution_bindings or {})
         for row in failed:
             case_id = str(row.get("case_id") or "")
             prompt = str(row.get("prompt") or "")
-            retry_reason = str(row.get("error") or row.get("fetch_error") or "failed remote attempt")
+            retry_reason = str(row.get("error") or row.get("fetch_error") or ("evidence recovery requested" if selected else "failed remote attempt"))
             _archive_attempt(row, retry_reason=retry_reason)
+            row_binding = per_case_bindings.get(case_id) or execution_binding
+            if row_binding is None and isinstance(row.get("execution_binding"), Mapping):
+                row_binding = CatxExecutionBinding.from_mapping(row["execution_binding"])
             next_attempt = _attempt_number(row) + 1
             row.update({
                 "status": "starting",
@@ -706,9 +842,10 @@ class RemoteBatchCoordinator:
                 # A retry is a fresh transport attempt.  Do not carry a
                 # previous binding failure into an intentionally unbound
                 # retry (or stale evidence into a newly bound one).
-                "binding_status": "pending" if execution_binding is not None else "not_requested",
+                "binding_status": "pending" if row_binding is not None else "not_requested",
                 "binding_evidence": None,
                 "binding_error": None,
+                "execution_binding": _binding_evidence_payload(row_binding),
             })
             batch.update({"cases": rows, "status": "dispatching", "updated_at": _now()})
             _atomic_json(path, batch)
@@ -717,12 +854,12 @@ class RemoteBatchCoordinator:
                     "title": "aceval %s %s retry" % (purpose, case_id),
                     "prompt": prompt,
                 }
-                session_id = self.gateway.start_session(request, binding=execution_binding) if execution_binding is not None else self.gateway.start_session(request)
-                if execution_binding is not None:
+                session_id = self.gateway.start_session(request, binding=row_binding) if row_binding is not None else self.gateway.start_session(request)
+                if row_binding is not None:
                     evidence = getattr(self.gateway, "last_binding_evidence", None)
                     verify = getattr(self.gateway, "verify_binding", None)
                     if callable(verify):
-                        evidence = verify(session_id, execution_binding)
+                        evidence = verify(session_id, row_binding)
                     if evidence is None or (hasattr(evidence, "assert_matches") and not evidence.verified):
                         raise RemoteBatchError("retried session binding was not verified")
                     row.update({"binding_status": "verified", "binding_evidence": _binding_evidence_payload(evidence)})
@@ -730,7 +867,7 @@ class RemoteBatchCoordinator:
                 row.update({"session_id": session_id, "status": "running"})
                 self.store.append_event(task_id, "case_run.retried", {"purpose": purpose, "session_id": session_id, "attempt_number": next_attempt, "retry_reason": retry_reason}, iteration=iteration, case_id=case_id, run_id=purpose)
             except Exception as exc:
-                row.update({"status": "failed", "error": str(exc), "binding_status": "failed" if execution_binding is not None else row.get("binding_status"), "message_status": "failed", "completed_at": _now()})
+                row.update({"status": "failed", "error": str(exc), "binding_status": "failed" if row_binding is not None else row.get("binding_status"), "message_status": "failed", "completed_at": _now()})
                 _archive_attempt(row)
                 self.store.append_event(task_id, "case_run.failed", {"purpose": purpose, "error": str(exc), "retry": True}, iteration=iteration, case_id=case_id, run_id=purpose)
             batch["updated_at"] = _now()

@@ -42,6 +42,35 @@ def make_alert_skill(root: Path) -> None:
 
 
 class SkillTreeOptimizerTests(unittest.TestCase):
+    def test_repairs_empty_changes_response_with_a_second_strict_edit_request(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            skill = root / "skill"
+            skill.mkdir()
+            make_alert_skill(skill)
+            empty = {"changes": [], "rationale": "plan only"}
+            repaired = {
+                "changes": [{
+                    "path": "SKILL.md",
+                    "operation": "replace_text",
+                    "old_text": "Run `scripts/collect.py`, then follow `workflow/fast/stage-3-grade.md`.",
+                    "new_text": "Run `scripts/collect.py`, then follow `workflow/fast/stage-3-grade.md`; report each required check and its evidence.",
+                    "reason": "make the missing verification output explicit",
+                }],
+                "rationale": "Add the missing verification requirement.",
+            }
+            model = ScriptedModelClient([
+                ModelReply(content=json.dumps(empty)),
+                ModelReply(content=json.dumps(repaired)),
+            ])
+            candidate = SkillTreeOptimizer(model).propose(
+                skill,
+                [FailureEvidence("cluster", "grader", "missing verification")],
+                root / "candidates",
+                target_scope=("SKILL.md",),
+            )
+            self.assertIn("report each required check", (candidate.path / "SKILL.md").read_text())
+
     def test_materializes_two_resource_edits_without_mutating_source(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

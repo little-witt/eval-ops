@@ -19,6 +19,10 @@ from typing import Any, Callable, Mapping, Optional, Sequence, Tuple, Union
 import uuid
 
 from .agent_runtime import CommandModelClient, ModelClient
+from .code_review_fixtures import (
+    FIXTURE_GENERATION_API_VERSION,
+    generate_code_review_fixtures,
+)
 from .catx import CatxAgentClient, CatxAgentProfile, CatxRepositoryResourceProfile
 from .catx_bindings import CatxExecutionBinding, CatxPayloadBindingAdapter, CATX_EXECUTION_BINDING_API_VERSION
 from .contracts import as_primitive
@@ -419,6 +423,11 @@ def _path_for_case(case: Mapping[str, Any], graph: Mapping[str, Any]) -> Mapping
     return {
         "api_version": EXECUTION_PATH_SPEC_API_VERSION,
         "case_id": case.get("id"),
+        "purpose": "验证 %s：%s" % (
+            title,
+            "；".join(str(item) for item in (test.get("expected_observables", ()) if isinstance(test.get("expected_observables"), list) else ()))
+            or "确认 Skill 被正确读取、执行并产出可观察结果",
+        ),
         "trace_completeness_required": True,
         "steps": steps,
     }
@@ -779,6 +788,83 @@ def _git_head(root_value: Optional[str]) -> Optional[str]:
     return revision if completed.returncode == 0 and len(revision) == 40 and all(item in "0123456789abcdef" for item in revision) else None
 
 
+def _fixture_catalog(root_value: Optional[str]) -> Mapping[str, Mapping[str, Any]]:
+    """Load a code-review Fixture Lab catalog without mutating the checkout."""
+
+    if not root_value:
+        return {}
+    root = Path(root_value).expanduser().resolve()
+    candidates = (root / "lab.json", root.parent / "lab.json")
+    document = None
+    for path in candidates:
+        if not path.is_file() or path.is_symlink():
+            continue
+        try:
+            value = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            continue
+        if isinstance(value, Mapping) and isinstance(value.get("cases"), list):
+            document = value
+            break
+    if document is None:
+        return {}
+    result = {}
+    for item in document.get("cases", ()):
+        if not isinstance(item, Mapping):
+            continue
+        case_id = str(item.get("id") or "").strip()
+        if case_id:
+            result[case_id] = dict(item)
+    return result
+
+
+def _attach_code_review_fixtures(
+    cases: Sequence[Mapping[str, Any]],
+    *,
+    code_root: Optional[str],
+) -> tuple[list[dict[str, Any]], Mapping[str, Any]]:
+    """Attach immutable base/head PR identities to each code-review Case.
+
+    A Case may supply the binding explicitly, or inherit it by stable id from
+    a versioned Fixture Lab. Missing bindings remain visible so the dispatch
+    phase can invoke the local fixture generator; the default branch is never
+    silently treated as five different PRs.
+    """
+
+    catalog = _fixture_catalog(code_root)
+    prepared = []
+    ready = []
+    missing = []
+    for raw in cases:
+        case = dict(raw)
+        metadata = dict(case.get("metadata", {})) if isinstance(case.get("metadata"), Mapping) else {}
+        catalog_item = catalog.get(str(case.get("id") or ""), {})
+        for key in ("base_ref", "head_ref", "base_commit", "head_commit", "oracle"):
+            if not metadata.get(key) and catalog_item.get(key):
+                metadata[key] = catalog_item[key]
+        if not metadata.get("fixture_branch") and metadata.get("head_ref"):
+            metadata["fixture_branch"] = metadata["head_ref"]
+        complete = all(
+            isinstance(metadata.get(key), str) and str(metadata.get(key)).strip()
+            for key in ("base_commit", "head_commit", "fixture_branch")
+        )
+        case_id = str(case.get("id") or "")
+        metadata["fixture_status"] = "ready" if complete else "missing_pr_binding"
+        if complete:
+            ready.append(case_id)
+        else:
+            missing.append(case_id)
+        case["metadata"] = metadata
+        prepared.append(case)
+    return prepared, {
+        "mode": "per_case_pr",
+        "case_count": len(prepared),
+        "ready_case_ids": ready,
+        "missing_case_ids": missing,
+        "source": "fixture_lab_or_case_metadata",
+    }
+
+
 class IterationKernel:
     """Persisted state machine used by CLI today and a desktop app later."""
 
@@ -961,6 +1047,7 @@ class IterationKernel:
                 "timeout_seconds": config.remote_agent.max_wait_seconds,
             },
         )
+        contract_refreshed = False
         try:
             if path.is_symlink():
                 raise IterationKernelError("frozen trial environment contract cannot be a symlink")
@@ -973,8 +1060,41 @@ class IterationKernel:
                     frozen_identity = {k: v for k, v in frozen.items() if k not in ("created_at", "contract_hash")}
                     current_identity = {k: v for k, v in current.items() if k not in ("created_at", "contract_hash")}
                     if frozen_identity != current_identity:
-                        raise IterationKernelError("trial environment drift detected; frozen contract no longer matches")
-                contract = frozen
+                        # Older runs could freeze the contract before the
+                        # newly-added code-review fixture generator attached
+                        # per-Case PR revisions.  If no remote session has
+                        # ever been created in this iteration, refreshing that
+                        # pre-session contract is safe and lets the run resume
+                        # with the actual immutable fixture inputs.  Once a
+                        # session exists, all identity drift remains fail
+                        # closed.
+                        frozen_fixtures = tuple(frozen.get("fixture_revisions") or ())
+                        current_fixtures = tuple(current.get("fixture_revisions") or ())
+                        fixture_upgrade = bool(current_fixtures) and not frozen_fixtures
+                        has_attempts = any(
+                            event.get("type") == "case_run.started"
+                            and int(event.get("iteration", -1)) == int(iteration)
+                            for event in self.store.events(task_id)
+                        )
+                        if not fixture_upgrade or has_attempts:
+                            raise IterationKernelError("trial environment drift detected; frozen contract no longer matches")
+                        contract = current
+                        contract_refreshed = True
+                        _atomic_json(path, contract)
+                        self.store.append_event(
+                            task_id,
+                            "environment.contract_refreshed",
+                            {
+                                "contract": str(path),
+                                "environment_contract_hash": contract["contract_hash"],
+                                "reason": "pre-session contract upgraded with generated Case fixture revisions",
+                            },
+                            iteration=iteration,
+                        )
+                    else:
+                        contract = frozen
+                else:
+                    contract = frozen
             else:
                 contract = current
                 _atomic_json(path, contract)
@@ -989,7 +1109,7 @@ class IterationKernel:
         explicit = config.trial_executor.environment_contract_hash if config.trial_executor else None
         if explicit and explicit != contract.get("contract_hash"):
             raise IterationKernelError("trial_executor.environment_contract_hash does not match frozen contract")
-        if state.get("environment_contract_hash") not in (None, contract.get("contract_hash")):
+        if not contract_refreshed and state.get("environment_contract_hash") not in (None, contract.get("contract_hash")):
             raise IterationKernelError("state environment contract does not match frozen contract")
         if state.get("environment_contract") != str(path) or state.get("environment_contract_hash") != contract.get("contract_hash"):
             self._transition(task_id, str(state.get("phase")), environment_contract=str(path), environment_contract_hash=contract.get("contract_hash"))
@@ -1025,6 +1145,7 @@ class IterationKernel:
             "api_version": "aceval.approval-record/v1",
             "record_id": "%s:%03d" % (task_id, index),
             "task_id": task_id,
+            "evaluation_flow_id": state.get("evaluation_flow_id"),
             "iteration": int(state.get("iteration", 0)),
             "approval_type": approval_type,
             "approve": bool(approve),
@@ -1125,6 +1246,11 @@ class IterationKernel:
             scenario = profile.id
         else:
             scenario = "generic-skill-construction"
+        # A task is an evaluation *flow*, not just a configuration snapshot.
+        # Keep a fresh id even when the caller reuses the same Skill/Case
+        # configuration so generated fixture branches and commits can never
+        # silently point at another flow's test content.
+        evaluation_flow_id = uuid.uuid4().hex
         task = self.store.create(
             task_id=task_id,
             skill_name=user_input.skill_name,
@@ -1140,6 +1266,7 @@ class IterationKernel:
                 "code_repository": config.code_repository.to_dict() if config.code_repository else None,
                 "remote_profile": config.remote_agent.profile_path,
                 "local_model_id": config.local_analysis.model_id,
+                "evaluation_flow_id": evaluation_flow_id,
             },
         )
         kernel_dir = self._kernel_dir(str(task["id"]))
@@ -1167,8 +1294,14 @@ class IterationKernel:
             "blueprint_approved": False,
             "design_approved": False,
             "approved_case_ids": [],
+            # Per-flow reliability memory. Cases are retired only after two
+            # consecutive stable passes; their frozen branches remain part of
+            # the design and are shown as regression protection.
+            "retired_case_ids": [],
+            "case_stability_rounds": {},
             "config_hash": contract_hash(config),
             "input_hash": contract_hash(user_input),
+            "evaluation_flow_id": evaluation_flow_id,
             "created_at": _now(),
             "updated_at": _now(),
         }
@@ -1377,9 +1510,44 @@ class IterationKernel:
         for case in cases:
             metadata = dict(case.get("metadata", {})) if isinstance(case.get("metadata"), Mapping) else {}
             test = dict(metadata.get("aceval_test", {})) if isinstance(metadata.get("aceval_test"), Mapping) else {}
+            # Enrich deterministic/fallback cases with the concrete Skill
+            # capability they exercise so the UI does not expose opaque
+            # capability ids as the only evaluation meaning.
+            capability_ids = test.get("capability_ids", ())
+            capability_id = str(capability_ids[0]) if isinstance(capability_ids, list) and capability_ids else ""
+            capability = next(
+                (item for item in (graph.get("capabilities", ()) if isinstance(graph.get("capabilities"), list) else ())
+                 if isinstance(item, Mapping) and str(item.get("id") or "") == capability_id),
+                None,
+            )
+            if capability is not None and test.get("origin") == "requirement_synthesis":
+                capability_name = str(capability.get("name") or capability_id)
+                test.setdefault("capability_name", capability_name)
+                for field in ("inputs", "outputs", "tools", "preconditions"):
+                    values = capability.get(field, ())
+                    test.setdefault("capability_%s" % field, list(values) if isinstance(values, list) else [])
+                dimension = str(test.get("kind") or "评测")
+                test.setdefault("title", "验证 Skill 能力：%s（%s）" % (capability_name, dimension))
+                test.setdefault("generation_reason", "从 Skill 能力“%s”的声明、来源和可观察结果生成本 Case。" % capability_name)
             refs = test.get("source_refs", ()) if isinstance(test.get("source_refs"), list) else ()
             test["source_ref_details"] = [source_ref_details[ref] for ref in refs if ref in source_ref_details]
             metadata["aceval_test"] = test
+            metadata["evaluation_flow_id"] = str(state.get("evaluation_flow_id") or "")
+            case_slug = re.sub(r"[^A-Za-z0-9._-]+", "-", str(case.get("id") or "case")).strip("-._")[:64] or "case"
+            # Never inherit a branch/revision from a seed Case or another
+            # task.  Recompiling the same task keeps this flow's identity,
+            # while every newly-created flow receives a fresh branch and test
+            # code revision even when its configuration is byte-for-byte the
+            # same as a previous flow.
+            metadata["evaluation_branch"] = (
+                "aceval/eval/%s/case/%s"
+                % (str(state.get("evaluation_flow_id") or "flow"), case_slug)
+            )
+            metadata["test_code_revision"] = contract_hash({
+                "evaluation_flow_id": state.get("evaluation_flow_id"),
+                "case_id": case.get("id"),
+                "case_revision": case.get("case_revision"),
+            })
             case["metadata"] = metadata
         paths = {}
         for case in cases:
@@ -1391,6 +1559,20 @@ class IterationKernel:
         pack_cases = []
         for item in cases:
             value = dict(item)
+            # Flow-local branch identity is execution provenance, not part of
+            # EvalPack content identity. Keeping it out of the compiler input
+            # preserves safe suite reuse while each flow still gets isolated
+            # fixture branches and a distinct frozen design.
+            if isinstance(value.get("metadata"), Mapping):
+                metadata = dict(value["metadata"])
+                metadata.pop("evaluation_flow_id", None)
+                metadata.pop("fixture_flow_id", None)
+                # Branch and test-code identities are intentionally scoped to
+                # the evaluation flow.  They must not perturb the reusable
+                # EvalPack signature for an otherwise identical case suite.
+                metadata.pop("evaluation_branch", None)
+                metadata.pop("test_code_revision", None)
+                value["metadata"] = metadata
             for key in ("case_revision", "content_hash", "provenance", "environment_applicability", "reuse_key", "title"):
                 value.pop(key, None)
             pack_cases.append(value)
@@ -1471,10 +1653,21 @@ class IterationKernel:
                 })
                 metadata["aceval_test"] = test
             case["metadata"] = metadata
+        fixture_summary = None
+        if (
+            config.code_repository is not None
+            and str(profile_value.get("id") or "") == "code-review"
+        ):
+            cases, fixture_summary = _attach_code_review_fixtures(
+                cases,
+                code_root=config.code_repository.local_path,
+            )
+        generated_case_count = len(planning.case_generation.generated_case_ids)
         design = {
             "api_version": EVALUATION_DESIGN_API_VERSION,
             "revision": revision,
             "task_id": task_id,
+            "evaluation_flow_id": state.get("evaluation_flow_id"),
             "input_mode": user_input.mode,
             "intent_mode": state.get("intent_mode", user_input.operation),
             "goal": goal,
@@ -1489,6 +1682,23 @@ class IterationKernel:
             "planning": planning.summary(),
             "test_design": planning.test_design(),
             "case_generation": model_case_provenance,
+            "fixture_summary": fixture_summary,
+            "path_strategy": {
+                "fixed_count": False,
+                "selection": "greedy_uncovered_risk_per_estimated_cost",
+                "one_path_per_case": True,
+                "one_branch_per_case_per_flow": True,
+                "skill_aware": True,
+                "seed_case_count": len(cases) - generated_case_count,
+                "generated_case_count": generated_case_count,
+                "actual_case_count": len(cases),
+                "max_generated_cases": config.policy.max_generated_cases,
+                "stop_conditions": [
+                    "all executable requirements are covered",
+                    "no candidate adds uncovered risk coverage",
+                    "generated Case budget is exhausted",
+                ],
+            },
             "evalpack": evalpack_value,
             "evalpack_ref": pack_ref,
             "source_subject_hash": graph.get("subject_hash"),
@@ -1595,9 +1805,23 @@ class IterationKernel:
             raise IterationKernelError("remote batch %s requires phase %s" % (purpose, expected_phase))
         design = self._design(task_id)
         wanted = set(case_ids)
-        if not wanted and purpose in ("evaluation", "without-skill-baseline"):
-            wanted = set(str(item) for item in state.get("approved_case_ids", ()) if str(item))
-        cases = [dict(case) for case in design.get("cases", ()) if isinstance(case, Mapping) and (not wanted or str(case.get("id")) in wanted)]
+        auto_selected = not wanted and purpose in ("evaluation", "without-skill-baseline")
+        approved_ids = set(str(item) for item in state.get("approved_case_ids", ()) if str(item))
+        if auto_selected:
+            wanted = set(approved_ids)
+            if purpose == "evaluation":
+                retired = {str(item) for item in state.get("retired_case_ids", ()) if str(item)}
+                wanted.difference_update(retired)
+        cases = [
+            dict(case)
+            for case in design.get("cases", ())
+            if isinstance(case, Mapping)
+            and (
+                (str(case.get("id")) in wanted if auto_selected and approved_ids else not wanted)
+                if auto_selected
+                else (not wanted or str(case.get("id")) in wanted)
+            )
+        ]
         if purpose == "without-skill-baseline":
             for case in cases:
                 metadata = dict(case.get("metadata", {})) if isinstance(case.get("metadata"), Mapping) else {}
@@ -1605,16 +1829,49 @@ class IterationKernel:
                 case["metadata"] = metadata
         if wanted != {str(case.get("id")) for case in cases} and wanted:
             raise IterationKernelError("dispatch references unknown case ids")
+        if not cases and auto_selected and purpose == "evaluation":
+            # All Cases are already stable regression protections. There is
+            # no new remote work to perform; expose a converged gate while
+            # retaining the prior decision and frozen branches.
+            prior_decision = state.get("decision")
+            self.store.update(task_id, status="ready")
+            return self._transition(task_id, "converged", active_batch=None, decision=prior_decision)
         if self._session_count(task_id) + len(cases) > config.policy.max_total_remote_sessions:
             raise IterationKernelError("remote session budget would be exceeded")
+        code_review_mode = bool(
+            config.code_repository is not None
+            and isinstance(design.get("profile"), Mapping)
+            and str(design.get("profile", {}).get("id") or "") == "code-review"
+        )
+        if code_review_mode:
+            # Generate missing PR fixtures before freezing the environment
+            # contract.  The resulting active-design hash and per-Case head
+            # commits then become part of the immutable trial inputs.
+            cases, fixture_summary = self._prepare_generated_code_review_fixtures(
+                task_id, design=design, cases=cases
+            )
+            design = dict(self._design(task_id))
+            design["fixture_summary"] = fixture_summary
         environment_contract = self._ensure_environment_contract(
             task_id,
             design=design,
             state=state,
             iteration=int(state.get("iteration", 0)),
         )
-        execution_binding = None
+        execution_bindings: dict[str, CatxExecutionBinding] = {}
         coordinator = self._coordinator(task_id)
+        if code_review_mode:
+            missing_pr_cases = []
+            for case in cases:
+                metadata = case.get("metadata", {}) if isinstance(case.get("metadata"), Mapping) else {}
+                if not all(metadata.get(key) for key in ("fixture_branch", "base_commit", "head_commit")):
+                    missing_pr_cases.append(str(case.get("id") or ""))
+            if missing_pr_cases:
+                raise IterationKernelError(
+                    "code-review dispatch requires an independent PR Fixture for every Case; "
+                    "missing fixture_branch/base_commit/head_commit: %s"
+                    % ", ".join(missing_pr_cases)
+                )
         if str(environment_contract.get("provider") or "catx") == "catx" and callable(getattr(coordinator.gateway, "verify_binding", None)):
             skill_contract = environment_contract.get("skill", {}) if isinstance(environment_contract.get("skill"), Mapping) else {}
             code_contract = environment_contract.get("code", {}) if isinstance(environment_contract.get("code"), Mapping) else {}
@@ -1627,7 +1884,7 @@ class IterationKernel:
                 )
             try:
                 _require_catx_binding_material(skill_contract, repository_contract)
-                execution_binding = CatxExecutionBinding(
+                common_binding = dict(
                         api_version=CATX_EXECUTION_BINDING_API_VERSION,
                         subject_hash=_execution_subject_hash(
                             design,
@@ -1637,11 +1894,21 @@ class IterationKernel:
                         skill_ref=str(skill_contract.get("ssh_url") or config.skill_repository.ssh_url or ""),
                         repository_ref=repository_ref,
                         repository_hash=repository_contract.get("working_tree_hash"),
-                        base_commit=repository_contract.get("revision"),
-                        head_commit=repository_contract.get("revision"),
+                )
+                for case in cases:
+                    case_id = str(case.get("id") or "")
+                    metadata = case.get("metadata", {}) if isinstance(case.get("metadata"), Mapping) else {}
+                    base_commit = str(metadata.get("base_commit") or repository_contract.get("revision") or "")
+                    head_commit = str(metadata.get("head_commit") or repository_contract.get("revision") or "")
+                    execution_bindings[case_id] = CatxExecutionBinding(
+                        **common_binding,
+                        base_commit=base_commit,
+                        head_commit=head_commit,
                         metadata={
                             "task_id": task_id,
+                            "case_id": case_id,
                             "iteration": int(state.get("iteration", 0)),
+                            "review_mode": "pull_request" if code_review_mode else "case",
                             "code_repository": environment_contract.get("code", {}),
                             "expected_mounts": [
                                 {
@@ -1650,11 +1917,11 @@ class IterationKernel:
                                 },
                                 *([{
                                     "mount_path": config.code_repository.mount_path or "/workspace/repo",
-                                    "revision": code_contract.get("revision"),
+                                    "revision": head_commit,
                                 }] if config.code_repository is not None else []),
                             ],
                         },
-                )
+                    )
             except Exception as exc:
                 raise IterationKernelError("cannot construct immutable CATX repository binding: %s" % exc) from exc
         batch = coordinator.dispatch(
@@ -1686,7 +1953,8 @@ class IterationKernel:
                 if item is not None
             ),
             environment_contract_hash=str(environment_contract["contract_hash"]),
-            execution_binding=execution_binding,
+            execution_binding=None,
+            execution_bindings=execution_bindings,
         )
         phase = {
             "pass-verification": "verification_running",
@@ -1767,8 +2035,16 @@ class IterationKernel:
             except Exception as exc:
                 raise IterationKernelError("cannot reconstruct immutable CATX repository binding for retry: %s" % exc) from exc
         try:
+            persisted_batch = self._batch(task_id, purpose)
+            has_persisted_case_bindings = any(
+                isinstance(row, Mapping) and isinstance(row.get("execution_binding"), Mapping)
+                for row in persisted_batch.get("cases", ())
+            )
             batch = self._coordinator(task_id).retry_failed(
-                task_id, int(state.get("iteration", 0)), purpose, execution_binding=execution_binding
+                task_id,
+                int(state.get("iteration", 0)),
+                purpose,
+                execution_binding=None if has_persisted_case_bindings else execution_binding,
             )
         except RemoteBatchError as exc:
             raise IterationKernelError(str(exc)) from exc
@@ -1781,9 +2057,216 @@ class IterationKernel:
         self._transition(task_id, phase, active_batch=purpose, decision=None, brain_stage=None)
         return batch
 
+    def retry_evidence(self, task_id: str) -> Mapping[str, Any]:
+        """Re-enter local analysis without creating another remote Session.
+
+        A failed or unexpected Case is the object of diagnosis. Replaying the
+        same Agent conversation would add noise and change the experiment, so
+        this compatibility action preserves the immutable batch and Trace and
+        only reruns the staged local analysis.
+        """
+
+        state = self.state(task_id)
+        if state.get("phase") != "needs_evidence":
+            raise IterationKernelError("targeted evidence retry requires phase needs_evidence")
+        decision_path = state.get("decision")
+        if not decision_path:
+            raise IterationKernelError("targeted evidence retry requires an analysis decision")
+        decision = _load_json(Path(str(decision_path)), "analysis decision")
+        case_ids = tuple(str(item) for item in decision.get("not_evaluable_case_ids", ()) if str(item))
+        if not case_ids:
+            raise IterationKernelError("analysis decision has no not-evaluable Cases to retry")
+        self.store.append_event(
+            task_id,
+            "evidence.analysis_reopened",
+            {
+                "case_ids": list(case_ids),
+                "remote_session_recreated": False,
+                "reason": "失败/偏离 Case 基于原始 Trace 做归因，不重复执行同一会话",
+            },
+            iteration=int(state.get("iteration", 0)),
+        )
+        self.store.update(task_id, status="running")
+        self._transition(task_id, "remote_collected", active_batch=None, brain_stage=None)
+        return self.analyze(task_id)
+
+    def reopen_case_review(self, task_id: str) -> Mapping[str, Any]:
+        """Return a needs-evidence task to its Case/Oracle review gate."""
+
+        state = self.state(task_id)
+        if state.get("phase") != "needs_evidence":
+            raise IterationKernelError("Case review can only be reopened from needs_evidence")
+        design = self._design(task_id)
+        self.store.update(task_id, status="awaiting_confirmation")
+        updated = self._transition(
+            task_id,
+            "design_ready",
+            design_approved=False,
+            approved_case_ids=list(state.get("approved_case_ids", ())),
+            active_design=str(self._kernel_dir(task_id) / "active-design.json"),
+            active_batch=None,
+            brain_stage=None,
+        )
+        self.store.append_event(
+            task_id,
+            "evaluation.case_review_reopened",
+            {
+                "case_ids": list(state.get("approved_case_ids", ())),
+                "reason": "not-evaluable Cases require Oracle calibration or review",
+                "design_revision": design.get("revision"),
+            },
+            iteration=int(state.get("iteration", 0)),
+        )
+        return updated
+
     def _batch(self, task_id: str, purpose: str) -> Mapping[str, Any]:
         state = self.state(task_id)
         return _load_json(self._coordinator(task_id).batch_path(task_id, int(state.get("iteration", 0)), purpose), "remote batch")
+
+    def _prepare_generated_code_review_fixtures(
+        self,
+        task_id: str,
+        *,
+        design: Mapping[str, Any],
+        cases: Sequence[Mapping[str, Any]],
+    ) -> tuple[list[dict[str, Any]], Mapping[str, Any]]:
+        """Create missing per-Case PR branches before the first CATX batch.
+
+        Existing Fixture Lab bindings remain authoritative.  Cases without a
+        binding are sent to the configured local model, which returns a
+        bounded source patch; the patch is committed in an isolated worktree
+        and pushed to the configured origin.  The active design is updated as
+        an auditable read pointer, while the approved design file stays
+        immutable.
+        """
+
+        config = self._config(task_id)
+        code_repo = config.code_repository
+        if code_repo is None or not code_repo.local_path:
+            raise IterationKernelError("code-review fixture generation requires a local code repository checkout")
+        missing = []
+        prepared = [dict(item) for item in cases]
+        flow_id = str(self.state(task_id).get("evaluation_flow_id") or "")
+        for case in prepared:
+            metadata = case.get("metadata", {}) if isinstance(case.get("metadata"), Mapping) else {}
+            # A complete binding from a previous task is intentionally not
+            # reusable.  Only the exact branch generated for this flow and
+            # iteration may be used; optimization rounds keep that binding
+            # frozen by carrying the same fixture_flow_id forward.
+            if (
+                metadata.get("fixture_flow_id") != flow_id
+                or not all(str(metadata.get(key) or "").strip() for key in ("fixture_branch", "base_commit", "head_commit"))
+            ):
+                missing.append(case)
+        if not missing:
+            return prepared, dict(design.get("fixture_summary") or {})
+
+        state = self.state(task_id)
+        iteration_root = self.store.task_dir(task_id) / "iterations" / ("iteration-%03d" % int(state.get("iteration", 0)))
+        artifact_root = iteration_root / "planning" / "code-review-fixtures"
+        self.store.append_event(
+            task_id,
+            "evaluation.fixture_generation_started",
+            {
+                "api_version": FIXTURE_GENERATION_API_VERSION,
+                "provider": "cc-switch",
+                "model_id": config.local_analysis.model_id,
+                "case_count": len(missing),
+                "case_ids": [str(item.get("id") or "") for item in missing],
+                "repository": str(code_repo.local_path),
+            },
+            iteration=int(state.get("iteration", 0)),
+        )
+        for case in missing:
+            self.store.append_event(
+                task_id,
+                "evaluation.fixture_case_generation_started",
+                {
+                    "api_version": FIXTURE_GENERATION_API_VERSION,
+                    "provider": "cc-switch",
+                    "model_id": config.local_analysis.model_id,
+                    "case_id": str(case.get("id") or ""),
+                    "message": "正在读取 Skill 与代码仓库快照并生成最小 PR 改动",
+                },
+                iteration=int(state.get("iteration", 0)),
+                case_id=str(case.get("id") or ""),
+            )
+        try:
+            skill_text = _skill_file(str(config.skill_repository.local_path)).read_text(encoding="utf-8")
+            generated = generate_code_review_fixtures(
+                self.model_factory(config),
+                repository=str(code_repo.local_path),
+                skill_text=skill_text,
+                cases=missing,
+                output_root=artifact_root,
+                branch_prefix="aceval/eval/%s/case" % (flow_id or uuid.uuid4().hex),
+                base_ref=code_repo.branch,
+                push=True,
+                evaluation_flow_id=flow_id,
+            )
+        except Exception as exc:
+            self.store.append_event(
+                task_id,
+                "evaluation.fixture_generation_failed",
+                {"api_version": FIXTURE_GENERATION_API_VERSION, "case_ids": [str(item.get("id") or "") for item in missing], "error": str(exc)},
+                iteration=int(state.get("iteration", 0)),
+            )
+            raise IterationKernelError("代码评审测试分支生成失败：%s" % exc) from exc
+        by_case = {item.case_id: item for item in generated}
+        records = []
+        for case in prepared:
+            case_id = str(case.get("id") or "")
+            fixture = by_case.get(case_id)
+            if fixture is None:
+                continue
+            metadata = dict(case.get("metadata", {})) if isinstance(case.get("metadata"), Mapping) else {}
+            metadata.update({
+                "fixture_branch": fixture.branch,
+                "base_ref": fixture.base_ref,
+                "head_ref": fixture.branch,
+                "base_commit": fixture.base_commit,
+                "head_commit": fixture.head_commit,
+                "fixture_revision": fixture.head_commit,
+                "fixture_status": "ready",
+                "fixture_flow_id": flow_id,
+                "fixture_generation": fixture.to_dict(),
+            })
+            case["metadata"] = metadata
+            record = fixture.to_dict()
+            records.append(record)
+            self.store.append_event(
+                task_id,
+                "evaluation.fixture_case_generation_completed",
+                record,
+                iteration=int(state.get("iteration", 0)),
+                case_id=case_id,
+            )
+        summary = {
+            "mode": "per_case_pr",
+            "source": "local_model_generated",
+            "case_count": len(prepared),
+            "ready_case_ids": [str(item.get("id") or "") for item in prepared if (item.get("metadata") or {}).get("fixture_status") == "ready"],
+            "missing_case_ids": [str(item.get("id") or "") for item in prepared if (item.get("metadata") or {}).get("fixture_status") != "ready"],
+            "generated_case_ids": [str(item.get("case_id") or "") for item in records],
+            "fixtures": records,
+        }
+        active_design = dict(design)
+        all_design_cases = [dict(item) for item in design.get("cases", ()) if isinstance(item, Mapping)]
+        prepared_by_id = {str(item.get("id") or ""): item for item in prepared}
+        active_design["cases"] = [prepared_by_id.get(str(item.get("id") or ""), item) for item in all_design_cases]
+        active_design["fixture_summary"] = summary
+        _atomic_json(self._kernel_dir(task_id) / "active-design.json", active_design)
+        task = self.store.load(task_id)
+        evaluation = dict(task.get("evaluation", {}))
+        evaluation["cases"] = active_design["cases"]
+        self.store.update(task_id, evaluation=evaluation)
+        self.store.append_event(
+            task_id,
+            "evaluation.fixture_generation_completed",
+            {"api_version": FIXTURE_GENERATION_API_VERSION, "case_count": len(prepared), "generated_case_count": len(records), "ready_case_ids": summary["ready_case_ids"], "missing_case_ids": summary["missing_case_ids"]},
+            iteration=int(state.get("iteration", 0)),
+        )
+        return prepared, summary
 
     def analyze(self, task_id: str) -> Mapping[str, Any]:
         config = self._config(task_id)
@@ -1796,19 +2279,31 @@ class IterationKernel:
             "semantic_grading",
             "attribution",
             "proposal",
+            "needs_evidence",
         ):
             raise IterationKernelError("analysis requires a fully collected remote batch")
         if config.analysis_executor and config.analysis_executor.provider != "local-forge":
             raise IterationKernelError("analysis_executor provider is unsupported; P0 only supports local-forge")
         design = self._design(task_id)
         approved_case_ids = set(str(item) for item in state.get("approved_case_ids", ()) if str(item))
+        # Analyze only Cases that actually belong to this immutable primary
+        # batch.  After two stable rounds a retired Case is intentionally not
+        # dispatched again; pulling it into the next analysis from the design
+        # would fabricate a missing Attempt/evidence gap.  Its prior verdict
+        # remains visible through the stability/regression-protection fields.
+        primary_case_ids = set()
+        primary_probe = self._batch(task_id, "evaluation")
+        for row in primary_probe.get("cases", ()) if isinstance(primary_probe, Mapping) else ():
+            if isinstance(row, Mapping) and row.get("case_id"):
+                primary_case_ids.add(str(row.get("case_id")))
         analysis_cases = tuple(
             item
             for item in design.get("cases", ())
             if isinstance(item, Mapping)
             and (not approved_case_ids or str(item.get("id")) in approved_case_ids)
+            and (not primary_case_ids or str(item.get("id")) in primary_case_ids)
         )
-        primary = self._batch(task_id, "evaluation")
+        primary = primary_probe
         verification_path = self._coordinator(task_id).batch_path(task_id, int(state.get("iteration", 0)), "pass-verification")
         verification = None
         if verification_path.is_file():
@@ -1845,9 +2340,34 @@ class IterationKernel:
             for item in selected_file_plan(blueprint):
                 if item.get("action") == "create" and item.get("path") not in resource_inventory:
                     resource_inventory.append(str(item.get("path")))
+        # Cross-Case diagnosis must be grounded in the Skill that was actually
+        # evaluated.  Previously attribution/proposal only received Case
+        # metadata and logs, so the local model could not tell whether a
+        # failure was caused by an omitted instruction, an Agent execution
+        # deviation, or an external tool.  Send bounded text snapshots of the
+        # editable resources; the immutable repository remains the source of
+        # truth and the optimizer still performs its own full-tree validation.
+        skill_resources = {}
+        for relative in resource_inventory:
+            path = skill_root / str(relative)
+            if not path.is_file() or path.is_symlink():
+                continue
+            try:
+                content = path.read_text(encoding="utf-8")
+            except (OSError, UnicodeError):
+                continue
+            skill_resources[str(relative)] = content[:16_000]
+        entrypoint = _optional_skill_file(str(config.skill_repository.local_path))
+        if entrypoint is not None:
+            relative_entry = entrypoint.relative_to(skill_root).as_posix()
+            if relative_entry not in skill_resources:
+                try:
+                    skill_resources[relative_entry] = entrypoint.read_text(encoding="utf-8")[:24_000]
+                except (OSError, UnicodeError):
+                    pass
         iteration_artifacts = self.store.task_dir(task_id) / "iterations" / ("iteration-%03d" % int(state.get("iteration", 0))) / "analysis"
         self._transition(task_id, "evidence_ready", evidence_bundle=str(iteration_artifacts / "evidence-bundle.json"))
-        decision = dict(IterationBrain(
+        brain = IterationBrain(
             model,
             iteration_artifacts,
             provider=(config.analysis_executor.provider if config.analysis_executor else "local-forge"),
@@ -1857,21 +2377,43 @@ class IterationKernel:
             max_evidence_chars_per_case=config.policy.max_analysis_evidence_chars_per_case,
             required_k=1 + int(config.policy.pass_verification_runs),
             stage_callback=lambda stage: self._transition(task_id, stage, brain_stage=stage),
-        ).analyze(
-            task_id=task_id,
-            iteration=int(state.get("iteration", 0)),
-            goal=str(design.get("goal") or user_input.effective_goal),
-            standards=tuple(str(item) for item in design.get("standards", user_input.effective_standards)),
-            cases=analysis_cases,
-            primary_batch=primary,
-            path_specs=design.get("execution_paths", {}),
-            verification_batch=verification,
-            comparison_baseline_batch=comparison_baseline,
-            capability_summary=graph,
-            editable_resource_inventory=resource_inventory,
-            evalpack_ref=design.get("evalpack_ref"),
-            comparison_context_hash=paired_context_hash,
-        ))
+        )
+        try:
+            decision = dict(brain.analyze(
+                task_id=task_id,
+                iteration=int(state.get("iteration", 0)),
+                goal=str(design.get("goal") or user_input.effective_goal),
+                standards=tuple(str(item) for item in design.get("standards", user_input.effective_standards)),
+                cases=analysis_cases,
+                primary_batch=primary,
+                path_specs=design.get("execution_paths", {}),
+                verification_batch=verification,
+                comparison_baseline_batch=comparison_baseline,
+                capability_summary=graph,
+                editable_resource_inventory=resource_inventory,
+                skill_resources=skill_resources,
+                evalpack_ref=design.get("evalpack_ref"),
+                comparison_context_hash=paired_context_hash,
+            ))
+        except Exception as exc:
+            # A transient local-model failure (rate limit, bridge restart, or
+            # malformed model response) must not strand the task in a brain
+            # stage.  Remote evidence is already immutable; return to the
+            # collected gate so the next automatic run retries Claude.
+            self.store.append_event(
+                task_id,
+                "analysis.failed",
+                {
+                    "stage": self.state(task_id).get("brain_stage") or "unknown",
+                    "error": str(exc)[:1000],
+                    "retryable": True,
+                    "evidence_preserved": True,
+                },
+                iteration=int(state.get("iteration", 0)),
+            )
+            self.store.update(task_id, status="running")
+            self._transition(task_id, "remote_collected", active_batch=None, brain_stage=None)
+            raise
         case_count = max(1, len(analysis_cases))
         score = len(decision["stable_pass_case_ids"]) / case_count
         prior_decisions = []
@@ -1894,6 +2436,24 @@ class IterationKernel:
         decision["round_number"] = int(state.get("iteration", 0)) + 1
         decision["evaluation_design_hash"] = contract_hash(design)
         decision["comparison_context_hash"] = paired_context_hash
+
+        # Reliability is tracked per Case across optimization rounds. A Case
+        # that has passed the primary run plus its verification in two
+        # consecutive rounds becomes retired for *future* rounds; its
+        # immutable branch/revision stays in the design and is listed as a
+        # regression-protection Case. Any failure resets its streak.
+        current_stable = {str(item) for item in decision.get("stable_pass_case_ids", ()) if str(item)}
+        prior_streaks = dict(state.get("case_stability_rounds", {})) if isinstance(state.get("case_stability_rounds"), Mapping) else {}
+        streaks: dict[str, int] = {}
+        for case in design.get("cases", ()) if isinstance(design.get("cases"), list) else ():
+            case_id = str(case.get("id") or "") if isinstance(case, Mapping) else ""
+            if not case_id:
+                continue
+            streaks[case_id] = int(prior_streaks.get(case_id, 0) or 0) + 1 if case_id in current_stable else 0
+        retired = sorted({str(item) for item in state.get("retired_case_ids", ()) if str(item)} | {case_id for case_id, count in streaks.items() if count >= 2})
+        decision["case_stability_rounds"] = streaks
+        decision["retired_case_ids"] = retired
+        decision["regression_protection_case_ids"] = sorted(set(retired) | current_stable)
 
         comparison = None
         challenger_commit = state.get("challenger_commit")
@@ -2011,6 +2571,10 @@ class IterationKernel:
         decision["convergence"] = convergence
 
         transition_changes: dict[str, Any] = {}
+        transition_changes.update({
+            "case_stability_rounds": streaks,
+            "retired_case_ids": retired,
+        })
         if isinstance(comparison, Mapping):
             if comparison.get("accepted") is True:
                 transition_changes.update({
@@ -2152,6 +2716,8 @@ class IterationKernel:
                 blueprint_approved=False,
                 design_approved=False,
                 approved_case_ids=[],
+                retired_case_ids=[],
+                case_stability_rounds={},
                 active_batch=None,
                 brain_stage=None,
                 environment_contract=None,
@@ -2557,14 +3123,47 @@ class IterationKernel:
             FailureEvidence(
                 scenario_id=str(cluster.get("id") or "failure-cluster"),
                 grader_id="cross_case_analysis_v1",
-                summary=str(cluster.get("root_cause") or "failed case cluster"),
+                summary=str(cluster.get("root_cause_hypothesis") or cluster.get("root_cause") or cluster.get("problem") or "failed case cluster"),
                 evidence=(
-                    {"case_ids": list(cluster.get("case_ids", ())), "proposed_changes": decision.get("proposed_changes", ()), "conflicts": decision.get("conflicts", ()), "approved_target_scope": decision.get("target_scope", ()), "user_feedback": decision.get("user_feedback")},
+                    {
+                        "case_ids": list(cluster.get("case_ids", ())),
+                        "proposed_changes": decision.get("proposed_changes", ()),
+                        "conflicts": decision.get("conflicts", ()),
+                        "approved_target_scope": decision.get("target_scope", ()),
+                        "user_feedback": decision.get("user_feedback"),
+                        "case_assessments": decision.get("case_assessments", ()),
+                        "overall_assessment": decision.get("overall_assessment", {}),
+                        "diagnosis_graph": decision.get("diagnosis_graph", {}),
+                    },
                 ),
             )
             for cluster in decision.get("failure_clusters", ())
             if isinstance(cluster, Mapping) and cluster.get("skill_change_authorized", True)
         )
+        # The approved overlay is the user's explicit authorization boundary.
+        # Older analysis artifacts may contain valid proposed_changes while a
+        # model omitted the redundant cluster-level authorization flag. Do not
+        # discard the approved proposal in that compatibility case.
+        if not failures and decision.get("proposed_changes"):
+            failures = (FailureEvidence(
+                scenario_id="approved-skill-change",
+                grader_id="cross_case_analysis_v1",
+                summary="用户已确认的跨 Case Skill 优化建议",
+                evidence=({
+                    "case_ids": sorted({
+                        str(case_id)
+                        for change in decision.get("proposed_changes", ())
+                        if isinstance(change, Mapping)
+                        for case_id in change.get("case_ids", ())
+                    }),
+                    "proposed_changes": decision.get("proposed_changes", ()),
+                    "approved_target_scope": decision.get("target_scope", ()),
+                    "user_feedback": decision.get("user_feedback"),
+                    "case_assessments": decision.get("case_assessments", ()),
+                    "overall_assessment": decision.get("overall_assessment", {}),
+                    "diagnosis_graph": decision.get("diagnosis_graph", {}),
+                },),
+            ),)
         if not failures:
             raise IterationKernelError("analysis did not authorize a Skill change")
         output = self.store.task_dir(task_id) / "iterations" / ("iteration-%03d" % int(state.get("iteration", 0))) / "candidates"

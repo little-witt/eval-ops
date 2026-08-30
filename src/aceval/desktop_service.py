@@ -117,6 +117,10 @@ class DesktopService:
         self.executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="aceval-desktop")
         self.operations: dict[str, dict[str, Any]] = {}
         self.task_operations: dict[str, str] = {}
+        # Keep the terminal operation receipt visible after the worker leaves
+        # the active-operation map.  Without this, a failed one-button run
+        # looked like a no-op once its background thread exited.
+        self.task_last_operations: dict[str, dict[str, Any]] = {}
         self.lock = threading.RLock()
 
     def _local_analysis(self, raw: Any) -> Mapping[str, Any]:
@@ -133,7 +137,11 @@ class DesktopService:
             )
             timeout = int(raw.get("timeout_seconds", 180))
             command = [sys.executable, "--claude-bridge"] if getattr(sys, "frozen", False) else [sys.executable, "-m", "aceval.claude_bridge"]
-            command.extend(["--profile", str(self.claude_profiles.profile_path), "--model", selected["model"], "--effort", selected["effort"], "--timeout-seconds", str(timeout)])
+            # max_output_chars is a user-facing character budget.  Reserve a
+            # bounded JSON response budget in tokens; do not let the bridge
+            # ask Claude for 24k output tokens on every small analysis stage.
+            output_tokens = max(512, min(8192, int(raw.get("max_output_chars", 24_000)) // 4))
+            command.extend(["--profile", str(self.claude_profiles.profile_path), "--model", selected["model"], "--effort", selected["effort"], "--timeout-seconds", str(timeout), "--max-output-tokens", str(output_tokens)])
             return {
                 "model_command": command,
                 "model_id": "claude:%s" % selected["model"],
@@ -206,9 +214,13 @@ class DesktopService:
                 result = _json_clone(action())
                 with self.lock:
                     operation.update({"status": "completed", "result": result, "updated_at": _now()})
+                    if task_id:
+                        self.task_last_operations[task_id] = dict(operation)
             except Exception as exc:
                 with self.lock:
                     operation.update({"status": "failed", "error": str(exc), "updated_at": _now()})
+                    if task_id:
+                        self.task_last_operations[task_id] = dict(operation)
             finally:
                 with self.lock:
                     if task_id and self.task_operations.get(task_id) == operation_id:
@@ -240,6 +252,7 @@ class DesktopService:
             with self.lock:
                 operation_id = self.task_operations.get(str(item["id"]))
                 row["active_operation"] = dict(self.operations[operation_id]) if operation_id in self.operations else None
+                row["last_operation"] = dict(self.task_last_operations.get(str(item["id"]))) if str(item["id"]) in self.task_last_operations else None
             result.append(row)
         return result
 
@@ -382,6 +395,20 @@ class DesktopService:
                     task_id=task_id,
                 ),
             }
+        if method == "tasks.retry_evidence":
+            task_id = str(params.get("task_id") or "")
+            result = self.kernel.retry_evidence(task_id)
+            # This action deliberately re-enters local analysis only.  Starting
+            # ``run_until_gate`` here could see a provisional ``verify_passes``
+            # result and silently create a new remote verification Session,
+            # defeating the evidence-preserving contract.
+            return {
+                "retry": result,
+                "operation": None,
+            }
+        if method == "tasks.reopen_case_review":
+            task_id = str(params.get("task_id") or "")
+            return self.kernel.reopen_case_review(task_id)
         if method == "tasks.confirm":
             task_id = str(params.get("task_id") or "")
             supplement = KernelInput.from_mapping(params["supplement"]) if params.get("supplement") is not None else None

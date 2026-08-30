@@ -287,17 +287,18 @@ class SkillTreeOptimizer:
         }
         if len(scope) == 1 and scope[0] in ("SKILL.md", "src/SKILL.md") and scope[0] in current_files:
             request["current_skill"] = current_files[scope[0]]
+        system_prompt = (
+            "Repair, tune, or extend the Agent Skill using only supplied evidence and approved files. "
+            "Return strict JSON with a NON-EMPTY `changes` array (or `skill_markdown` only for a single SKILL.md target). "
+            "Each changes item must be an executable replace_text/create_file operation; do not return proposed_changes, "
+            "an empty array, a prose-only plan, or a rationale without edits. Use the smallest exact replace_text edits; "
+            "old_text must occur exactly once. Do not emit whole unchanged files, case IDs, fixture literals, grader internals, "
+            "or hidden data. Only create files explicitly listed in approved_create_paths. Never delete, rename, or edit "
+            "paths outside approved_target_scope."
+        )
         reply = self._model.complete(
             [
-                {
-                    "role": "system",
-                    "content": (
-                        "Repair, tune, or extend the Agent Skill using only supplied evidence and approved files. "
-                        "Return strict JSON. Use the smallest exact replace_text edits; old_text must occur exactly once. "
-                        "Do not emit whole unchanged files, case IDs, fixture literals, grader internals, hidden data, "
-                        "Only create files explicitly listed in approved_create_paths. Never delete, rename, or edit paths outside approved_target_scope."
-                    ),
-                },
+                {"role": "system", "content": system_prompt},
                 {"role": "user", "content": json.dumps(request, ensure_ascii=False)},
             ],
             (),
@@ -316,6 +317,38 @@ class SkillTreeOptimizer:
             changes = payload.get("changes")
         else:
             changes = None
+        # The analysis stage uses a different ``proposed_changes`` shape. A
+        # local model can accidentally echo that plan here instead of
+        # producing executable edits. Give it one narrowly-scoped repair turn
+        # before failing, rather than surfacing the opaque empty-array error.
+        if not isinstance(changes, list) or not changes:
+            repair_request = dict(request)
+            repair_request["previous_response"] = payload if isinstance(payload, Mapping) else str(reply.content)[:4000]
+            repair_request["repair_instruction"] = (
+                "上一次输出不是可执行编辑。请仅返回一个 JSON 对象：changes 必须是非空数组；"
+                "每项使用 approved_target_scope 内的 replace_text（提供唯一 old_text/new_text）或允许的 create_file。"
+            )
+            repair_reply = self._model.complete(
+                [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": json.dumps(repair_request, ensure_ascii=False)},
+                ],
+                (),
+            )
+            if repair_reply.tool_calls:
+                raise CandidateRejected("optimizer may not call tools", repair_reply.usage)
+            try:
+                repair_payload = json.loads(repair_reply.content)
+            except json.JSONDecodeError as exc:
+                raise CandidateRejected("optimizer returned invalid repair JSON", repair_reply.usage) from exc
+            payload = repair_payload
+            if isinstance(payload, Mapping) and isinstance(payload.get("skill_markdown"), str) and len(scope) == 1 and scope[0] in current_files:
+                changes = [{"path": scope[0], "operation": "replace_text", "old_text": current_files[scope[0]], "new_text": payload["skill_markdown"], "reason": payload.get("rationale", "")}]
+            elif isinstance(payload, Mapping):
+                changes = payload.get("changes")
+            else:
+                changes = None
+            reply = repair_reply
         if not isinstance(changes, list) or not changes or any(not isinstance(item, Mapping) for item in changes):
             raise CandidateRejected("optimizer changes must be a non-empty array", reply.usage)
         try:

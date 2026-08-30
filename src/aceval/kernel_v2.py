@@ -267,15 +267,38 @@ def _validity(evidence: Mapping[str, Any]) -> EvidenceValidity:
     refs = tuple(str(item) for item in (evidence.get("artifact"),) if item)
     reasons = []
     missing = []
+    partial = []
+    trace = evidence.get("trace") if isinstance(evidence.get("trace"), Mapping) else {}
+    # A remote terminal/error flag can be emitted after the Agent already
+    # fetched the Case branch, mounted the Skill and produced a complete
+    # review trace.  That is an analyzable execution outcome (often an
+    # Agent/tool failure), not an evidence gap that should force a replay.
+    execution_observed = (
+        evidence.get("trace_complete") is True
+        and int(trace.get("event_count") or 0) > 0
+        and int(evidence.get("output_chars") or 0) > 0
+    )
     if not evidence.get("artifact"):
         reasons.append("attempt.artifact_missing")
         missing.append("session_artifact")
     if evidence.get("run_status") != "completed":
-        reasons.append("attempt.remote_not_completed")
+        if execution_observed:
+            partial.append("attempt.remote_not_completed_after_trace")
+        else:
+            reasons.append("attempt.remote_not_completed")
     if evidence.get("error"):
-        reasons.append("attempt.runtime_error")
+        if execution_observed:
+            partial.append("attempt.runtime_error_after_trace")
+        else:
+            reasons.append("attempt.runtime_error")
+    binding_status = evidence.get("binding_status")
+    if binding_status == "failed":
+        reasons.append("attempt.case_session_binding_failed")
+        missing.append("repository_binding")
+    elif binding_status == "pending":
+        partial.append("attempt.case_session_binding_pending")
+        missing.append("repository_binding")
     completeness = evidence.get("log_completeness")
-    partial = []
     if isinstance(completeness, Mapping):
         completeness_reasons = [str(item) for item in completeness.get("reason_codes", ()) if item]
         complete_flag = completeness.get("complete")
@@ -314,7 +337,15 @@ def _validity(evidence: Mapping[str, Any]) -> EvidenceValidity:
             partial.append("attempt.legacy_event_log")
             missing.append("immutable_event_log")
     path = evidence.get("path_conformance")
-    if isinstance(path, Mapping) and path.get("status") == "not_evaluable":
+    if (
+        isinstance(path, Mapping)
+        and path.get("status") == "not_evaluable"
+        # A native V3 path evaluator may be unavailable while the session
+        # itself is complete. That is an analysis capability gap, not missing
+        # execution evidence; keep the Case scoreable and surface the
+        # procedure dimension as an explicit limitation.
+        and evidence.get("trace_complete") is not True
+    ):
         partial.append("attempt.trace_incomplete")
         missing.append("trace")
     return EvidenceValidity(
@@ -343,6 +374,56 @@ def _has_grounded_reference(refs: Sequence[str], artifact_refs: Sequence[str]) -
             if anchor and (value == anchor or value.startswith(anchor + "#")):
                 return True
     return False
+
+
+def _bounded_text(value: Any, limit: int = 320) -> str:
+    """Return a compact, single-line excerpt suitable for a dimension reason."""
+
+    if value is None:
+        return ""
+    text = str(value).replace("\r", " ").replace("\n", " ").strip()
+    return text if len(text) <= limit else text[:limit] + "…"
+
+
+def _path_reason(path: Mapping[str, Any]) -> str:
+    """Explain exactly which execution-path checks failed.
+
+    ``evaluate_trace_conformance`` intentionally keeps its core result small
+    and stores details in ``steps``/``violations``.  The old caller displayed
+    only ``path.reason`` (which is normally null for a failed path), making a
+    hard procedure score look unexplained.  Build the human-readable reason at
+    the decision boundary while retaining the raw path receipt as evidence.
+    """
+
+    violations = path.get("violations") if isinstance(path.get("violations"), Sequence) else ()
+    steps = path.get("steps") if isinstance(path.get("steps"), Sequence) else ()
+    labels = {
+        str(item.get("id")): str(item.get("label") or item.get("id"))
+        for item in steps
+        if isinstance(item, Mapping) and item.get("id")
+    }
+    details = []
+    for violation in violations:
+        if not isinstance(violation, Mapping):
+            continue
+        kind = str(violation.get("type") or "path_violation")
+        step_id = str(violation.get("step_id") or "")
+        label = labels.get(step_id, step_id or "未知步骤")
+        if kind == "missing_required":
+            details.append("缺少必须步骤「%s」" % label)
+        elif kind == "forbidden_observed":
+            details.append("发生禁止步骤「%s」（Trace[%s]）" % (label, violation.get("event_index", "?")))
+        elif kind == "ordering":
+            details.append("步骤「%s」未按要求位于「%s」之后" % (label, labels.get(str(violation.get("after")), str(violation.get("after")))))
+        elif kind == "missing_predecessor":
+            details.append("步骤「%s」缺少前置步骤「%s」" % (label, labels.get(str(violation.get("after")), str(violation.get("after")))))
+        elif kind == "missing_alternative":
+            details.append("允许替代组「%s」没有观察到任何合法步骤" % str(violation.get("group") or "未命名"))
+        else:
+            details.append("步骤「%s」违反路径约束" % label)
+    if details:
+        return "；".join(details[:6])
+    return _bounded_text(path.get("reason") or "执行路径没有通过，但未记录具体违规项")
 
 
 def build_attempt_verdict(
@@ -482,9 +563,22 @@ def build_attempt_verdict(
                     mark_formal_contract_error("formal EvalPack Grader result is invalid: %s" % str(exc)[:300])
                     break
         elif not formal_declared and exact is True:
-            dimensions.append(DimensionGrade("outcome", "pass", 1.0, True, "exact_expected/v1", reason, refs or artifact_refs))
+            dimensions.append(DimensionGrade("outcome", "pass", 1.0, True, "exact_expected/v1", "输出与用户确认的期望结果一致。实际输出：%s" % _bounded_text(evidence.get("output_excerpt") or "（空）"), refs or artifact_refs))
         elif not formal_declared and exact is False:
-            dimensions.append(DimensionGrade("outcome", "fail", 0.0, True, "exact_expected/v1", reason, refs or artifact_refs))
+            expected = case.get("expected_output")
+            expected_text = json.dumps(expected, ensure_ascii=False, sort_keys=True, default=str) if not isinstance(expected, str) else expected
+            dimensions.append(DimensionGrade(
+                "outcome",
+                "fail",
+                0.0,
+                True,
+                "exact_expected/v1",
+                "输出与用户确认的期望结果不一致。期望：%s；实际输出：%s" % (
+                    _bounded_text(expected_text),
+                    _bounded_text(evidence.get("output_excerpt") or "（空）"),
+                ),
+                refs or artifact_refs,
+            ))
         elif not formal_declared and result_status in _STATUSES:
             dimensions.append(DimensionGrade(
                 "outcome",
@@ -527,26 +621,48 @@ def build_attempt_verdict(
             and not has_formal_grades
             and not exploratory_oracle
         )
+        execution_observed = (
+            evidence.get("trace_complete") is True
+            and int(evidence.get("output_chars") or 0) > 0
+        )
+        grounding_status = "pass" if grounded else "fail" if execution_observed else "not_evaluable"
+        grounding_score = 1.0 if grounded else 0.0 if execution_observed else None
         dimensions.append(DimensionGrade(
             "grounding",
-            "pass" if grounded else "not_evaluable",
-            1.0 if grounded else None,
+            grounding_status,
+            grounding_score,
             grounding_hard,
             "evidence_reference/v1",
-            "result is linked to this immutable attempt" if grounded else "semantic result did not cite this attempt's immutable evidence",
+            (
+                "结果已绑定本次不可变会话证据（引用：%s）" % "、".join(refs or artifact_refs)
+                if grounded
+                else "语义结果未引用本次不可变会话证据；已收到输出/Trace，但没有可追溯引用"
+            ),
             refs or artifact_refs,
         ))
         trace_summary = evidence.get("trace")
         if isinstance(trace_summary, Mapping):
             runtime_errors = trace_summary.get("errors", ())
-            has_runtime_errors = isinstance(runtime_errors, Sequence) and not isinstance(runtime_errors, (str, bytes)) and bool(runtime_errors)
+            has_runtime_errors = (
+                isinstance(runtime_errors, Sequence)
+                and not isinstance(runtime_errors, (str, bytes))
+                and bool(runtime_errors)
+            ) or bool(evidence.get("error"))
             dimensions.append(DimensionGrade(
                 "runtime",
                 "fail" if has_runtime_errors else "pass",
                 0.0 if has_runtime_errors else 1.0,
                 False,
                 "trace_runtime_errors/v1",
-                "tool/runtime errors were observed" if has_runtime_errors else "no tool/runtime error was observed in the complete trace",
+                (
+                    "Trace 观察到运行时/工具错误：%s" % "；".join(
+                        _bounded_text(item.get("error"), 220)
+                        for item in runtime_errors
+                        if isinstance(item, Mapping) and item.get("error")
+                    )
+                    if has_runtime_errors
+                    else "完整 Trace 中未观察到工具或运行时错误（共 %s 个事件）" % trace_summary.get("event_count", 0)
+                ),
                 artifact_refs,
             ))
         token_budget = metadata.get("max_total_tokens")
@@ -560,7 +676,7 @@ def build_attempt_verdict(
                 max(0.0, min(1.0, 1.0 - max(0.0, float(total_tokens) - float(token_budget)) / float(token_budget))),
                 False,
                 "token_budget/v1",
-                "used %s tokens against a %s token budget" % (total_tokens, token_budget),
+                "实际使用 %s tokens；预算 %s tokens，%s" % (total_tokens, token_budget, "未超预算" if efficient else "超过预算"),
                 artifact_refs,
             ))
         path = evidence.get("path_conformance")
@@ -576,15 +692,26 @@ def build_attempt_verdict(
                     None if path_status == "not_evaluable" else max(0.0, min(1.0, float(raw_coverage))),
                     path_status == "fail",
                     "semantic_execution_path/v1",
-                    str(path.get("reason") or "semantic path conformance"),
-                    refs,
+                    _path_reason(path) if path_status == "fail" else _bounded_text(path.get("reason") or "执行路径中的必须步骤均已观察到"),
+                    tuple(
+                        "%s#trace[%s]" % (artifact_refs[0], index)
+                        for step in (path.get("steps") or ())
+                        if isinstance(step, Mapping)
+                        for index in (step.get("evidence_event_indexes") or ())
+                        if artifact_refs
+                    ) or refs or artifact_refs,
                 ))
         status = result_status if result_status in _STATUSES else "not_evaluable"
         if any(item.hard and item.status == "fail" for item in dimensions):
             status = "fail"
         elif any(item.hard and item.status == "not_evaluable" for item in dimensions):
             status = "not_evaluable"
-        elif validity.status != "valid":
+        # ``partial`` evidence remains evaluable: it records a terminal or
+        # runtime anomaly after a complete trace, which is precisely the
+        # execution effect the analysis phase must attribute.  Only an
+        # ``invalid`` attempt (missing/contradictory immutable evidence)
+        # forces the aggregate into ``not_evaluable``.
+        elif not validity.evaluable:
             status = "not_evaluable"
     else:
         status = "not_evaluable"
@@ -669,34 +796,121 @@ def compile_diagnosis_graph(
 ) -> Mapping[str, Any]:
     """Build a stable evidence-first graph; model clusters remain inferences."""
 
+    def case_evidence_refs(item: Mapping[str, Any]) -> list[str]:
+        refs = [str(ref) for ref in item.get("evidence_refs", ()) if str(ref)]
+        for dimension in item.get("dimension_summaries", ()) if isinstance(item.get("dimension_summaries"), Sequence) else ():
+            if isinstance(dimension, Mapping):
+                refs.extend(str(ref) for ref in dimension.get("evidence_refs", ()) if str(ref))
+        for attempt in item.get("attempts", ()) if isinstance(item.get("attempts"), Sequence) else ():
+            if not isinstance(attempt, Mapping):
+                continue
+            for dimension in attempt.get("dimensions", ()) if isinstance(attempt.get("dimensions"), Sequence) else ():
+                if isinstance(dimension, Mapping):
+                    refs.extend(str(ref) for ref in dimension.get("evidence_refs", ()) if str(ref))
+        return list(dict.fromkeys(refs))[:12]
+
+    def failure_dimensions(item: Mapping[str, Any]) -> list[Mapping[str, Any]]:
+        source = item.get("dimension_summaries")
+        if not isinstance(source, Sequence) or isinstance(source, (str, bytes)):
+            source = [
+                dimension
+                for attempt in item.get("attempts", ()) if isinstance(attempt, Mapping)
+                for dimension in attempt.get("dimensions", ()) if isinstance(dimension, Mapping)
+            ]
+        result = []
+        seen = set()
+        for dimension in source:
+            if not isinstance(dimension, Mapping):
+                continue
+            status = str(dimension.get("status") or "not_evaluable")
+            if status not in ("fail", "not_evaluable"):
+                continue
+            name = str(dimension.get("dimension") or "unknown")
+            if name in seen:
+                continue
+            seen.add(name)
+            result.append({
+                "dimension": name,
+                "label": str(dimension.get("label") or name.replace("_", " ")),
+                "status": status,
+                "score": dimension.get("score"),
+                "hard": dimension.get("hard") is True,
+                "reason": str(dimension.get("reason") or dimension.get("evidence_detail") or "该维度未达到通过标准"),
+                "evidence_detail": str(dimension.get("evidence_detail") or ""),
+                "evidence_refs": [str(ref) for ref in dimension.get("evidence_refs", ()) if str(ref)],
+            })
+        return result
+
+    def fact_for(item: Mapping[str, Any]) -> Mapping[str, Any]:
+        dimensions = failure_dimensions(item)
+        missing = [
+            str(value)
+            for value in (item.get("goal_observations", {}) or {}).get("missing_requirements", ())
+            if str(value)
+        ] if isinstance(item.get("goal_observations"), Mapping) else []
+        fragments = []
+        for dimension in dimensions:
+            detail = dimension.get("evidence_detail") or dimension.get("reason")
+            score = dimension.get("score")
+            score_text = "" if score is None else "（评分 %.0f%%）" % (float(score) * 100)
+            fragments.append("%s%s：%s" % (dimension.get("label"), score_text, detail))
+        if missing:
+            fragments.append("目标未观察到：%s" % "、".join(missing[:5]))
+        summary = "；".join(fragment for fragment in fragments if fragment)
+        if not summary:
+            summary = str(item.get("reason") or "该 Case 未达到一个或多个评测目标")
+        return {
+            "case_id": str(item.get("case_id")),
+            "status": str(item.get("status") or "not_evaluable"),
+            "reason_code": _reason_code(item),
+            "reason": summary,
+            "failure_dimensions": dimensions,
+            "goal_gaps": missing,
+            "evidence_refs": case_evidence_refs(item),
+            "source": "fact",
+        }
+
     failed = [item for item in case_results if item.get("status") != "pass"]
     clusters = []
     assigned = set()
+    cluster_by_cases = {}
     for raw in failure_clusters:
         case_ids = tuple(sorted(str(item) for item in raw.get("case_ids", ()) if item))
         if not case_ids:
             continue
         assigned.update(case_ids)
+        cluster_key = tuple(case_ids)
         cluster_id = str(raw.get("id") or "cluster-" + canonical_hash(case_ids).split(":")[-1][:10])
-        facts = [
-            {
-                "case_id": str(item.get("case_id")),
-                "status": str(item.get("status")),
-                "reason_code": _reason_code(item),
-                "reason": str(item.get("reason") or ""),
-                "evidence_refs": list(item.get("evidence_refs", ())),
-                "source": "fact",
-            }
-            for item in failed if str(item.get("case_id")) in case_ids
-        ]
-        clusters.append({
+        facts = [fact_for(item) for item in failed if str(item.get("case_id")) in case_ids]
+        value = {
             "id": cluster_id,
             "case_ids": list(case_ids),
             "facts": facts,
-            "root_cause_hypothesis": str(raw.get("root_cause") or "unresolved"),
+            "root_cause_hypothesis": str(raw.get("root_cause_hypothesis") or raw.get("root_cause") or raw.get("hypothesis") or "unresolved"),
             "hypothesis_source": "inference",
             "skill_change_authorized": bool(raw.get("skill_change_authorized") is True and any(item["status"] == "fail" for item in facts)),
-        })
+            "responsibility": str(raw.get("responsibility") or raw.get("classification") or raw.get("cause_type") or ""),
+            "skill_factors": list(raw.get("skill_factors", ())) if isinstance(raw.get("skill_factors"), Sequence) and not isinstance(raw.get("skill_factors"), (str, bytes)) else [],
+            "agent_model_factors": list(raw.get("agent_model_factors", raw.get("model_factors", ()))) if isinstance(raw.get("agent_model_factors", raw.get("model_factors", ())), Sequence) and not isinstance(raw.get("agent_model_factors", raw.get("model_factors", ())), (str, bytes)) else [],
+            "environment_factors": list(raw.get("environment_factors", raw.get("tool_factors", ()))) if isinstance(raw.get("environment_factors", raw.get("tool_factors", ())), Sequence) and not isinstance(raw.get("environment_factors", raw.get("tool_factors", ())), (str, bytes)) else [],
+        }
+        existing = cluster_by_cases.get(cluster_key)
+        if existing is not None:
+            # Model attribution can emit the same Case set twice (for
+            # example once as a Skill issue and once as an evaluator issue).
+            # Merge those hypotheses into one evidence card instead of
+            # rendering duplicate blocks with identical facts.
+            hypotheses = [str(existing.get("root_cause_hypothesis") or ""), str(value.get("root_cause_hypothesis") or "")]
+            existing["root_cause_hypothesis"] = "；".join(dict.fromkeys(item for item in hypotheses if item and item != "unresolved")) or "unresolved"
+            existing["skill_change_authorized"] = bool(existing.get("skill_change_authorized") or value.get("skill_change_authorized"))
+            known = {str(item.get("case_id")): item for item in existing.get("facts", ()) if isinstance(item, Mapping)}
+            for fact in value.get("facts", ()):
+                if isinstance(fact, Mapping):
+                    known.setdefault(str(fact.get("case_id")), dict(fact))
+            existing["facts"] = list(known.values())
+        else:
+            clusters.append(value)
+            cluster_by_cases[cluster_key] = value
     for item in failed:
         case_id = str(item.get("case_id"))
         if case_id in assigned:
@@ -705,14 +919,7 @@ def compile_diagnosis_graph(
         clusters.append({
             "id": "signature-" + hashlib.sha256(signature.encode("utf-8")).hexdigest()[:12],
             "case_ids": [case_id],
-            "facts": [{
-                "case_id": case_id,
-                "status": str(item.get("status")),
-                "reason_code": signature,
-                "reason": str(item.get("reason") or ""),
-                "evidence_refs": list(item.get("evidence_refs", ())),
-                "source": "fact",
-            }],
+            "facts": [fact_for(item)],
             "root_cause_hypothesis": "unresolved",
             "hypothesis_source": "inference",
             "skill_change_authorized": False,
@@ -725,6 +932,8 @@ def compile_diagnosis_graph(
             "change": str(item.get("change") or ""),
             "why": str(item.get("why") or ""),
             "case_ids": list(item.get("case_ids", ())),
+            "target_guidance": str(item.get("target_guidance") or item.get("section") or ""),
+            "validation_steps": [str(step) for step in item.get("validation_steps", item.get("verification_steps", ())) if str(step)] if isinstance(item.get("validation_steps", item.get("verification_steps", ())), Sequence) and not isinstance(item.get("validation_steps", item.get("verification_steps", ())), (str, bytes)) else [],
             "source": "inference",
         })
     graph = {

@@ -2,7 +2,7 @@ const { contextBridge, ipcRenderer } = require("electron");
 
 const RPC_METHODS = new Set([
   "system.bootstrap", "tasks.list", "tasks.get", "tasks.events", "tasks.create",
-  "tasks.run", "tasks.restart", "tasks.confirm", "tasks.retry_failed", "tasks.log", "operations.get", "d2c.check", "d2c.validate",
+  "tasks.run", "tasks.restart", "tasks.confirm", "tasks.retry_failed", "tasks.retry_evidence", "tasks.reopen_case_review", "tasks.log", "operations.get", "d2c.check", "d2c.validate",
 ]);
 
 contextBridge.exposeInMainWorld("forge", Object.freeze({

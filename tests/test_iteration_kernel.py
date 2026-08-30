@@ -8,7 +8,7 @@ from pathlib import Path
 
 from aceval.agent_runtime import ModelReply
 from aceval.catx_bindings import CatxBindingEvidence
-from aceval.iteration_kernel import IterationKernel, IterationKernelError, _merge_model_path, _path_for_case
+from aceval.iteration_kernel import IterationKernel, IterationKernelError, _attach_code_review_fixtures, _merge_model_path, _path_for_case
 from aceval.kernel_contracts import KERNEL_CONFIG_API_VERSION, KERNEL_INPUT_API_VERSION, KernelConfig, KernelInput
 
 
@@ -246,6 +246,33 @@ Steps:
     def tearDown(self):
         self.temporary.cleanup()
 
+    def test_code_review_fixtures_are_bound_per_case_and_missing_cases_stay_blocked(self):
+        lab = self.root / "fixture-lab"
+        repository = lab / "repository"
+        repository.mkdir(parents=True)
+        (lab / "lab.json").write_text(
+            json.dumps({
+                "cases": [{
+                    "id": "bound",
+                    "base_ref": "base/main",
+                    "head_ref": "case/bound",
+                    "base_commit": "1" * 40,
+                    "head_commit": "2" * 40,
+                    "oracle": "cases/bound/oracle.json",
+                }]
+            }),
+            encoding="utf-8",
+        )
+        cases, summary = _attach_code_review_fixtures(
+            ({"id": "bound", "prompt": "Review"}, {"id": "missing", "prompt": "Review another"}),
+            code_root=str(repository),
+        )
+        self.assertEqual("ready", cases[0]["metadata"]["fixture_status"])
+        self.assertEqual("case/bound", cases[0]["metadata"]["fixture_branch"])
+        self.assertEqual("missing_pr_binding", cases[1]["metadata"]["fixture_status"])
+        self.assertEqual(["bound"], summary["ready_case_ids"])
+        self.assertEqual(["missing"], summary["missing_case_ids"])
+
     def test_model_path_cannot_remove_locked_skill_loading_or_publish_guards(self):
         case = {
             "id": "near-miss",
@@ -349,6 +376,33 @@ Steps:
                 purpose="pass-verification",
                 case_ids=decision["verification_required_case_ids"],
             )
+
+    def test_pre_session_contract_can_be_upgraded_with_generated_fixture_revisions(self):
+        task_id = "fixture-contract-upgrade"
+        self.kernel.create_task(self.config, self.user_input, task_id=task_id)
+        state = self.kernel.state(task_id)
+        original_design = {"cases": [{"id": "review-1", "case_revision": "revision-1"}]}
+        frozen = self.kernel._ensure_environment_contract(
+            task_id, design=original_design, state=state, iteration=0
+        )
+        upgraded_design = {
+            "cases": [{
+                "id": "review-1",
+                "case_revision": "revision-1",
+                "metadata": {"fixture_revision": "a" * 40},
+            }]
+        }
+        refreshed = self.kernel._ensure_environment_contract(
+            task_id,
+            design=upgraded_design,
+            state=self.kernel.state(task_id),
+            iteration=0,
+        )
+        self.assertNotEqual(frozen["contract_hash"], refreshed["contract_hash"])
+        self.assertIn(
+            "environment.contract_refreshed",
+            [event["type"] for event in self.kernel.store.events(task_id)],
+        )
 
     def test_catx_binding_requires_a_real_commit_and_active_subject_snapshot(self):
         task_id = "binding-material"
@@ -714,10 +768,16 @@ Steps:
         self.assertEqual("created", first["state"]["phase"])
         generated = self.kernel.compile_design("reuse-task-001")
         self.assertEqual("generated", generated["evalpack"]["source"])
-        self.kernel.create_task(self.config, self.user_input, task_id="reuse-task-002")
+        second = self.kernel.create_task(self.config, self.user_input, task_id="reuse-task-002")
         reused = self.kernel.compile_design("reuse-task-002")
         self.assertEqual("reused", reused["evalpack"]["source"])
         self.assertEqual(generated["evalpack"]["signature"], reused["evalpack"]["signature"])
+        self.assertNotEqual(first["state"]["evaluation_flow_id"], second["state"]["evaluation_flow_id"])
+        first_branches = {case["metadata"]["evaluation_branch"] for case in generated["cases"]}
+        second_branches = {case["metadata"]["evaluation_branch"] for case in reused["cases"]}
+        self.assertTrue(first_branches)
+        self.assertTrue(second_branches)
+        self.assertTrue(first_branches.isdisjoint(second_branches))
 
     def test_one_button_run_stops_only_at_a_real_gate(self):
         self.kernel.create_task(self.config, self.user_input, task_id="one-button-task")
@@ -753,6 +813,9 @@ Steps:
         self.assertEqual("needs_evidence", decision["next_action"])
         self.assertEqual([], decision["optimization_eligible_case_ids"])
         self.assertEqual([], decision["proposed_changes"])
+        reopened = kernel.reopen_case_review("unready-pack-task")
+        self.assertEqual("design_ready", reopened["phase"])
+        self.assertFalse(reopened["design_approved"])
 
     def test_invalid_task_id_is_rejected_before_checkout_path_is_used(self):
         checkout = FakeCheckoutManager(self.skill)

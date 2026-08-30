@@ -118,6 +118,25 @@ class EvidenceAnalysisTests(unittest.TestCase):
         self.assertEqual("needs_evidence", decision["next_action"])
         self.assertEqual([], decision["failed_case_ids"])
         self.assertEqual(["infra"], decision["not_evaluable_case_ids"])
+        self.assertFalse(decision["recovery"]["full_restart_required"])
+        # Analysis failures are diagnosed from the original evidence; the
+        # control plane must not offer an automatic remote-session replay.
+        self.assertEqual([], decision["recovery"]["targeted_retry_case_ids"])
+        self.assertEqual("remote_or_analysis_failure", decision["evidence_issues"][0]["category"])
+        self.assertEqual("remote_session_failed", decision["evidence_issues"][0]["evidence_type"])
+
+    def test_missing_artifact_is_reported_as_case_session_binding_gap(self):
+        decision = CrossCaseAnalyzer(None).analyze(
+            task_id="task",
+            iteration=0,
+            goal="goal",
+            standards=("correct",),
+            cases=({"id": "unbound", "prompt": "Do it", "expected_output": "ok"},),
+            primary_batch={"cases": [{"case_id": "unbound", "status": "completed"}]},
+        )
+        issue = decision["evidence_issues"][0]
+        self.assertEqual("case_session_binding_missing", issue["evidence_type"])
+        self.assertIn("绑定", issue["reason_cn"])
 
     def test_string_false_does_not_pass_trace_completeness_gate(self):
         cases = ({"id": "typed-completeness", "prompt": "Do it", "expected_output": "ok"},)

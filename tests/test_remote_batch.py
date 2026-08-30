@@ -6,6 +6,7 @@ from pathlib import Path
 
 from aceval.remote_batch import RemoteBatchCoordinator, RemoteBatchError, compact_remote_prompt
 from aceval.kernel_contracts import REMOTE_BATCH_API_VERSION
+from aceval.catx_bindings import CATX_EXECUTION_BINDING_API_VERSION, CatxExecutionBinding
 from aceval.task_center import TaskStore
 
 
@@ -47,6 +48,24 @@ class RetryGateway(FakeGateway):
         if self.fail_first:
             self.fail_first = False
             raise RuntimeError("temporary create failure")
+        return "session-%d" % len(self.started)
+
+
+class AlwaysFailGateway(FakeGateway):
+    def start_session(self, request):
+        self.started.append(dict(request))
+        raise RuntimeError("legacy session creation failure")
+
+
+class BoundGateway(FakeGateway):
+    def __init__(self):
+        super().__init__()
+        self.bindings = []
+        self.last_binding_evidence = {"verified": True}
+
+    def start_session(self, request, *, binding=None):
+        self.started.append(dict(request))
+        self.bindings.append(binding)
         return "session-%d" % len(self.started)
 
 
@@ -232,10 +251,73 @@ class RemoteBatchTests(unittest.TestCase):
             standards=("do not force the Skill",),
         )
         self.assertIn("不得读取或使用", baseline)
-        self.assertIn("无 Skill 对照", baseline)
+        self.assertNotIn("总体目标", baseline)
+        self.assertNotIn("grounded summary", baseline)
         self.assertNotIn("按当前会话挂载的候选 Skill 严格完成", baseline)
         self.assertIn("不适用时不得读取 SKILL.md", boundary)
+        self.assertNotIn("验收标准", boundary)
+        self.assertNotIn("avoid false triggers", boundary)
         self.assertNotIn("按当前会话挂载的候选 Skill 严格完成", boundary)
+
+    def test_regular_prompt_hides_control_plane_goal_and_uses_pr_commits(self):
+        base = "1" * 40
+        head = "2" * 40
+        prompt = compact_remote_prompt(
+            {
+                "id": "pr-case",
+                "prompt": "Review only the introduced defect",
+                "metadata": {
+                    "fixture_branch": "case/pr-case",
+                    "base_commit": base,
+                    "head_commit": head,
+                },
+            },
+            goal="SECRET EVALUATION TARGET",
+            standards=("SECRET ACCEPTANCE STANDARD",),
+            repository_bindings=(
+                {"role": "skill", "mount_path": "/workspace/skill", "branch": "skill/eval"},
+                {"role": "code", "mount_path": "/workspace/repo", "branch": "master"},
+            ),
+        )
+        self.assertIn("使用目标 Skill 评审下面 PR", prompt)
+        self.assertIn(base, prompt)
+        self.assertIn(head, prompt)
+        self.assertNotIn("SECRET EVALUATION TARGET", prompt)
+        self.assertNotIn("SECRET ACCEPTANCE STANDARD", prompt)
+        self.assertNotIn("总体目标", prompt)
+        self.assertNotIn("验收标准", prompt)
+
+    def test_each_case_uses_its_own_immutable_pr_binding(self):
+        gateway = BoundGateway()
+        coordinator = RemoteBatchCoordinator(gateway, self.store)
+        bindings = {
+            case_id: CatxExecutionBinding(
+                api_version=CATX_EXECUTION_BINDING_API_VERSION,
+                subject_hash="sha256:" + "a" * 64,
+                skill_ref="ssh://git.example/skill.git",
+                repository_ref="ssh://git.example/fixtures.git",
+                repository_hash="sha256:" + "b" * 64,
+                base_commit=base,
+                head_commit=head,
+                metadata={"case_id": case_id},
+            )
+            for case_id, base, head in (
+                ("a", "1" * 40, "2" * 40),
+                ("b", "3" * 40, "4" * 40),
+            )
+        }
+        batch = coordinator.dispatch(
+            "batch-task-001",
+            0,
+            "evaluation",
+            ({"id": "a", "prompt": "A"}, {"id": "b", "prompt": "B"}),
+            goal="hidden",
+            standards=("hidden",),
+            execution_bindings=bindings,
+        )
+        self.assertEqual(["1" * 40, "3" * 40], [item.base_commit for item in gateway.bindings])
+        self.assertEqual(["2" * 40, "4" * 40], [item.head_commit for item in gateway.bindings])
+        self.assertEqual(bindings["a"].binding_hash, batch["cases"][0]["execution_binding"]["binding_hash"])
 
     def test_prompt_budget_is_checked_before_any_session_is_created(self):
         gateway = FakeGateway()
@@ -292,6 +374,38 @@ class RemoteBatchTests(unittest.TestCase):
             "temporary create failure",
             retried_case["attempts"][0]["retry_reason"],
         )
+
+    def test_completed_legacy_failure_batch_is_retried_when_bindings_become_available(self):
+        first_gateway = AlwaysFailGateway()
+        first = RemoteBatchCoordinator(first_gateway, self.store).dispatch(
+            "batch-task-001", 0, "evaluation",
+            ({"id": "a", "prompt": "Review A"},),
+            goal="goal", standards=("correct",),
+        )
+        self.assertEqual("completed", first["status"])
+        self.assertEqual("failed", first["cases"][0]["status"])
+
+        binding = CatxExecutionBinding(
+            api_version=CATX_EXECUTION_BINDING_API_VERSION,
+            subject_hash="sha256:" + "a" * 64,
+            skill_ref="ssh://git.example/skill.git",
+            repository_ref="ssh://git.example/fixtures.git",
+            repository_hash="sha256:" + "b" * 64,
+            base_commit="1" * 40,
+            head_commit="2" * 40,
+            metadata={"case_id": "a"},
+        )
+        second_gateway = BoundGateway()
+        resumed = RemoteBatchCoordinator(second_gateway, self.store).dispatch(
+            "batch-task-001", 0, "evaluation",
+            ({"id": "a", "prompt": "Review A with generated PR"},),
+            goal="goal", standards=("correct",),
+            execution_bindings={"a": binding},
+        )
+        self.assertEqual("running", resumed["status"])
+        self.assertEqual(1, len(second_gateway.started))
+        self.assertEqual(binding.base_commit, second_gateway.bindings[0].base_commit)
+        self.assertEqual("running", resumed["cases"][0]["status"])
 
     def test_collection_reuses_the_session_snapshot_and_records_hash_receipt(self):
         gateway = CachedLogGateway()

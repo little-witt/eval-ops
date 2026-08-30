@@ -4,26 +4,27 @@ import unittest
 from pathlib import Path
 
 from aceval.agent_runtime import ModelReply
-from aceval.iteration_brain import EvidenceQueryError, IterationBrain, LocalEvidenceQueryPort
+from aceval.iteration_brain import EvidenceQueryError, IterationBrain, LocalEvidenceQueryPort, _json, _parse_semantic
 
 
 class StagedModel:
     model_id = "forge-test-model"
     profile = "forge-test-profile"
 
-    def __init__(self, invalid_stage=None):
+    def __init__(self, invalid_stage=None, semantic_status="fail"):
         self.calls = []
         self.invalid_stage = invalid_stage
+        self.semantic_status = semantic_status
 
     def complete(self, messages, tools):
-        stage = messages[0]["content"].split(" the ", 1)[-1].split(" stage", 1)[0]
+        stage = next(name for name in ("semantic_grading", "attribution", "proposal") if name in messages[0]["content"])
         request = json.loads(messages[-1]["content"])
         self.calls.append((stage, request))
         if stage == self.invalid_stage:
             return ModelReply(content="not-json")
         if stage == "semantic_grading":
             return ModelReply(content=json.dumps({
-                "case_results": [{"case_id": c["id"], "status": "fail", "verification_status": "not_run", "reason": "semantic defect", "evidence_refs": []} for c in request["cases"]],
+                "case_results": [{"case_id": c["id"], "status": self.semantic_status, "verification_status": "not_run", "reason": "semantic defect", "evidence_refs": []} for c in request["cases"]],
                 "without_skill_baseline_case_results": [],
             }), usage={"total_tokens": 7})
         if stage == "attribution":
@@ -100,6 +101,152 @@ class IterationBrainTests(unittest.TestCase):
         decision = IterationBrain(StagedModel(), self.root / "analysis").analyze(**args)
         self.assertEqual("fail", decision["case_results"][0]["status"])
         self.assertEqual(["c"], decision["failed_case_ids"])
+        self.assertEqual("skill_improvement_candidate", decision["case_assessments"][0]["attribution"])
+        self.assertIn("Skill", decision["case_assessments"][0]["conclusion"])
+
+    def test_completed_trace_is_analyzable_without_an_oracle(self):
+        decision = IterationBrain(None, self.root / "analysis").analyze(**self.args())
+        # A complete session is itself an executable observation.  Lack of an
+        # exact Oracle must not manufacture an ``evidence_gap`` or trigger a
+        # remote replay; the result is held for semantic/stability analysis.
+        self.assertEqual("pass_pending_verification", decision["case_assessments"][0]["attribution"])
+        self.assertTrue(decision["case_assessments"][0]["reason"])
+        self.assertTrue(decision["case_assessments"][0]["recommended_action"])
+        self.assertEqual([], decision["not_evaluable_case_ids"])
+        self.assertEqual([], decision["evidence_issues"])
+
+    def test_pending_stability_is_not_reported_as_skill_failure(self):
+        decision = IterationBrain(None, self.root / "analysis").analyze(**self.args(cases=({"id": "c", "prompt": "judge", "expected_output": "observed"},)))
+        assessment = decision["case_assessments"][0]
+        self.assertEqual("pending_verification", assessment["display_status"])
+        self.assertEqual("pass_pending_verification", assessment["attribution"])
+        self.assertIn("稳定性复验", assessment["conclusion"])
+        self.assertIn("不要修改 Skill", assessment["recommended_action"])
+        self.assertIn("测试分支", assessment["fixture_recommendation"])
+
+    def test_case_goal_observations_and_overall_optimization_summary(self):
+        case = {
+            "id": "review",
+            "title": "复杂度审查",
+            "prompt": "检查变更并输出审查报告",
+            "expected_output": "expected",
+            "metadata": {
+                "aceval_test": {
+                    "title": "复杂度审查",
+                    "generation_reason": "验证 Skill 的代码审查能力",
+                    "oracle_ready": True,
+                    "oracle_trust": "human_confirmed",
+                    "expected_observables": [
+                        "读取 git diff",
+                        "输出结构化审查报告",
+                        "执行 analyze_complexity.js",
+                    ],
+                }
+            },
+        }
+        self.run.write_text(json.dumps({"session": {"completeness": {"trace": True, "output": True}, "observation": {"output": "读取 git diff 后输出结构化审查报告", "trace": [{"kind": "tool_call", "tool": "shell", "command": "git diff"}], "metadata": {}, "error": None}}}), encoding="utf-8")
+        decision = IterationBrain(StagedModel(), self.root / "analysis").analyze(**self.args(
+            cases=(case,),
+            primary_batch={"cases": [{"case_id": "review", "status": "completed", "artifact": str(self.run)}]},
+        ))
+        observations = decision["case_assessments"][0]["goal_observations"]
+        self.assertTrue(observations["trace_analyzed"])
+        statuses = {item["requirement"]: item["status"] for item in observations["items"]}
+        self.assertEqual("observed", statuses["读取 git diff"])
+        self.assertEqual("observed", statuses["输出结构化审查报告"])
+        self.assertEqual("not_observed", statuses["执行 analyze_complexity.js"])
+        overall = decision["overall_assessment"]
+        self.assertTrue(overall["skill_optimization_plan"])
+        self.assertEqual("optimize_skill_then_verify", overall["next_action"])
+        self.assertIn("先结合用户意见", overall["next_step"])
+        self.assertEqual(["SKILL.md"], decision["target_scope"])
+
+    def test_oversized_stage_context_is_compacted_before_model_call(self):
+        model = StagedModel()
+        args = self.args(
+            cases=({"id": "c", "prompt": "judge " + "x" * 6000},),
+            primary_batch={"cases": [{"case_id": "c", "status": "completed", "artifact": str(self.run)}]},
+        )
+        decision = IterationBrain(model, self.root / "analysis", max_prompt_chars=2200).analyze(**args)
+        self.assertTrue(model.calls)
+        self.assertLessEqual(len(json.dumps(model.calls[0][1], ensure_ascii=False)), 2200)
+        self.assertIn("case_aggregates", decision)
+
+    def test_semantic_grading_is_partitioned_without_dropping_cases(self):
+        model = StagedModel()
+        cases = tuple({"id": "c%d" % index, "prompt": "judge " + "x" * 5000} for index in range(3))
+        primary = {"cases": [{"case_id": case["id"], "status": "completed", "artifact": str(self.run)} for case in cases]}
+        decision = IterationBrain(model, self.root / "analysis", max_prompt_chars=3000).analyze(
+            **self.args(cases=cases, primary_batch=primary)
+        )
+        semantic_calls = [request for stage, request in model.calls if stage == "semantic_grading"]
+        self.assertGreaterEqual(len(semantic_calls), 2)
+        self.assertEqual({case["id"] for case in cases}, {item["case_id"] for item in decision["case_results"]})
+        self.assertTrue(all(len(json.dumps(request, ensure_ascii=False)) <= 3000 for request in semantic_calls))
+
+    def test_json_parser_accepts_claude_markdown_wrapper_and_preface(self):
+        self.assertEqual({"ok": True}, _json("Here is the result:\n```json\n{\"ok\": true}\n```\n", "semantic_grading"))
+        self.assertEqual({"ok": True}, _json("Result: {\"ok\": true} done", "semantic_grading"))
+        self.assertEqual({"case_results": [{"case_id": "c1", "status": "pass"}]}, _json('[{"case_id":"c1","status":"pass"}]', "semantic_grading"))
+
+    def test_semantic_parser_keeps_additive_dimension_extensions(self):
+        parsed = _parse_semantic({
+            "case_results": [{"case_id": "c", "status": "pass", "reason": "ok", "evidence_refs": []}],
+            "dimensions": [{"id": "skill_execution", "score": 0.9}],
+            "confidence": 0.8,
+        }, ["c"], [])
+        self.assertEqual("skill_execution", parsed["model_extensions"]["dimensions"][0]["id"])
+        self.assertEqual(0.8, parsed["model_extensions"]["confidence"])
+
+    def test_semantic_parser_normalizes_case_map_and_wrapped_envelope(self):
+        parsed = _parse_semantic({
+            "semantic_verdict": {
+                "results": {
+                    "c": {"status": "not_evaluable", "reason": "missing trace", "evidence_refs": []}
+                }
+            }
+        }, ["c"], [])
+        self.assertEqual("c", parsed["case_results"][0]["case_id"])
+        self.assertEqual("not_evaluable", parsed["case_results"][0]["status"])
+
+    def test_semantic_parser_accepts_localized_and_qualified_statuses(self):
+        parsed = _parse_semantic({
+            "case_results": [
+                {"case_id": "a", "status": "未通过（输出缺失）", "reason": "x", "evidence_refs": []},
+                {"case_id": "b", "verdict": "not evaluated", "reason": "y", "evidence_refs": []},
+            ]
+        }, ["a", "b"], [])
+        self.assertEqual(["fail", "not_evaluable"], [item["status"] for item in parsed["case_results"]])
+
+    def test_semantic_parser_downgrades_unknown_status_without_blocking_confirmation(self):
+        parsed = _parse_semantic({
+            "case_results": [{"case_id": "c", "status": "maybe", "reason": "ambiguous", "evidence_refs": []}],
+        }, ["c"], [])
+        row = parsed["case_results"][0]
+        self.assertEqual("not_evaluable", row["status"])
+        self.assertEqual("maybe", row["status_raw"])
+        self.assertIn("未识别状态", row["reason"])
+
+    def test_failed_dimensions_expose_output_trace_facts_in_decision_and_graph(self):
+        case = {"id": "c", "prompt": "judge", "expected_output": "expected"}
+        decision = IterationBrain(None, self.root / "analysis").analyze(**self.args(cases=(case,)))
+        assessment = decision["case_assessments"][0]
+        outcome = next(item for item in assessment["dimensions"] if item["dimension"] == "outcome")
+        self.assertIn("期望", outcome["reason"])
+        self.assertIn("实际输出", outcome["reason"])
+        self.assertTrue(outcome["evidence_detail"])
+        fact = decision["diagnosis_graph"]["clusters"][0]["facts"][0]
+        self.assertTrue(fact["failure_dimensions"])
+        self.assertIn("结果是否符合 Case 目标", fact["reason"])
+        matrix = decision["overall_assessment"]["causal_matrix"][0]
+        self.assertTrue(matrix["failure_dimensions"])
+        self.assertTrue(matrix["skill_factors"])
+
+    def test_open_ended_output_basis_does_not_call_missing_expectation_an_expected_value(self):
+        decision = IterationBrain(None, self.root / "analysis-open-ended").analyze(**self.args())
+        outcome = next(item for item in decision["case_assessments"][0]["dimensions"] if item["dimension"] == "outcome")
+        self.assertIn("未声明精确期望", outcome["evidence_detail"])
+        self.assertNotIn("期望「未声明精确期望」", outcome["evidence_detail"])
 
 
 if __name__ == "__main__":

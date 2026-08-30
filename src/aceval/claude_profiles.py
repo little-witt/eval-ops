@@ -77,7 +77,25 @@ def _validated_settings(raw: bytes) -> Mapping[str, str]:
         raise ClaudeProfileError("Claude settings.json does not contain an env object")
     base_url = environment.get("ANTHROPIC_BASE_URL")
     token = environment.get("ANTHROPIC_AUTH_TOKEN") or environment.get("ANTHROPIC_API_KEY")
+    # CC Switch takeover settings may omit the top-level `model`.  Depending
+    # on its version, the active model is written to ANTHROPIC_MODEL or only
+    # to one of the role defaults (most commonly the Sonnet default).
     model = value.get("model") if isinstance(value, Mapping) else None
+    if not isinstance(model, str) or not model.strip():
+        for key in (
+            "ANTHROPIC_MODEL",
+            "CLAUDE_CODE_MODEL",
+            "ANTHROPIC_DEFAULT_SONNET_MODEL",
+            "ANTHROPIC_DEFAULT_OPUS_MODEL",
+            "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+            "ANTHROPIC_DEFAULT_SONNET_MODEL_NAME",
+            "ANTHROPIC_DEFAULT_OPUS_MODEL_NAME",
+            "ANTHROPIC_DEFAULT_HAIKU_MODEL_NAME",
+        ):
+            candidate = environment.get(key)
+            if isinstance(candidate, str) and candidate.strip():
+                model = candidate
+                break
     parsed = urlparse(str(base_url or ""))
     if parsed.scheme != "http" or parsed.hostname not in ("127.0.0.1", "localhost", "::1"):
         raise ClaudeProfileError("CC Switch Claude proxy is not active on a loopback HTTP address")
@@ -146,7 +164,20 @@ class ClaudeMessagesClient:
         except (URLError, OSError, TimeoutError):
             return ()
 
-    def complete(self, messages: Sequence[Mapping[str, Any]], *, model: str, effort: Optional[str] = None) -> Mapping[str, Any]:
+    def complete(
+        self,
+        messages: Sequence[Mapping[str, Any]],
+        *,
+        model: str,
+        effort: Optional[str] = None,
+        max_output_tokens: int = 4096,
+    ) -> Mapping[str, Any]:
+        # Analysis stages return small, schema-checked JSON envelopes.  A
+        # large unconditional max_tokens is counted together with input
+        # tokens by Claude/CC Switch and can reject an otherwise valid prompt
+        # with "staged request exceeds Token budget".
+        if isinstance(max_output_tokens, bool) or not isinstance(max_output_tokens, int) or max_output_tokens <= 0:
+            raise ClaudeProfileError("Claude max_output_tokens must be a positive integer")
         system_parts = []
         conversation = []
         for message in messages:
@@ -158,12 +189,14 @@ class ClaudeMessagesClient:
                 conversation.append({"role": "assistant" if role == "assistant" else "user", "content": content})
         if not conversation:
             conversation.append({"role": "user", "content": "Produce the requested result."})
-        body = {"model": model, "max_tokens": 24000, "messages": conversation}
+        body = {"model": model, "max_tokens": min(max_output_tokens, 8192), "messages": conversation}
         if effort and effort != "default":
             body["output_config"] = {"effort": effort}
         if system_parts:
             body["system"] = "\n\n".join(system_parts)
         attempted_models = []
+        connection_attempts = 0
+        upstream_attempts = 0
         while True:
             attempted_models.append(str(body["model"]))
             request = Request(
@@ -184,6 +217,16 @@ class ClaudeMessagesClient:
                     detail = str(error.get("message") or "") if isinstance(error, Mapping) else ""
                 except json.JSONDecodeError:
                     detail = ""
+                # CC Switch returns 502/503/504 when its upstream provider is
+                # briefly unavailable. Cloudflare-style proxies use 524 for
+                # the same origin timeout condition. Retry once before
+                # surfacing the failure; the proxy has received an HTTP
+                # response, so this is intentionally separate from the
+                # connection retry above.
+                if exc.code in (502, 503, 504, 524) and upstream_attempts < 1:
+                    upstream_attempts += 1
+                    time.sleep(0.5)
+                    continue
                 # CC Switch can store Claude Code convenience aliases such as
                 # ``sonnet[1m]`` while its active provider requires a concrete
                 # model id.  Its bounded 403 response lists the allowed ids;
@@ -207,19 +250,66 @@ class ClaudeMessagesClient:
                 if exc.code == 403 and resolved and resolved not in attempted_models and len(attempted_models) == 1:
                     body["model"] = resolved
                     continue
-                raise ClaudeProfileError(str(detail or "Claude proxy returned HTTP %d" % exc.code)[:1000]) from exc
+                if exc.code == 524:
+                    message = "Claude proxy upstream timeout (HTTP 524); please retry semantic analysis"
+                else:
+                    message = str(detail or "Claude proxy returned HTTP %d" % exc.code)
+                raise ClaudeProfileError(message[:1000]) from exc
             except (URLError, OSError, TimeoutError) as exc:
-                raise ClaudeProfileError("Claude proxy connection failed") from exc
+                # The local CC Switch listener can briefly restart while the
+                # desktop app is launching. Retry once only when no HTTP
+                # response was received; this cannot duplicate an accepted
+                # model request.
+                if connection_attempts < 1:
+                    connection_attempts += 1
+                    time.sleep(0.25)
+                    continue
+                reason = getattr(exc, "reason", None) or str(exc)
+                detail = str(reason).strip()
+                message = "Claude proxy connection failed"
+                if detail and detail != str(exc):
+                    message = "%s: %s" % (message, detail)
+                raise ClaudeProfileError(message[:1000]) from exc
         if len(raw) > 4 * 1024 * 1024:
             raise ClaudeProfileError("Claude proxy response exceeds the size limit")
         try:
             value = json.loads(raw.decode("utf-8"))
         except (UnicodeError, json.JSONDecodeError) as exc:
             raise ClaudeProfileError("Claude proxy returned invalid JSON") from exc
-        parts = [item.get("text", "") for item in value.get("content", ()) if isinstance(item, Mapping) and item.get("type") == "text"]
-        content = "".join(str(item) for item in parts)
+        raw_content = value.get("content", ())
+        if isinstance(raw_content, str):
+            content = raw_content
+        else:
+            # Anthropic-compatible proxies are not fully uniform: some
+            # versions emit ``output_text`` blocks (or a top-level
+            # ``output_text``) instead of canonical ``text`` blocks.
+            parts = [
+                item.get("text") or item.get("output_text") or ""
+                for item in raw_content
+                if isinstance(item, Mapping)
+                and item.get("type") in ("text", "output_text")
+            ] if isinstance(raw_content, Sequence) and not isinstance(raw_content, (str, bytes)) else []
+            content = "".join(str(item) for item in parts)
+            if not content.strip() and isinstance(value.get("output_text"), str):
+                content = value["output_text"]
+            if not content.strip() and isinstance(raw_content, list):
+                # A few Anthropic-compatible gateways wrap a structured
+                # response in a tool_use block even when the request declares
+                # no tools.  Preserve the structured input so the strict
+                # caller can validate it as JSON (fixture/case generation),
+                # rather than discarding a usable response.
+                tool_inputs = [
+                    item.get("input")
+                    for item in raw_content
+                    if isinstance(item, Mapping)
+                    and item.get("type") == "tool_use"
+                    and isinstance(item.get("input"), Mapping)
+                ]
+                if len(tool_inputs) == 1:
+                    content = json.dumps(tool_inputs[0], ensure_ascii=False, allow_nan=False)
         if not content.strip():
-            raise ClaudeProfileError("Claude proxy completed without output text")
+            block_types = [str(item.get("type")) for item in raw_content if isinstance(item, Mapping)] if isinstance(raw_content, list) else []
+            raise ClaudeProfileError("Claude proxy completed without output text (content_types=%s)" % ",".join(block_types) or "none")
         source_usage = value.get("usage") if isinstance(value.get("usage"), Mapping) else {}
         input_tokens = int(source_usage.get("input_tokens") or 0)
         output_tokens = int(source_usage.get("output_tokens") or 0)
@@ -273,6 +363,14 @@ class ClaudeProfileManager:
         if not profile["ready"]:
             raise ClaudeProfileError("Import the active CC Switch Claude configuration first")
         ids = ClaudeMessagesClient(self.profile_path, 45).list_model_ids()
+        # Some CC Switch providers intentionally expose an empty /v1/models
+        # catalog while still accepting the active Claude Code model alias.
+        # Keep that configured model selectable instead of treating the proxy
+        # as unusable; the actual completion call remains the final probe.
+        if not ids:
+            configured_fallback = str(json.loads(self.metadata_path.read_text(encoding="utf-8")).get("model") or "").strip()
+            if configured_fallback:
+                ids = (configured_fallback,)
         if not ids:
             raise ClaudeProfileError("CC Switch Claude proxy returned no selectable models")
         configured = str(json.loads(self.metadata_path.read_text(encoding="utf-8")).get("model") or "")
@@ -303,6 +401,17 @@ class ClaudeProfileManager:
     def resolve_model(self, model_id: str, effort: Optional[str] = None) -> Mapping[str, str]:
         profile = self.profile()
         selected = next((item for item in profile["models"] if item["id"] == model_id or item["model"] == model_id), None)
+        if not selected and model_id:
+            # A task stores the model id it was created with. CC Switch can
+            # replace that id on a later source switch (for example
+            # claude-sonnet-5 -> claude-sonnet-4-6). Reuse the same family
+            # when the exact id is no longer advertised.
+            requested = model_id.lower()
+            family = next((name for name in ("opus", "sonnet", "haiku") if name in requested), None)
+            if family:
+                selected = next((item for item in profile["models"] if family in str(item.get("model", "")).lower()), None)
+        if not selected and profile["models"]:
+            selected = next((item for item in profile["models"] if item.get("is_default")), profile["models"][0])
         if not profile["ready"] or not selected:
             raise ClaudeProfileError("Import the active CC Switch Claude configuration first")
         selected_effort = str(effort or selected.get("default_reasoning_effort") or "default")

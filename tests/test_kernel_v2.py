@@ -79,6 +79,31 @@ class KernelV2Tests(unittest.TestCase):
         self.assertEqual("not_evaluable", verdict.status)
         self.assertIn("attempt.log_incomplete", verdict.evidence_validity.reason_codes)
 
+    def test_complete_trace_after_remote_terminal_error_remains_analyzable(self):
+        item = evidence("completed-trace-error", exact=None, status="failed")
+        item.update({
+            "error": "agent process exited after writing the review",
+            "trace_complete": True,
+            "output_chars": 128,
+            "trace": {"event_count": 6, "errors": []},
+        })
+        verdict = build_attempt_verdict(
+            {"id": "completed-trace-error"},
+            item,
+            {
+                "case_id": "completed-trace-error",
+                "status": "fail",
+                "reason": "review output was produced before the terminal error",
+                "evidence_refs": [item["artifact"]],
+            },
+            attempt_id="primary",
+            run_context_hash="sha256:test",
+        )
+        self.assertEqual("fail", verdict.status)
+        self.assertTrue(verdict.evidence_validity.evaluable)
+        self.assertEqual("partial", verdict.evidence_validity.status)
+        self.assertIn("attempt.runtime_error_after_trace", verdict.evidence_validity.reason_codes)
+
     def test_stable_pass_requires_all_k_attempts(self):
         case = {"id": "case-1", "expected_output": "ok"}
         result = {"case_id": "case-1", "status": "pass", "reason": "oracle", "evidence_refs": []}

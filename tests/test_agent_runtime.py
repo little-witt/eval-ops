@@ -111,7 +111,7 @@ class CommandModelClientTest(unittest.TestCase):
             with self.assertRaisesRegex(ReferenceRuntimeError, "stderr exceeds byte limit"):
                 client.complete((), ())
 
-    def test_bridge_failure_does_not_include_stderr(self) -> None:
+    def test_bridge_failure_includes_bounded_stderr(self) -> None:
         command = (
             sys.executable,
             "-c",
@@ -121,7 +121,10 @@ class CommandModelClientTest(unittest.TestCase):
         with self.assertRaises(ReferenceRuntimeError) as raised:
             CommandModelClient(command).complete((), ())
 
-        self.assertEqual("model bridge exited with status 7", str(raised.exception))
+        self.assertEqual(
+            "model bridge exited with status 7: sensitive-output",
+            str(raised.exception),
+        )
 
     def test_normalizes_utf8_encoding_and_decoding_errors(self) -> None:
         invalid_stdout = (

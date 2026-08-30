@@ -259,9 +259,17 @@ class CommandModelClient:
             if exceeded is not None:
                 raise ReferenceRuntimeError("model bridge %s exceeds byte limit" % exceeded)
             if process.returncode != 0:
-                raise ReferenceRuntimeError(
-                    "model bridge exited with status %s" % process.returncode
-                )
+                stderr_stream.seek(0)
+                stderr = stderr_stream.read(self._max_stderr_bytes + 1)
+                detail = stderr.decode("utf-8", errors="replace").strip()
+                # Keep the user-facing failure actionable while bounding the
+                # amount of subprocess output persisted in task events.
+                if len(detail) > 2000:
+                    detail = detail[-2000:]
+                message = "model bridge exited with status %s" % process.returncode
+                if detail:
+                    message = "%s: %s" % (message, detail)
+                raise ReferenceRuntimeError(message)
             stdout_stream.seek(0)
             return stdout_stream.read(self._max_stdout_bytes + 1)
 

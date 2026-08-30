@@ -309,9 +309,19 @@ def compact_case_evidence(
         # a semantic model cannot turn missing evidence into a passing Case.
         return {
             "case_id": case.get("id"),
+            "attempt_number": row.get("attempt_number"),
+            "attempts": [dict(item) for item in row.get("attempts", ()) if isinstance(item, Mapping)],
+            "retry_count": max(0, len(row.get("attempts", ())) - 1) if isinstance(row.get("attempts"), list) else 0,
+            "timing": {
+                "started_at": row.get("started_at"),
+                "completed_at": row.get("completed_at"),
+                "duration_ms": row.get("duration_ms"),
+            },
             "run_status": row.get("status"),
             "terminal": row.get("terminal"),
             "error": row.get("error") or "remote attempt did not produce an immutable session artifact",
+            "binding_status": row.get("binding_status"),
+            "binding_evidence": row.get("binding_evidence"),
             "output_excerpt": "",
             "output_chars": 0,
             "exact_expected_match": None,
@@ -340,6 +350,13 @@ def compact_case_evidence(
     session = run.get("session", {}) if isinstance(run.get("session"), Mapping) else {}
     observation = session.get("observation", {}) if isinstance(session.get("observation"), Mapping) else {}
     trace = observation.get("trace", ())
+    # CATX receipts carry the authoritative immutable event log at the run
+    # envelope's ``events`` field.  Prefer it over the abbreviated observation
+    # trace so every Case review is grounded in the complete session sequence;
+    # the archived artifact still remains the source for deeper windows.
+    raw_event_log = run.get("events")
+    if isinstance(raw_event_log, list) and raw_event_log:
+        trace = raw_event_log
     if not isinstance(trace, Sequence) or isinstance(trace, (str, bytes)):
         trace = ()
     trace_items = tuple(item for item in trace if isinstance(item, Mapping))
@@ -408,9 +425,19 @@ def compact_case_evidence(
     formal_grading = _evalpack_grading(case, run, evalpack_ref)
     return {
         "case_id": case.get("id"),
+        "attempt_number": row.get("attempt_number"),
+        "attempts": [dict(item) for item in row.get("attempts", ()) if isinstance(item, Mapping)],
+        "retry_count": max(0, len(row.get("attempts", ())) - 1) if isinstance(row.get("attempts"), list) else 0,
+        "timing": {
+            "started_at": row.get("started_at"),
+            "completed_at": row.get("completed_at"),
+            "duration_ms": row.get("duration_ms"),
+        },
         "run_status": row.get("status"),
         "terminal": row.get("terminal"),
         "error": observation.get("error") or row.get("error"),
+        "binding_status": row.get("binding_status"),
+        "binding_evidence": row.get("binding_evidence"),
         "output_excerpt": output_text[:output_limit],
         "output_chars": len(output_text),
         "exact_expected_match": exact,
@@ -438,16 +465,24 @@ def compact_case_evidence(
 
 
 def _heuristic_case_result(case: Mapping[str, Any], evidence: Mapping[str, Any]) -> Optional[Mapping[str, Any]]:
-    if evidence.get("run_status") != "completed" or evidence.get("error"):
-        return {"case_id": case.get("id"), "status": "not_evaluable", "reason": str(evidence.get("error") or "remote run failed; infrastructure and Skill responsibility are not distinguishable"), "evidence_refs": [evidence.get("artifact")]}
+    trace = evidence.get("trace") if isinstance(evidence.get("trace"), Mapping) else {}
+    output_chars = int(evidence.get("output_chars") or 0)
+    event_count = int(trace.get("event_count") or 0)
+    execution_observed = evidence.get("trace_complete") is True and event_count > 0 and output_chars > 0
+    # A terminal/error status is not allowed to erase a completed execution
+    # trace.  Once the Case branch, Skill mount, review events and output are
+    # present, the run is an analyzable failure (possibly caused by the
+    # Agent/tool), not an ``evidence insufficient`` Case.
+    if (evidence.get("run_status") != "completed" or evidence.get("error")) and not execution_observed:
+        return {"case_id": case.get("id"), "status": "not_evaluable", "reason": str(evidence.get("error") or "remote run failed before a complete review trace was produced"), "evidence_refs": [evidence.get("artifact")]}
     log_completeness = evidence.get("log_completeness")
-    if isinstance(log_completeness, Mapping) and log_completeness.get("complete") is False:
+    if isinstance(log_completeness, Mapping) and log_completeness.get("complete") is False and not execution_observed:
         reasons = list(log_completeness.get("reason_codes", ()))
         missing = list(log_completeness.get("missing_required_event_types", ()))
         detail = ", ".join(str(item) for item in reasons + missing) or "complete session log was not proven"
         return {"case_id": case.get("id"), "status": "not_evaluable", "reason": "session evidence is incomplete: %s" % detail, "evidence_refs": [evidence.get("artifact")]}
     path = evidence.get("path_conformance")
-    if isinstance(path, Mapping) and path.get("status") == "not_evaluable":
+    if isinstance(path, Mapping) and path.get("status") == "not_evaluable" and not execution_observed:
         return {"case_id": case.get("id"), "status": "not_evaluable", "reason": str(path.get("reason")), "evidence_refs": [evidence.get("artifact")]}
     if isinstance(path, Mapping) and path.get("status") == "fail":
         return {"case_id": case.get("id"), "status": "fail", "reason": "execution path violates the Skill contract", "evidence_refs": [evidence.get("artifact")]}
@@ -457,7 +492,12 @@ def _heuristic_case_result(case: Mapping[str, Any], evidence: Mapping[str, Any])
     formal = evidence.get("formal_grading")
     if isinstance(formal, Mapping):
         formal_status = str(formal.get("status") or "not_evaluable")
-        if formal_status in ("pass", "fail", "not_evaluable"):
+        formal_reason = str(formal.get("reason") or "")
+        formal_integrity_gap = any(
+            token in formal_reason.casefold()
+            for token in ("changed after", "cannot be loaded", "could not evaluate", "hash", "scenario")
+        )
+        if formal_status in ("pass", "fail") or (formal_status == "not_evaluable" and (not execution_observed or formal_integrity_gap)):
             return {
                 "case_id": case.get("id"),
                 "status": formal_status,
@@ -468,6 +508,7 @@ def _heuristic_case_result(case: Mapping[str, Any], evidence: Mapping[str, Any])
         if (
             formal_status == "not_calibrated"
             and metadata.get("expectation_mode") == "evalpack_graders"
+            and not execution_observed
         ):
             return {
                 "case_id": case.get("id"),
@@ -483,7 +524,105 @@ def _heuristic_case_result(case: Mapping[str, Any], evidence: Mapping[str, Any])
         return {"case_id": case.get("id"), "status": "pass", "reason": "output exactly matches the user-provided expected result", "evidence_refs": [evidence.get("artifact")]}
     if exact is False:
         return {"case_id": case.get("id"), "status": "fail", "reason": "output does not match the user-provided expected result", "evidence_refs": [evidence.get("artifact")]}
-    return None
+    # A Case with a complete immutable session is still evaluable even when it
+    # has no exact-output Oracle.  The session proves the Agent loaded the
+    # mounted Skill, ran the requested review and produced a response; that is
+    # the execution fact the analysis phase must explain.  A configured local
+    # semantic model may subsequently replace this provisional status, but the
+    # control plane must never turn an otherwise valid run into a spurious
+    # "evidence insufficient" result merely because the output is open-ended.
+    if execution_observed:
+        return {
+            "case_id": case.get("id"),
+            "status": "pass",
+            "reason": "会话已完成并形成完整 Trace/输出；开放结果交由逐 Case 分析核对目标与评分维度",
+            "evidence_refs": [evidence.get("artifact")],
+        }
+    return {
+        "case_id": case.get("id"),
+        "status": "fail",
+        "reason": "会话虽已结束，但没有形成可核对的输出或执行事件；按执行效果记录为未达标",
+        "evidence_refs": [evidence.get("artifact")],
+    }
+
+
+def _evidence_issue(
+    case_id: str,
+    result: Mapping[str, Any],
+    aggregate: Any,
+) -> Mapping[str, Any]:
+    """Turn an opaque not-evaluable verdict into an actionable recovery item."""
+
+    reason = str(result.get("reason") or "No evaluable Attempt was produced")
+    validity_codes = sorted({
+        str(code)
+        for attempt in getattr(aggregate, "attempts", ())
+        for code in attempt.evidence_validity.reason_codes
+    })
+    missing_channels = sorted({
+        str(channel)
+        for attempt in getattr(aggregate, "attempts", ())
+        for channel in attempt.evidence_validity.missing_channels
+    })
+    searchable = " ".join([reason, *validity_codes, *missing_channels]).casefold()
+    reason_text = reason.casefold()
+    if any(token in reason_text for token in ("timeout", "gateway", "remote run failed", "infrastructure", "connection", "transport")):
+        category = "remote_or_analysis_failure"
+        evidence_type = "remote_session_failed"
+        reason_cn = "远端会话没有成功完成，当前不能把失败归因到 Skill。"
+        action = "analyze_existing_trace"
+        guidance = "保留本次完整会话，直接基于原始 Trace 分析失败原因；不要重复创建远端会话。"
+        retryable = False
+    elif any(token in validity_codes for token in ("attempt.artifact_missing", "attempt.case_session_binding_missing")) or "artifact" in reason_text and "missing" in reason_text:
+        # A transport row can be marked completed while the immutable receipt
+        # was never attached to this Case.  This is a binding problem, not a
+        # semantic failure and must be shown as such in the UI.
+        category = "repository_binding"
+        evidence_type = "case_session_binding_missing"
+        reason_cn = "Case 没有绑定到对应的不可变会话产物，当前无法确认这份日志是否属于该 Case。"
+        action = "analyze_existing_trace"
+        guidance = "核对 Case、Attempt、测试分支和会话产物绑定后，直接在原始证据上分析；不要重跑会话。"
+        retryable = False
+    elif any(token in searchable for token in ("oracle", "expected", "grader", "calibrat", "trusted", "判定", "预期", "insufficient evidence", "not enough evidence", "cannot determine", "无法判断", "证据不足")):
+        category = "oracle_not_ready"
+        evidence_type = "semantic_or_oracle_insufficient"
+        reason_cn = "会话证据已记录，但缺少可信的通过标准或语义判定依据，不能安全得出通过/失败结论。"
+        action = "reopen_case_review"
+        guidance = "补充或确认可观察的通过标准后，回到本次 Trace 重新分析；不重新创建远端会话。"
+        retryable = False
+    elif any(token in searchable for token in ("binding", "commit", "repository", "mount")):
+        category = "repository_binding"
+        evidence_type = "case_session_binding_missing"
+        reason_cn = "没有证明会话对应了该 Case 的测试分支、base/head commit 或仓库挂载。"
+        action = "analyze_existing_trace"
+        guidance = "核对 Skill 与 PR 的 base/head commit 绑定，并在现有 Trace 上完成归因；不重新创建会话。"
+        retryable = False
+    elif any(token in searchable for token in ("log", "event", "trace", "hash", "sequence", "artifact", "channel", "complete")):
+        category = "evidence_incomplete"
+        evidence_type = "session_log_incomplete"
+        reason_cn = "会话日志或 Trace 不完整，缺少可核验的事件、序列或完整性收据。"
+        action = "analyze_existing_trace"
+        guidance = "远端任务可能已完成；保留当前日志并标记缺口，优先分析现有 Trace，不重复创建会话。"
+        retryable = False
+    else:
+        category = "remote_or_analysis_failure"
+        evidence_type = "remote_session_failed"
+        reason_cn = "没有形成可用于评分的完整会话证据，暂不能区分远端故障与 Skill 问题。"
+        action = "analyze_existing_trace"
+        guidance = "保留当前会话证据，先分析失败原因；如确实属于传输故障，由用户显式发起独立评测流程。"
+        retryable = False
+    return {
+        "case_id": case_id,
+        "category": category,
+        "evidence_type": evidence_type,
+        "reason": reason,
+        "reason_cn": reason_cn,
+        "reason_codes": validity_codes,
+        "missing_channels": missing_channels,
+        "recommended_action": action,
+        "guidance": guidance,
+        "targeted_retry_available": retryable,
+    }
 
 
 def _parse_model_decision(
@@ -618,6 +757,18 @@ class CrossCaseAnalyzer:
             or baseline_unresolved
             or any(item.get("status") == "fail" for item in deterministic_results.values())
             or any(item.get("status") == "fail" for item in verification_heuristic.values())
+            # Open-ended/semantic Cases need a model pass even when the
+            # execution-fact fallback is present.  Otherwise a candidate and
+            # its without-Skill baseline would both look like provisional
+            # passes and incremental value could never be established.
+            or any(
+                "expected_output" not in case
+                or (
+                    isinstance(case.get("metadata"), Mapping)
+                    and case.get("metadata", {}).get("expectation_mode") in ("semantic", "model_proposed")
+                )
+                for case in cases
+            )
         )
         model_called = False
         if needs_model_analysis:
@@ -678,15 +829,43 @@ class CrossCaseAnalyzer:
                 )
                 model_called = True
                 heuristic = {str(item["case_id"]): dict(item) for item in decision["case_results"]}
-                # Exact user expectations and deterministic execution-path
-                # failures are authoritative. The model may explain them but
-                # must never reverse them.
-                heuristic.update(deterministic_results)
+                # Exact user expectations, formal EvalPack results, and
+                # deterministic path failures are authoritative.  The
+                # complete-trace fallback is deliberately *provisional* for
+                # open-ended Cases, so a semantic model may still distinguish
+                # a grounded candidate from a weaker without-Skill baseline.
+                authoritative = {}
+                for case in cases:
+                    case_id = str(case.get("id"))
+                    item = next((entry for entry in evidence if str(entry.get("case_id")) == case_id), {})
+                    value = deterministic_results.get(case_id)
+                    if value is None:
+                        continue
+                    path = item.get("path_conformance") if isinstance(item.get("path_conformance"), Mapping) else {}
+                    formal = item.get("formal_grading") if isinstance(item.get("formal_grading"), Mapping) else {}
+                    if value.get("status") == "not_evaluable" or isinstance(item.get("exact_expected_match"), bool) or path.get("status") == "fail" or formal.get("status") in ("pass", "fail"):
+                        authoritative[case_id] = value
+                heuristic.update(authoritative)
                 model_baseline = {
                     str(item["case_id"]): dict(item)
                     for item in decision.get("without_skill_baseline_case_results", ())
                 }
-                model_baseline.update(baseline_heuristic)
+                # As with the candidate, keep the complete-trace fallback
+                # provisional for semantic baseline Cases.  Only explicit
+                # expected output, formal grading, or a path failure may
+                # override the model's baseline judgement.
+                baseline_authoritative = {}
+                for case in cases:
+                    case_id = str(case.get("id"))
+                    item = next((entry for entry in baseline_evidence if str(entry.get("case_id")) == case_id), {})
+                    value = baseline_heuristic.get(case_id)
+                    if value is None:
+                        continue
+                    path = item.get("path_conformance") if isinstance(item.get("path_conformance"), Mapping) else {}
+                    formal = item.get("formal_grading") if isinstance(item.get("formal_grading"), Mapping) else {}
+                    if value.get("status") == "not_evaluable" or isinstance(item.get("exact_expected_match"), bool) or path.get("status") == "fail" or formal.get("status") in ("pass", "fail"):
+                        baseline_authoritative[case_id] = value
+                model_baseline.update(baseline_authoritative)
                 baseline_heuristic = model_baseline
                 failure_clusters = list(decision["failure_clusters"])
                 conflicts = list(decision["conflicts"])
@@ -856,6 +1035,10 @@ class CrossCaseAnalyzer:
             [item["case_id"] for item in results if item["status"] == "not_evaluable"]
             + aggregate_not_evaluable
         ))
+        evidence_issues = [
+            _evidence_issue(case_id, heuristic.get(case_id, {}), aggregate_by_id.get(case_id))
+            for case_id in not_evaluable
+        ]
         if primary_passes and verification_batch is None:
             next_action = "verify_passes"
         elif not_evaluable:
@@ -888,12 +1071,25 @@ class CrossCaseAnalyzer:
             "api_version": ANALYSIS_DECISION_API_VERSION,
             "task_id": task_id,
             "iteration": iteration,
+            "primary_purpose": str(primary_batch.get("purpose") or "evaluation"),
             "case_results": results,
             "stable_pass_case_ids": stable_passes,
             "verification_required_case_ids": primary_passes if verification_batch is None else [],
             "flaky_case_ids": flaky,
             "failed_case_ids": failed,
             "not_evaluable_case_ids": not_evaluable,
+            "evidence_issues": evidence_issues,
+            "recovery": {
+                "full_restart_required": False,
+                "targeted_retry_case_ids": [
+                    item["case_id"] for item in evidence_issues
+                    if item.get("targeted_retry_available")
+                ],
+                "reopen_case_review_case_ids": [
+                    item["case_id"] for item in evidence_issues
+                    if item.get("recommended_action") == "reopen_case_review"
+                ],
+            },
             "without_skill_baseline_case_results": [baseline_heuristic.get(str(case.get("id")), {"case_id": str(case.get("id")), "status": "not_evaluable", "reason": "baseline requires semantic analysis", "evidence_refs": []}) for case in cases] if comparison_baseline_batch is not None else [],
             "incremental_value_case_ids": incremental_value_case_ids,
             "failure_clusters": failure_clusters,
