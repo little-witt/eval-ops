@@ -40,7 +40,13 @@ from .catx_bindings import (
 
 CATX_PROFILE_API_VERSION = "aceval.catx-profile/v1"
 DEFAULT_CATX_BASE_URL = "https://api.catx.sankuai.com/api/v1"
-DEFAULT_EVENTS_LIMIT = 200
+# CATX's Events endpoint accepts up to 1000 events per request.  A 200-event
+# default was too small for normal repository reviews: once a response landed
+# exactly on that boundary, the legacy API supplied no pagination metadata and
+# we had to fail closed with ``pagination_not_proven_complete``.  Request the
+# documented maximum by default so ordinary completed sessions arrive in one
+# complete snapshot; callers can still lower this explicitly when needed.
+DEFAULT_EVENTS_LIMIT = 1000
 MAX_PROFILE_BYTES = 1024 * 1024
 MAX_CREDENTIALS_BYTES = 64 * 1024
 _ENV_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")

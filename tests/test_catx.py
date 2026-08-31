@@ -132,6 +132,13 @@ class BindingAdapter:
 
 
 class CatxProfileTest(unittest.TestCase):
+    def test_default_events_limit_uses_maximum_snapshot_size(self):
+        value = profile_payload()
+        value.pop("events_limit")
+        loaded = CatxAgentProfile.from_mapping(value)
+
+        self.assertEqual(1000, loaded.events_limit)
+
     def test_loads_strict_profile_without_credentials(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             path = Path(temp_dir, "catx.json")

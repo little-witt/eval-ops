@@ -16,6 +16,7 @@ import hashlib
 import json
 import os
 from pathlib import Path, PurePosixPath
+import re
 import shutil
 import subprocess
 import tempfile
@@ -25,6 +26,7 @@ from typing import Any, Dict, Iterable, Mapping, Optional, Sequence, Tuple
 from .agent_runtime import ModelClient
 from .contracts import as_primitive
 from .optimizer import CandidateRejected, MaterializedCandidateSnapshot, _skill_file
+from .evaluation_skills import node_skill_context
 
 
 SKILL_TREE_IMPROVER_CONTRACT = "aceval.optimizer/skill-tree-improver-v1"
@@ -165,6 +167,76 @@ def _decode_editable(path: str, raw: bytes) -> str:
         raise CandidateRejected("editable Skill resource must be UTF-8 text: %s" % path) from exc
 
 
+def _compact_model_value(value: Any, *, max_string: int = 1_600, max_items: int = 20, depth: int = 0) -> Any:
+    """Bound analysis evidence before it is sent to the edit model.
+
+    A decision contains full per-Case attempts and trace references for audit,
+    but sending that whole envelope again at the edit stage can exceed a local
+    model's context and surface as an opaque optimizer failure.  Preserve the
+    shape and high-signal prefixes while keeping the immutable files on disk
+    as the source of truth.
+    """
+
+    if depth >= 5:
+        return _bounded_text(value, max_string)
+    if isinstance(value, str):
+        return value if len(value) <= max_string else value[:max_string].rstrip() + "…"
+    if isinstance(value, Mapping):
+        return {
+            str(key): _compact_model_value(item, max_string=max_string, max_items=max_items, depth=depth + 1)
+            for key, item in list(value.items())[:max_items]
+        }
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+        return [
+            _compact_model_value(item, max_string=max_string, max_items=max_items, depth=depth + 1)
+            for item in list(value)[:max_items]
+        ]
+    return value
+
+
+def _bounded_text(value: Any, limit: int) -> str:
+    text = str(value or "")
+    return text if len(text) <= limit else text[:limit].rstrip() + "…"
+
+
+def _normalize_entrypoint_alias(path: Any, scope: Sequence[str]) -> str:
+    value = str(path or "").strip()
+    allowed = set(str(item) for item in scope)
+    if value == "SKILL.md" and value not in allowed and "src/SKILL.md" in allowed:
+        return "src/SKILL.md"
+    return value
+
+
+def _candidate_json_response(content: str) -> Mapping[str, Any]:
+    """Extract one complete candidate JSON object from a model reply."""
+
+    if not isinstance(content, str):
+        raise ValueError("candidate response is not text")
+    text = content.lstrip("\ufeff").strip()
+    candidates = [text]
+    for match in re.finditer(r"```(?:json)?\s*([\s\S]*?)\s*```", text, re.IGNORECASE):
+        candidates.append(match.group(1).strip())
+    decoder = json.JSONDecoder()
+    for index, char in enumerate(text):
+        if char != "{":
+            continue
+        try:
+            value, end = decoder.raw_decode(text[index:])
+        except json.JSONDecodeError:
+            continue
+        if isinstance(value, Mapping):
+            candidates.append(text[index:index + end])
+            break
+    for candidate in candidates:
+        try:
+            value = json.loads(candidate)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
+        if isinstance(value, Mapping):
+            return value
+    raise ValueError("candidate response contains no JSON object")
+
+
 def _validate_changed_file(path: str, content: str) -> None:
     if not content.strip():
         raise CandidateRejected("changed Skill resource must not be empty: %s" % path)
@@ -261,7 +333,12 @@ class SkillTreeOptimizer:
         invalid_create = [path for path in create_paths if path in frozen or not is_editable_skill_path(path, active)]
         if invalid_create:
             raise CandidateRejected("create path must be a new editable Skill resource: %s" % ", ".join(invalid_create))
-        scope = tuple(dict.fromkeys(_relative_path(str(path)) for path in target_scope))
+        scope = tuple(
+            dict.fromkeys(
+                _normalize_entrypoint_alias(_relative_path(str(path)), inventory)
+                for path in target_scope
+            )
+        )
         if not scope:
             scope = (_skill_file(source).relative_to(source).as_posix(),)
         unsupported = [path for path in scope if path not in inventory and path not in create_paths]
@@ -276,7 +353,10 @@ class SkillTreeOptimizer:
             "editable_resource_inventory": list(inventory),
             "approved_target_scope": list(scope),
             "approved_create_paths": [path for path in scope if path in create_paths],
-            "evidence": [as_primitive(item) for item in failures],
+            "evidence": [
+                _compact_model_value(as_primitive(item), max_string=1_600, max_items=20)
+                for item in failures
+            ],
             "output_contract": {
                 "changes": [
                     {"path": "approved/existing/file", "operation": "replace_text", "old_text": "exact unique text", "new_text": "replacement", "reason": "evidence-based reason"},
@@ -288,6 +368,7 @@ class SkillTreeOptimizer:
         if len(scope) == 1 and scope[0] in ("SKILL.md", "src/SKILL.md") and scope[0] in current_files:
             request["current_skill"] = current_files[scope[0]]
         system_prompt = (
+            node_skill_context("skill-optimizer") + " "
             "Repair, tune, or extend the Agent Skill using only supplied evidence and approved files. "
             "Return strict JSON with a NON-EMPTY `changes` array (or `skill_markdown` only for a single SKILL.md target). "
             "Each changes item must be an executable replace_text/create_file operation; do not return proposed_changes, "
@@ -306,9 +387,9 @@ class SkillTreeOptimizer:
         if reply.tool_calls:
             raise CandidateRejected("optimizer may not call tools", reply.usage)
         try:
-            payload = json.loads(reply.content)
-        except json.JSONDecodeError as exc:
-            raise CandidateRejected("optimizer returned invalid candidate JSON", reply.usage) from exc
+            payload = _candidate_json_response(reply.content)
+        except ValueError:
+            payload = None
         # Backward compatibility keeps existing single-file model bridges usable
         # while the desktop migrates to the multi-file contract.
         if isinstance(payload, Mapping) and isinstance(payload.get("skill_markdown"), str) and len(scope) == 1 and scope[0] in current_files:
@@ -325,7 +406,7 @@ class SkillTreeOptimizer:
             repair_request = dict(request)
             repair_request["previous_response"] = payload if isinstance(payload, Mapping) else str(reply.content)[:4000]
             repair_request["repair_instruction"] = (
-                "上一次输出不是可执行编辑。请仅返回一个 JSON 对象：changes 必须是非空数组；"
+                "上一次输出不是可解析的可执行编辑。请不要使用 Markdown 围栏或前后说明；仅返回一个 JSON 对象：changes 必须是非空数组；"
                 "每项使用 approved_target_scope 内的 replace_text（提供唯一 old_text/new_text）或允许的 create_file。"
             )
             repair_reply = self._model.complete(
@@ -338,8 +419,8 @@ class SkillTreeOptimizer:
             if repair_reply.tool_calls:
                 raise CandidateRejected("optimizer may not call tools", repair_reply.usage)
             try:
-                repair_payload = json.loads(repair_reply.content)
-            except json.JSONDecodeError as exc:
+                repair_payload = _candidate_json_response(repair_reply.content)
+            except ValueError as exc:
                 raise CandidateRejected("optimizer returned invalid repair JSON", repair_reply.usage) from exc
             payload = repair_payload
             if isinstance(payload, Mapping) and isinstance(payload.get("skill_markdown"), str) and len(scope) == 1 and scope[0] in current_files:
@@ -349,6 +430,16 @@ class SkillTreeOptimizer:
             else:
                 changes = None
             reply = repair_reply
+        if isinstance(changes, list):
+            # Accept the conventional root alias when the approved checkout
+            # contains only src/SKILL.md, then keep materialization strict for
+            # every other path.
+            changes = [
+                dict(item, path=_normalize_entrypoint_alias(item.get("path"), scope))
+                if isinstance(item, Mapping) and item.get("path")
+                else item
+                for item in changes
+            ]
         if not isinstance(changes, list) or not changes or any(not isinstance(item, Mapping) for item in changes):
             raise CandidateRejected("optimizer changes must be a non-empty array", reply.usage)
         try:
@@ -365,7 +456,64 @@ class SkillTreeOptimizer:
                 usage=reply.usage,
             )
         except CandidateRejected as exc:
-            raise CandidateRejected(str(exc), reply.usage) from exc
+            # Models often select a short sentence that appears more than
+            # once (or return an ellipsis-truncated excerpt).  The exact
+            # replacement contract is correct, but surfacing this low-level
+            # validation error makes an otherwise recoverable proposal look
+            # like a failed optimization.  Give the model one repair turn
+            # with the concrete occurrence error and the frozen file text;
+            # never weaken the uniqueness check in materialization.
+            if "old_text must occur exactly once" not in str(exc):
+                raise CandidateRejected(str(exc), reply.usage) from exc
+            repair_request = dict(request)
+            repair_request["previous_response"] = payload if isinstance(payload, Mapping) else str(reply.content)[:4000]
+            repair_request["repair_instruction"] = (
+                "上一次编辑的 old_text 在目标文件中不是唯一匹配，已被拒绝。请重新返回严格 JSON。"
+                "old_text 必须从 current_files 原文逐字复制、不能包含省略号，并选择带标题/代码上下文的唯一连续片段；"
+                "不要输出整文件。若无法安全选择唯一片段，只对 SKILL.md 返回完整 skill_markdown。"
+            )
+            repair_reply = self._model.complete(
+                [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": json.dumps(repair_request, ensure_ascii=False)},
+                ],
+                (),
+            )
+            if repair_reply.tool_calls:
+                raise CandidateRejected("optimizer may not call tools", repair_reply.usage)
+            try:
+                repaired_payload = _candidate_json_response(repair_reply.content)
+            except ValueError as repair_exc:
+                raise CandidateRejected("optimizer returned invalid repair JSON", repair_reply.usage) from repair_exc
+            if isinstance(repaired_payload, Mapping) and isinstance(repaired_payload.get("skill_markdown"), str) and len(scope) == 1 and scope[0] in current_files:
+                repaired_changes = [{"path": scope[0], "operation": "replace_text", "old_text": current_files[scope[0]], "new_text": repaired_payload["skill_markdown"], "reason": repaired_payload.get("rationale", "")}]
+            elif isinstance(repaired_payload, Mapping):
+                repaired_changes = repaired_payload.get("changes")
+            else:
+                repaired_changes = None
+            if isinstance(repaired_changes, list):
+                repaired_changes = [
+                    dict(item, path=_normalize_entrypoint_alias(item.get("path"), scope))
+                    if isinstance(item, Mapping) and item.get("path") else item
+                    for item in repaired_changes
+                ]
+            if not isinstance(repaired_changes, list) or not repaired_changes or any(not isinstance(item, Mapping) for item in repaired_changes):
+                raise CandidateRejected("optimizer changes must be a non-empty array", repair_reply.usage)
+            try:
+                return materialize_skill_tree_candidate(
+                    source,
+                    frozen,
+                    repaired_changes,
+                    str(repaired_payload.get("rationale", "")) if isinstance(repaired_payload, Mapping) else "",
+                    Path(output_root),
+                    scope,
+                    active,
+                    create_paths=create_paths,
+                    forbidden_literals=forbidden_literals,
+                    usage=repair_reply.usage,
+                )
+            except CandidateRejected as repair_exc:
+                raise CandidateRejected(str(repair_exc), repair_reply.usage) from repair_exc
 
 
 def materialize_skill_tree_candidate(

@@ -17,8 +17,16 @@ import time
 from typing import Any, Callable, Mapping, Optional, Sequence
 
 from .agent_runtime import ModelClient, ReferenceRuntimeError
+from .evaluation_skills import node_skill_context
 from .claude_profiles import ClaudeProfileError
-from .evidence_analysis import _evidence_issue, _heuristic_case_result, _optimization_case_ready, compact_case_evidence
+from .evidence_analysis import (
+    _evidence_issue,
+    _heuristic_case_result,
+    _optimization_case_ready,
+    compact_case_evidence,
+    normalize_skill_path,
+    skill_entrypoint_path,
+)
 from .kernel_contracts import ANALYSIS_DECISION_API_VERSION
 from .kernel_v2 import build_case_aggregates, compile_diagnosis_graph
 
@@ -124,8 +132,7 @@ def _dimension_evidence_detail(
     base = _dimension_base(name)
     status = str(dimension.get("status") or "not_evaluable")
     trace = evidence.get("trace") if isinstance(evidence.get("trace"), Mapping) else {}
-    output = str(evidence.get("output_excerpt") or "").replace("\r", " ").replace("\n", " ").strip()
-    output = output if len(output) <= 360 else output[:360] + "…"
+    output = _clean_output_excerpt(evidence.get("output_excerpt"), 260)
     refs = [str(ref) for ref in dimension.get("evidence_refs", ()) if str(ref)]
     artifact = str(evidence.get("artifact") or "")
     selected = trace.get("selected_evidence") if isinstance(trace.get("selected_evidence"), Sequence) else ()
@@ -241,7 +248,7 @@ def _assessment_failure_facts(assessment: Mapping[str, Any]) -> list[str]:
         facts.append("%s%s：%s" % (label, score_text, detail))
     missing = (assessment.get("goal_observations", {}) or {}).get("missing_requirements", ())
     if isinstance(missing, Sequence) and not isinstance(missing, (str, bytes)) and missing:
-        facts.append("目标未观察到：%s" % "、".join(str(item) for item in missing[:5]))
+        facts.append("目标未观察到：%s" % "、".join(_clean_output_excerpt(item, 90) for item in missing[:5]))
     return list(dict.fromkeys(facts))
 
 
@@ -250,8 +257,68 @@ def _short_text(value: Any, limit: int = 180) -> str:
     return text if len(text) <= limit else text[:limit].rstrip() + "…"
 
 
+def _clean_output_excerpt(value: Any, limit: int = 260) -> str:
+    """Keep an output observation, not an entire generated report.
+
+    Agents frequently append a full Markdown retrospective after the useful
+    result.  That text is valid evidence for audit, but is not suitable for a
+    decision card or a model hand-off.  Prefer a nearby finding headline and
+    drop table/process boilerplate deterministically.
+    """
+
+    text = " ".join(str(value or "").replace("\r", " ").replace("\n", " ").split())
+    if not text:
+        return ""
+    for marker in ("下面是本次执行的完整过程回顾", "以下是本次执行的完整过程回顾", "执行过程总结"):
+        if marker in text:
+            prefix = text.split(marker, 1)[0].strip(" ：:；;")
+            if len(prefix) >= 24:
+                text = prefix
+            else:
+                text = text.split(marker, 1)[1].strip(" ：:；;")
+            break
+    # Pull the useful finding headline out of a long report when one exists.
+    matches = list(re.finditer(r"(?:核心发现|关键发现|Must[- ]fix|阻塞|高风险|发现)\s*[:：]?", text, re.IGNORECASE))
+    if len(text) > limit and matches:
+        start = max(0, matches[0].start())
+        text = text[start:]
+    # Markdown table rows and heading markers are presentation noise here.
+    text = re.sub(r"\|[^|]{0,160}\|", " ", text)
+    text = re.sub(r"#{2,}\s*", "", text)
+    return _short_text(text, limit)
+
+
+def _safe_model_summary(value: Any, limit: int = 240) -> str:
+    """Accept a model summary only when it is actually summary-shaped."""
+
+    text = _short_text(value, limit)
+    if not text:
+        return ""
+    noise_markers = ("执行过程总结", "完整过程回顾", "以上即为完整", "| 步骤 |", "```", "###")
+    if any(marker in text for marker in noise_markers):
+        return ""
+    return text
+
+
+def _decision_text(value: Any, limit: int = 240) -> str:
+    """Return a complete, compact sentence for the primary decision card.
+
+    Ellipsis is useful in audit tables but misleading in a verdict: it makes
+    the user think the conclusion was truncated. Prefer the first complete
+    clause/sentence and never append a Unicode ellipsis.
+    """
+
+    text = _clean_output_excerpt(value, limit * 2)
+    if len(text) <= limit:
+        return text
+    boundary = max(text.rfind("。", 0, limit), text.rfind("；", 0, limit), text.rfind(".", 0, limit))
+    if boundary >= max(40, limit // 2):
+        return text[: boundary + 1].strip()
+    return text[:limit].rstrip(" ，,；;：:。.")
+
+
 def _concise_failure_summary(assessments: Sequence[Mapping[str, Any]]) -> str:
-    """Summarize repeated Case failures by dimension, not by raw Case prose."""
+    """Summarize failures as short facts, never by concatenating raw output."""
 
     groups: dict[str, dict[str, Any]] = {}
     for assessment in assessments:
@@ -262,7 +329,7 @@ def _concise_failure_summary(assessments: Sequence[Mapping[str, Any]]) -> str:
             group = groups.setdefault(key, {"label": str(dimension.get("label") or _dimension_label_cn(key)), "cases": set(), "detail": ""})
             group["cases"].add(str(assessment.get("case_id") or ""))
             if not group["detail"]:
-                group["detail"] = _short_text(dimension.get("evidence_detail") or dimension.get("reason") or "未记录具体依据")
+                group["detail"] = _compact_failure_fact(assessment, dimension)
     lines = []
     for group in groups.values():
         count = len({case_id for case_id in group["cases"] if case_id})
@@ -270,7 +337,56 @@ def _concise_failure_summary(assessments: Sequence[Mapping[str, Any]]) -> str:
     return "；".join(lines[:4])
 
 
-def _concrete_skill_change(assessments: Sequence[Mapping[str, Any]], case_ids: Sequence[str]) -> str:
+def _compact_failure_fact(assessment: Mapping[str, Any], dimension: Mapping[str, Any]) -> str:
+    """Return one actionable fact for a failed dimension.
+
+    ``evidence_detail`` may contain an entire Agent report because it is also
+    used by the drill-down view.  It must never be copied into the one-line
+    decision summary or the Skill proposal.  Prefer deterministic goal/path/
+    trace fields and fall back to a bounded, single-sentence model reason.
+    """
+
+    base = _dimension_base(dimension.get("dimension"))
+    goal = assessment.get("goal_observations") if isinstance(assessment.get("goal_observations"), Mapping) else {}
+    missing = [_clean_output_excerpt(item, 90) for item in goal.get("missing_requirements", ()) if _clean_output_excerpt(item, 90)]
+    if base in {"procedure", "path"} and missing:
+        return "Trace 未观察到必须步骤：%s" % "、".join(missing[:3])
+    if base == "outcome":
+        if missing:
+            return "Case 目标未满足：%s" % "、".join(missing[:3])
+        if assessment.get("status") == "fail":
+            return "语义评估判定实际结果未满足 Case 目标（该 Case 未声明精确期望）"
+        return "当前没有足够证据证明实际结果满足 Case 目标"
+    if base in {"grounding", "evidence_grounding", "evidence"}:
+        refs = dimension.get("evidence_refs") if isinstance(dimension.get("evidence_refs"), Sequence) else ()
+        return "未绑定本次会话的独立证据引用" if not refs else "结论引用的证据不足以支撑该维度"
+    if base == "runtime":
+        trace = assessment.get("evidence_trace") if isinstance(assessment.get("evidence_trace"), Mapping) else {}
+        errors = trace.get("errors") if isinstance(trace.get("errors"), Sequence) else ()
+        first_error = next((str(item.get("error")) for item in errors if isinstance(item, Mapping) and item.get("error")), "")
+        return "Trace 记录运行时错误：%s" % _short_text(first_error, 180) if first_error else "Trace 记录了运行时或工具错误"
+    if base == "format":
+        return "实际输出未满足 Case 要求的终态格式"
+    if base == "efficiency":
+        evidence = assessment.get("evidence") if isinstance(assessment.get("evidence"), Mapping) else {}
+        usage = evidence.get("usage") if isinstance(evidence.get("usage"), Mapping) else {}
+        total = usage.get("total_tokens")
+        return "运行成本超过该 Case 的预算" if total is None else "运行收据记录总 Token=%s" % total
+    reason = dimension.get("reason") or "未记录具体依据"
+    # Avoid leaking Markdown tables/long Agent retrospectives into the
+    # summary. Keep only the first sentence-like clause.
+    text = _short_text(reason, 220)
+    for marker in ("执行过程总结", "完整过程回顾", "以上即为", "###", "| 步骤 |", "```"):
+        if marker in text:
+            text = text.split(marker, 1)[0].rstrip("；。 ")
+    return text or "未记录具体依据"
+
+
+def _concrete_skill_change(
+    assessments: Sequence[Mapping[str, Any]],
+    case_ids: Sequence[str],
+    target: str = "SKILL.md",
+) -> str:
     """Create a useful deterministic fallback when the model omits a proposal."""
 
     selected = [assessment for assessment in assessments if str(assessment.get("case_id")) in set(str(item) for item in case_ids)]
@@ -278,9 +394,9 @@ def _concrete_skill_change(assessments: Sequence[Mapping[str, Any]], case_ids: S
     if not facts:
         facts = "补充与本轮失败事实对应的执行要求和完成前自检"
     return (
-        "修改 SKILL.md：在对应执行流程中补齐「%s」；"
+        "修改 %s：在对应执行流程中补齐「%s」；"
         "在最终输出前逐项自检并报告核对结果，确保后续 Case 能在 Trace/输出中观察到这些产物。"
-        % facts
+        % (target, facts)
     )
 
 
@@ -599,13 +715,37 @@ def _overall_assessment(
     changes: Sequence[Mapping[str, Any]],
     evidence_issues: Sequence[Mapping[str, Any]],
     next_action: str,
+    entrypoint: str = "SKILL.md",
+    model_summary: Optional[Mapping[str, Any]] = None,
 ) -> Mapping[str, Any]:
     """Build the Chinese, cross-Case optimization hand-off shown in the UI."""
 
     stable = [item for item in assessments if item.get("attribution") == "stable_pass"]
-    candidates = [item for item in assessments if item.get("attribution") == "skill_improvement_candidate"]
+    candidates = [item for item in assessments if item.get("attribution") in {"skill_improvement_candidate", "skill_optimization_candidate"}]
+    resilience_candidates = [item for item in candidates if item.get("attribution") == "skill_optimization_candidate"]
     pending = [item for item in assessments if item.get("attribution") == "pass_pending_verification"]
     gaps = [item for item in assessments if item.get("attribution") == "evidence_gap"]
+    # A failed Case that is not authorized for a Skill edit is still a failed
+    # Case.  It must never be hidden by the "all passed, verify stability"
+    # branch merely because other Cases are pending verification.  Keep this
+    # separate from evidence_gap: the evidence may be complete, while the
+    # attribution/Oracle contract is what remains unresolved.
+    unattributed_failures = [
+        item for item in assessments
+        if item.get("status") == "fail"
+        and item.get("attribution") not in {"skill_improvement_candidate", "skill_optimization_candidate"}
+    ]
+    # A complete trace can still be unusable when the generated fixture does
+    # not cover the Case's stated repository/language.  Keep this distinct
+    # from an evidence gap: the user should repair only that fixture, not
+    # rerun successful sessions or be asked to "补齐日志".
+    fixture_mismatch_failures = [
+        item for item in unattributed_failures
+        if any(
+            token in " ".join(_text_list(item.get("environment_factors"))).casefold()
+            for token in ("fixture", "夹具", "占位", "prompt", "仓库绑定", "语言")
+        )
+    ]
     skill_problems = []
     for cluster in clusters:
         # This column is specifically the Skill problem summary.  Evaluator,
@@ -624,7 +764,19 @@ def _overall_assessment(
             for requirement in (item.get("goal_observations", {}) or {}).get("missing_requirements", ())
             if requirement
         ]
-        raw_problem = str(cluster.get("root_cause_hypothesis") or cluster.get("root_cause") or cluster.get("problem") or cluster.get("hypothesis") or "")
+        # The diagnostician's one-sentence problem is the user-facing source
+        # of truth.  Root-cause prose is deliberately kept for audit only;
+        # using it here was the reason pages showed long, opaque paragraphs.
+        raw_problem = str(
+            cluster.get("problem_summary")
+            or cluster.get("problem_cn")
+            or cluster.get("fact_summary")
+            or cluster.get("root_cause_hypothesis")
+            or cluster.get("root_cause")
+            or cluster.get("problem")
+            or cluster.get("hypothesis")
+            or ""
+        )
         dimension_facts = [fact for item in facts for fact in _assessment_failure_facts(item)]
         dimension_facts = list(dict.fromkeys(dimension_facts))
         affected = list(dict.fromkeys(
@@ -633,17 +785,31 @@ def _overall_assessment(
             for item in assessment.get("dimension_summaries", ())
             if isinstance(item, Mapping) and item.get("status") in ("fail", "not_evaluable")
         ))
-        problem = "Skill 缺口：%s（影响 %d 个 Case）" % (
-            "、".join(affected[:4]) or "Case 要求未被稳定落实",
-            len(ids),
+        model_problem = _safe_model_summary(
+            cluster.get("problem_summary")
+            or cluster.get("problem_cn")
+            or cluster.get("fact_summary"),
+            220,
         )
-        fact_reasons = list(dict.fromkeys(str(item.get("reason") or "") for item in cluster.get("facts", ()) if isinstance(item, Mapping) and item.get("reason")))
-        if fact_reasons:
-            dimension_facts.extend(fact_reasons)
-        concise_facts = _concise_failure_summary(facts) or _short_text("；".join(dimension_facts), 420)
-        if missing:
-            missing_unique = list(dict.fromkeys(str(item) for item in missing))
+        if model_problem:
+            problem = "%s（影响 %d 个 Case）" % (_decision_text(model_problem, 180), len(ids))
+        elif missing:
+            missing_labels = list(dict.fromkeys(_clean_output_excerpt(item, 100) for item in missing if _clean_output_excerpt(item, 100)))
+            problem = "Skill 未落实：%s（影响 %d 个 Case）" % ("、".join(missing_labels[:3]), len(ids))
+        else:
+            problem = "Skill 未满足：%s（影响 %d 个 Case）" % (
+                "、".join(affected[:4]) or "Case 要求未被稳定落实",
+                len(ids),
+            )
+        model_evidence = _safe_model_summary(
+            cluster.get("evidence_summary") or cluster.get("evidence") or cluster.get("fact_summary"),
+            260,
+        )
+        concise_facts = model_evidence or _concise_failure_summary(facts) or _short_text("；".join(dimension_facts), 420)
+        if missing and not model_evidence:
+            missing_unique = list(dict.fromkeys(_clean_output_excerpt(item, 100) for item in missing if _clean_output_excerpt(item, 100)))
             concise_facts = "%s；未观察到：%s" % (concise_facts, "、".join(missing_unique[:3]))
+        optimization_kind = str(cluster.get("optimization_kind") or "defect")
         skill_problems.append({
             "case_ids": ids,
             "problem": problem,
@@ -653,7 +819,8 @@ def _overall_assessment(
             "affected_dimensions": affected,
             "evidence_refs": list(dict.fromkeys(refs))[:8],
             "authorized": True,
-            "classification": "skill",
+            "classification": "skill_optimization" if optimization_kind == "resilience" else "skill",
+            "optimization_kind": optimization_kind,
         })
     # Do not let the two summary panels disagree when the attribution model
     # returned proposals/candidates without a populated cluster.  Every
@@ -664,10 +831,17 @@ def _overall_assessment(
         if not case_id or case_id in represented:
             continue
         refs = [ref for dimension in assessment.get("dimensions", ()) for ref in dimension.get("evidence_refs", ())]
+        missing = [str(item) for item in (assessment.get("goal_observations", {}) or {}).get("missing_requirements", ()) if str(item)]
+        failed_labels = [
+            str(item.get("label") or _dimension_label_cn(item.get("dimension")))
+            for item in assessment.get("dimension_summaries", ())
+            if isinstance(item, Mapping) and item.get("status") in ("fail", "not_evaluable")
+        ]
+        problem_text = "Skill 未落实：%s（影响 1 个 Case）" % "、".join(dict.fromkeys(missing[:3])) if missing else "Skill 未满足：%s（影响 1 个 Case）" % ("、".join(dict.fromkeys(failed_labels[:4])) or "Case 目标")
         skill_problems.append({
             "case_ids": [case_id],
-            "problem": "Skill 缺口：%s（影响 1 个 Case）" % ("、".join(str(item.get("label") or _dimension_label_cn(item.get("dimension"))) for item in assessment.get("dimension_summaries", ()) if isinstance(item, Mapping) and item.get("status") in ("fail", "not_evaluable")) or "Case 目标未满足"),
-            "problem_cn": "Skill 缺口：%s（影响 1 个 Case）" % ("、".join(str(item.get("label") or _dimension_label_cn(item.get("dimension"))) for item in assessment.get("dimension_summaries", ()) if isinstance(item, Mapping) and item.get("status") in ("fail", "not_evaluable")) or "Case 目标未满足"),
+            "problem": problem_text,
+            "problem_cn": problem_text,
             "fact_summary": _short_text(_concise_failure_summary([assessment]) or str(assessment.get("reason") or "未记录具体事实"), 520),
             "hypothesis": _short_text(str(assessment.get("attribution_hypothesis") or "待通过下一轮回归验证的共性原因"), 240),
             "affected_dimensions": [str(item.get("label") or _dimension_label_cn(item.get("dimension"))) for item in assessment.get("dimension_summaries", ()) if isinstance(item, Mapping) and item.get("status") in ("fail", "not_evaluable")],
@@ -676,23 +850,31 @@ def _overall_assessment(
             "classification": "skill",
         })
     if skill_problems:
-        # Present one comprehensive Skill diagnosis, not one card per branch
-        # or per failure cluster.  The detailed Case evidence remains
-        # available in the per-Case assessment and attribution matrix.
+        # Present one readable Skill diagnosis.  Never concatenate whole
+        # model/log paragraphs: the UI needs one concrete problem and one
+        # representative fact, with a count for additional clusters.
+        first = skill_problems[0]
+        extra_count = max(0, len(skill_problems) - 1)
+        first_problem = str(first.get("problem_cn") or first.get("problem") or "Skill 未满足明确的 Case 要求")
+        if extra_count:
+            first_problem = "%s；另有 %d 个同类问题" % (first_problem.rstrip("。"), extra_count)
+        first_fact = str(first.get("fact_summary") or "未形成可核验事实")
+        first_hypothesis = str(first.get("hypothesis") or "待下一轮回归验证")
         skill_problems = [{
             "case_ids": list(dict.fromkeys(case_id for item in skill_problems for case_id in item.get("case_ids", ()))),
-            "problem": "；".join(dict.fromkeys(str(item.get("problem") or "") for item in skill_problems if item.get("problem"))),
-            "problem_cn": "；".join(dict.fromkeys(str(item.get("problem_cn") or item.get("problem") or "") for item in skill_problems if item.get("problem_cn") or item.get("problem"))),
-            "fact_summary": _short_text("；".join(dict.fromkeys(str(item.get("fact_summary") or "") for item in skill_problems if item.get("fact_summary"))), 760),
-            "hypothesis": _short_text("；".join(dict.fromkeys(str(item.get("hypothesis") or "") for item in skill_problems if item.get("hypothesis"))), 420),
+            "problem": _decision_text(first_problem, 220),
+            "problem_cn": _decision_text(first_problem, 220),
+            "fact_summary": _decision_text(first_fact, 280),
+            "hypothesis": _decision_text(first_hypothesis, 200),
             "affected_dimensions": list(dict.fromkeys(str(value) for item in skill_problems for value in item.get("affected_dimensions", ()) if str(value))),
             "evidence_refs": list(dict.fromkeys(ref for item in skill_problems for ref in item.get("evidence_refs", ())))[:12],
             "authorized": True,
-            "classification": "skill",
+            "classification": "skill_optimization" if all(item.get("classification") == "skill_optimization" for item in skill_problems) else "skill",
+            "optimization_kind": "resilience" if all(item.get("optimization_kind") == "resilience" for item in skill_problems) else "defect",
         }]
     optimization_plan = []
     for change in changes:
-        change_text = str(change.get("change") or "根据失败证据修正 Skill")
+        change_text = _safe_model_summary(change.get("change"), 280) or "根据失败证据修正 Skill"
         related_ids = [str(item) for item in change.get("case_ids", ()) if str(item)]
         generic_markers = (
             "根据失败维度和目标核对结果修正 Skill",
@@ -702,34 +884,46 @@ def _overall_assessment(
             "补充明确的执行步骤、产出要求和自检标准",
         )
         if not change_text.strip() or any(marker.casefold() in change_text.casefold() for marker in generic_markers):
-            change_text = _concrete_skill_change(assessments, related_ids)
+            change_text = _concrete_skill_change(assessments, related_ids, entrypoint)
         related = [item for item in clusters if set(str(case_id) for case_id in item.get("case_ids", ())).intersection(related_ids)]
         root_causes = [str(item.get("root_cause_hypothesis") or item.get("root_cause") or item.get("problem") or item.get("hypothesis") or "") for item in related]
         root_causes = [item for item in root_causes if item and item not in {"unresolved", "requires cross-case Skill repair analysis"}]
-        why = str(change.get("why") or "")
+        why = _safe_model_summary(change.get("why"), 280)
         if not why or why in {"失败 Case 的可核验证据", "one or more frozen expectations failed"}:
             related_assessments = [item for item in assessments if str(item.get("case_id")) in set(related_ids)]
             facts = _concise_failure_summary(related_assessments)
             why = facts or ("根因假设：" + _short_text("；".join(dict.fromkeys(root_causes)), 240) if root_causes else "对应失败 Case 的维度证据已绑定到不可变会话产物")
         optimization_plan.append({
-            "target": str(change.get("target") or "SKILL.md"),
+            "target": normalize_skill_path(change.get("target") or entrypoint, (entrypoint,)),
             "change": change_text,
             "why": why,
             "case_ids": related_ids,
-            "target_guidance": str(change.get("target_guidance") or change.get("section") or "在 Skill 对应能力段落补充失败事实所要求的执行与自检规则"),
+            "target_guidance": _safe_model_summary(change.get("target_guidance") or change.get("section"), 240) or "在 Skill 对应能力段落补充失败事实所要求的执行与自检规则",
             "validation_steps": _text_list(change.get("validation_steps") or change.get("verification_steps")) or ["使用同一批失败 Case 复验，并确认所有保护 Case 仍通过"],
         })
     if candidates or optimization_plan:
-        conclusion = "本轮发现 %d 条可归因到 Skill 的改进候选；%d 条稳定通过 Case 应继续作为回归保护。" % (len(candidates), len(stable))
-        next_step = "先结合用户意见和下方证据支持的建议优化 Skill，再使用同一批冻结 Case 与测试分支进入下一轮验证。"
+        if resilience_candidates and len(resilience_candidates) == len(candidates):
+            conclusion = "Skill 的核心规则已覆盖目标，但执行约束不够强：Agent 跳过关键步骤后仍能提交结果。建议增加完成前证据门禁，再用同一批 Case 回归。"
+            next_step = "先增强关键步骤的执行证据与完成前自检，再使用同一批冻结 Case 和测试分支验证跳步问题是否消失。"
+        else:
+            conclusion = "Skill 存在可修复缺口：%s" % _decision_text((skill_problems[0] if skill_problems else {}).get("problem_cn") or "关键要求没有稳定落实", 180)
+            next_step = "确认最小修改后生成 Skill 候选，再使用同一批冻结 Case 与测试分支回归。"
         action = "optimize_skill_then_verify"
     elif gaps:
         conclusion = "本轮有 %d 条 Case 证据不足；不能据此断言 Skill 有问题。%d 条 Case 已稳定通过。" % (len(gaps), len(stable))
         next_step = "先补齐会话日志、Case/Attempt 绑定或可信通过标准；证据可核验后，再决定是否需要优化 Skill 并进入下一轮验证。"
         action = "resolve_evidence_before_optimization"
+    elif unattributed_failures:
+        if fixture_mismatch_failures:
+            conclusion = "本轮有 %d 条 Case 未通过；日志完整，但其中 %d 条的评测 Fixture 与 Case 目标不匹配，不能用来判定 Skill。" % (len(unattributed_failures), len(fixture_mismatch_failures))
+            next_step = "仅重建不匹配 Case 的 Fixture，复用其余已有会话；修复后沿用同一批冻结 Case 继续评测。已确认的 Skill 优化建议可保留，不要求重跑全流程。"
+        else:
+            conclusion = "本轮有 %d 条 Case 未通过；日志完整，但责任归属尚未确认，不能把它直接算作 Skill 缺陷。" % len(unattributed_failures)
+            next_step = "先校准该 Case 的通过标准或绑定关系，再决定是否修改 Skill；不重跑已完成且证据完整的 Case。"
+        action = "resolve_fixture_before_optimization" if fixture_mismatch_failures else "resolve_evidence_before_optimization"
     elif pending:
-        conclusion = "本轮已有 %d 条 Case 初测通过，但仍有 %d 条等待稳定性复验；当前没有已证实的 Skill 缺陷。" % (len(pending), len(pending))
-        next_step = "先完成同一测试分支上的稳定性复验；复验通过后保持 Skill，不进入修改流程。"
+        conclusion = "全部 %d 条 Case 本次评测通过；下一步可统一执行稳定性复检，确认结果可以重复。" % len(pending)
+        next_step = "由用户确认后，对全部通过 Case 使用同一测试分支统一执行稳定性复检。"
         action = "verify_passes"
     else:
         conclusion = "本轮没有形成可授权的 Skill 修改；请以逐 Case 目标核对和证据状态为准。"
@@ -778,9 +972,9 @@ def _overall_assessment(
             row["hard"] = row["hard"] or dimension.get("hard") is True
     if candidates or optimization_plan:
         skill_decision = {
-            "status": "needs_improvement",
-            "title": "建议先优化 Skill，再进入下一轮验证",
-            "summary": "至少一个可信失败 Case 与 Skill 能力缺陷相关；测试分支证据可以支持修改，但修改后必须用同一批 Case 回归。",
+            "status": "can_optimize" if resilience_candidates and len(resilience_candidates) == len(candidates) else "needs_improvement",
+            "title": "建议增强 Skill 的执行稳定性" if resilience_candidates and len(resilience_candidates) == len(candidates) else "建议先修复 Skill，再进入下一轮验证",
+            "summary": "Skill 已声明目标步骤，但缺少能阻止 Agent 跳步提交的证据门禁。" if resilience_candidates and len(resilience_candidates) == len(candidates) else "可信失败证据指向 Skill 的具体规则缺口。",
         }
     elif gaps:
         skill_decision = {
@@ -788,17 +982,30 @@ def _overall_assessment(
             "title": "暂不修改 Skill，先补齐证据",
             "summary": "当前有 Case 无法核对完整会话或通过标准；证据不足不等于 Skill 失败。",
         }
+    elif unattributed_failures:
+        if fixture_mismatch_failures:
+            skill_decision = {
+                "status": "fixture_mismatch",
+                "title": "先修复不匹配的评测 Fixture",
+                "summary": "会话日志完整；失败 Case 的测试文件与目标语言/变更描述不一致。先定向重建该 Fixture，再沿用同一批 Case 评测。",
+            }
+        else:
+            skill_decision = {
+                "status": "attribution_pending",
+                "title": "先确认失败责任归属",
+                "summary": "会话日志完整，但当前失败同时可能由 Skill、Agent 或评测环境造成；确认责任后再决定是否修改 Skill。",
+            }
     elif pending:
         skill_decision = {
             "status": "verification_pending",
-            "title": "暂不修改 Skill，先完成稳定性复验",
-            "summary": "目前只有初测通过，尚未达到规定的重复运行次数。",
+            "title": "本次全部通过，等待统一稳定性复检",
+            "summary": "每条 Case 本次均已通过；复检只验证结果能否稳定复现。",
         }
     else:
         skill_decision = {
-            "status": "no_change",
-            "title": "当前没有需要修改 Skill 的可信证据",
-            "summary": "现有 Case 均已通过确定性门禁，或没有形成可授权的失败归因。",
+            "status": "healthy",
+            "title": "Skill 已满足本轮目标",
+            "summary": "现有 Case 已稳定通过；可结束本轮，或另行评估非阻塞增强项。",
         }
     case_outcome_counts = {
         "stable_pass": len(stable),
@@ -822,6 +1029,7 @@ def _overall_assessment(
             cluster_by_case.setdefault(str(case_id), cluster)
     responsibility_labels = {
         "skill_improvement_candidate": "Skill 问题候选",
+        "skill_optimization_candidate": "Skill 稳定性增强候选",
         "failure_not_authorized": "评测/证据不足，暂不归因 Skill",
         "evidence_gap": "证据或环境问题",
         "pass_pending_verification": "待稳定性复验",
@@ -865,10 +1073,55 @@ def _overall_assessment(
         )
         for item in assessments
     ]
+    # A compact, user-facing verdict is intentionally separate from the
+    # detailed matrices below.  It is the only text a reviewer needs to read
+    # before deciding whether to approve an optimization.
+    primary_problem = skill_problems[0] if skill_problems else {}
+    primary_change = optimization_plan[0] if optimization_plan else {}
+    model_summary = model_summary if isinstance(model_summary, Mapping) else {}
+    model_problem = _safe_model_summary(model_summary.get("problem"), 220)
+    model_evidence = _safe_model_summary(model_summary.get("evidence"), 260)
+    model_recommendation = _safe_model_summary(model_summary.get("recommendation"), 260)
+    primary_evidence = str(primary_problem.get("fact_summary") or "")
+    if not primary_evidence and gaps:
+        primary_evidence = _short_text(
+            "；".join(str(item.get("reason_cn") or item.get("reason") or "") for item in evidence_issues),
+            360,
+        )
+    if model_problem:
+        verdict_summary = "%s 建议：%s" % (
+            model_problem.rstrip("。") + "。",
+            (model_recommendation or primary_change.get("change") or "按关键证据执行最小修改").rstrip("。") + "。",
+        )
+    elif skill_problems:
+        verdict_summary = "问题：%s。证据：%s。建议：%s。" % (
+            _short_text(primary_problem.get("problem_cn") or primary_problem.get("problem"), 220),
+            _short_text(primary_evidence or "已绑定冻结会话证据", 260),
+            _short_text(primary_change.get("change") or "按失败事实补充可观察的执行与自检规则", 260),
+        )
+    elif gaps:
+        verdict_summary = "当前不能判断 Skill 是否有问题。证据：%s。建议：先补齐证据后再决定是否修改。" % (
+            _short_text(primary_evidence or "会话日志、Case 标准或仓库绑定不完整", 320),
+        )
+    elif pending:
+        verdict_summary = "全部 Case 本次评测通过；由用户确认后统一进行稳定性复检。"
+    else:
+        verdict_summary = "Skill 已满足本轮目标并完成稳定性验证。"
+    user_verdict = {
+        "status": skill_decision["status"],
+        "title": skill_decision["title"],
+        "summary": _decision_text(verdict_summary, 420),
+        "problem": _decision_text(model_problem or primary_problem.get("problem_cn") or primary_problem.get("problem") or ("全部 Case 本次通过，尚待稳定性复检" if pending else "本轮目标已满足"), 240),
+        "evidence": _decision_text(model_evidence or primary_evidence or ("所有 Case 的结果与执行证据均通过" if pending or stable else "没有需要补充的证据"), 280),
+        "fix": _decision_text(model_recommendation or primary_change.get("change") or ("先补齐证据" if gaps else "统一执行稳定性复检" if pending else "结束本轮并保留这些 Case 作为回归保护"), 280),
+        "affected_case_ids": list(primary_problem.get("case_ids", ())) if isinstance(primary_problem, Mapping) else [],
+        "evidence_refs": list(primary_problem.get("evidence_refs", ()))[:8] if isinstance(primary_problem, Mapping) else [],
+    }
     return {
         "conclusion": conclusion,
         "conclusion_cn": conclusion,
         "skill_decision": skill_decision,
+        "user_verdict": user_verdict,
         "case_outcome_counts": case_outcome_counts,
         "goal_coverage": {
             "observed": observed_goals,
@@ -962,26 +1215,65 @@ def _case_rows(value: Any, ids: Sequence[str], label: str, *, verification: bool
     # Claude sometimes emits a compact object keyed by case id instead of an
     # array.  Normalize that additive representation before applying the
     # strict coverage/status checks below.
+    # A semantic chunk may contain only baseline Cases. In that case there is
+    # deliberately no primary ``case_results`` payload to validate.
+    def shape_fallback(reason: str) -> list[Mapping[str, Any]]:
+        return [{
+            "case_id": str(case_id),
+            "status": "not_evaluable",
+            "reason": "语义模型返回的 case_results 无法解析（%s）；已降级为证据不足" % reason,
+            "evidence_refs": [],
+        } for case_id in ids]
+
+    if not ids:
+        # A baseline-only chunk has no primary rows by contract. Ignore any
+        # stray value rather than turning the whole optimization loop into a
+        # schema error.
+        return []
     if isinstance(value, Mapping):
-        rows = []
-        for case_id, item in value.items():
-            if isinstance(item, Mapping):
-                row = dict(item)
-            elif isinstance(item, str):
-                # Compact model responses occasionally use {case_id:
-                # "pass"}.  Keep the raw token and let the normalization
-                # below handle localized/qualified variants as well.
-                row = {"status": item, "reason": "model returned compact status", "evidence_refs": []}
-            else:
-                raise ValueError("%s.case_results must contain objects" % label)
-            row.setdefault("case_id", str(case_id))
-            rows.append(row)
+        # A one-Case chunk is sometimes returned as the row itself rather
+        # than wrapped in ``case_results`` or keyed by Case ID.  Accept that
+        # unambiguous shorthand, but only when the requested set contains one
+        # Case so a malformed multi-Case response cannot silently pass.
+        row_keys = {"case_id", "status", "verdict", "case_status", "result_status", "outcome"}
+        if len(ids) == 1 and row_keys.intersection(value):
+            row = dict(value)
+            row.setdefault("case_id", str(ids[0]))
+            rows = [row]
+        else:
+            rows = []
+            for case_id, item in value.items():
+                if isinstance(item, Mapping):
+                    row = dict(item)
+                elif isinstance(item, str):
+                    # Compact model responses occasionally use {case_id:
+                    # "pass"}.  Keep the raw token and let the normalization
+                    # below handle localized/qualified variants as well.
+                    row = {"status": item, "reason": "model returned compact status", "evidence_refs": []}
+                else:
+                    return shape_fallback("对象值类型为 %s" % type(item).__name__)
+                row.setdefault("case_id", str(case_id))
+                rows.append(row)
+    elif value is None and len(ids) == 1:
+        # Some Claude gateways serialize an omitted/null ``case_results``
+        # field when the answer is interrupted. Keep the Case auditable and
+        # conservative instead of aborting the whole optimization loop.
+        rows = [{
+            "case_id": str(ids[0]),
+            "status": "not_evaluable",
+            "reason": "语义模型未返回该 Case 的结构化判定",
+            "evidence_refs": [],
+        }]
+    elif isinstance(value, str) and len(ids) == 1:
+        rows = [{"case_id": str(ids[0]), "status": value, "reason": "model returned compact status", "evidence_refs": []}]
     elif isinstance(value, list) and all(isinstance(x, Mapping) for x in value):
         rows = [dict(x) for x in value]
+    elif isinstance(value, list) and len(value) == len(ids) and all(not isinstance(x, (Mapping, list, tuple)) for x in value):
+        rows = [{"case_id": str(case_id), "status": item, "reason": "model returned compact status", "evidence_refs": []} for case_id, item in zip(ids, value)]
     else:
-        raise ValueError("%s.case_results must be an array or case-id object" % label)
+        return shape_fallback("收到 %s" % type(value).__name__)
     if {str(x.get("case_id")) for x in rows} != set(ids):
-        raise ValueError("%s.case_results do not cover the selected cases" % label)
+        return shape_fallback("返回 Case 与请求 Case 不匹配")
     for row in rows:
         # Normalize common model wording to the frozen contract before
         # validation.  Real local-model responses often use Chinese labels,
@@ -1038,8 +1330,17 @@ def _case_rows(value: Any, ids: Sequence[str], label: str, *, verification: bool
             elif row.get("verification_status") not in ("pass", "fail", "not_evaluable", "not_run"):
                 row["verification_status_raw"] = raw_verification
                 row["verification_status"] = "not_evaluable"
-        if not isinstance(row.get("reason", ""), str) or not isinstance(row.get("evidence_refs", []), list):
-            raise ValueError("%s case row has invalid reason/evidence_refs" % label)
+        if not isinstance(row.get("reason", ""), str):
+            row["reason"] = str(row.get("reason") or "未提供语义判断理由")
+        refs = row.get("evidence_refs", [])
+        if refs is None:
+            row["evidence_refs"] = []
+        elif isinstance(refs, str):
+            row["evidence_refs"] = [refs]
+        elif isinstance(refs, Sequence) and not isinstance(refs, (str, bytes)):
+            row["evidence_refs"] = [str(ref) for ref in refs if str(ref)]
+        else:
+            row["evidence_refs"] = [str(refs)]
     return rows
 
 
@@ -1052,10 +1353,20 @@ def _parse_semantic(value: Mapping[str, Any], ids: Sequence[str], baseline_ids: 
     # case rows are used for the frozen decision; wrapper/extension metadata is
     # retained for explainability.
     payload: Mapping[str, Any] = value
+    row_keys = {"case_id", "status", "verdict", "case_status", "result_status", "outcome"}
     for wrapper in ("semantic_verdict", "result", "analysis"):
         nested = payload.get(wrapper) if isinstance(payload, Mapping) else None
-        if isinstance(nested, Mapping) and ("case_results" in nested or "results" in nested):
-            payload = nested
+        if isinstance(nested, Mapping):
+            if "case_results" in nested or "results" in nested:
+                payload = nested
+                break
+            if len(ids) == 1 and row_keys.intersection(nested):
+                row = dict(nested)
+                row.setdefault("case_id", str(ids[0]))
+                payload = {"case_results": [row]}
+                break
+        elif isinstance(nested, list):
+            payload = {"case_results": nested}
             break
     if "case_results" not in payload:
         for alias in ("results", "case_scores", "scores", "cases"):
@@ -1063,6 +1374,12 @@ def _parse_semantic(value: Mapping[str, Any], ids: Sequence[str], baseline_ids: 
                 payload = dict(payload)
                 payload["case_results"] = payload[alias]
                 break
+    if "case_results" not in payload and len(ids) == 1 and row_keys.intersection(payload):
+        # Accept a bare single-Case verdict emitted by a model following the
+        # per-Case instruction too literally.  The strict row/status/evidence
+        # checks below still apply and the deterministic Kernel remains the
+        # authority for mutation decisions.
+        payload = {"case_results": [dict(payload)]}
     known = {"api_version", "case_results", "without_skill_baseline_case_results", "failure_clusters", "conflicts", "proposed_changes", "target_scope", "model_extensions", "semantic_verdict", "result", "analysis", "results", "case_scores", "scores", "cases"}
     extensions = {str(key): value[key] for key in value if key not in known}
     if isinstance(value.get("model_extensions"), Mapping):
@@ -1104,9 +1421,19 @@ def _parse_proposal(value: Mapping[str, Any], inventory: Sequence[str]) -> Mappi
     if not isinstance(scope, list) or any(not isinstance(x, str) or not x for x in scope):
         raise ValueError("optimization target_scope must be an array of paths")
     allowed = set(str(x) for x in inventory)
+    # Models often use the conventional root alias even when this checkout
+    # exposes only ``src/SKILL.md``.  Normalize that alias before enforcing
+    # the scope contract so a valid user-approved optimization is not lost.
+    scope = [normalize_skill_path(item, inventory) for item in scope]
+    normalized_changes = []
+    for change in changes:
+        item = dict(change)
+        if item.get("target"):
+            item["target"] = normalize_skill_path(item.get("target"), inventory)
+        normalized_changes.append(item)
     if any(x not in allowed for x in scope):
         raise ValueError("optimization target_scope contains a non-editable path")
-    result = {"proposed_changes": [dict(x) for x in changes], "target_scope": list(scope)}
+    result = {"proposed_changes": normalized_changes, "target_scope": list(scope)}
     extensions = {str(key): value[key] for key in value if key not in known}
     if isinstance(value.get("model_extensions"), Mapping):
         extensions.update(dict(value["model_extensions"]))
@@ -1270,14 +1597,31 @@ class IterationBrain:
             request_text = json.dumps(request_value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False)
         started = time.monotonic()
         receipt = {"api_version": AGENT_CALL_RECEIPT_API_VERSION, "provider": self.provider, "profile": self.profile, "model": self.model_id, "prompt_template_version": PROMPT_TEMPLATE_VERSION, "stage": stage, "attempt": attempt, "input_hash": _hash(request_text), "request_chars": len(request_text), "request_estimated_tokens": max(1, (len(request_text) + 3) // 4), "context_compacted": request_text != json.dumps(input_value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False), "status": "running", "started_at": datetime.now(timezone.utc).isoformat()}
+        # Persist an in-flight marker before entering the local bridge. A
+        # Claude/CC Switch request can legitimately take up to the configured
+        # timeout; without this marker the task directory looks idle and the
+        # desktop has no evidence that a model call was actually started.
+        _write(stage_dir / "manifest.json", {
+            "api_version": "aceval.stage-manifest/v1",
+            "stage": stage,
+            "attempt": attempt,
+            "input_hash": input_hash,
+            "request_hash": receipt["input_hash"],
+            "status": "running",
+            "artifact_validated": False,
+            "started_at": receipt["started_at"],
+            "model": self.model_id,
+            "provider": self.provider,
+        })
+        _write(stage_dir / "agent-call-receipt.json", receipt)
         try:
             if len(request_text) > self.max_prompt_chars:
                 raise ValueError("staged request exceeds Token budget after safe evidence compaction (stage=%s, chars=%d, budget=%d)" % (stage, len(request_text), self.max_prompt_chars))
             self._prompt_chars += len(request_text)
             contract_hint = {
-                "semantic_grading": "必须包含 case_results（数组；每项含 case_id、status、reason、evidence_refs；建议同时返回 dimensions、skill_factors、agent_model_factors、environment_factors、attribution、attribution_confidence）。每次只分析一个 Case，并结合 Skill 原文、goal、重点检查项、scoring_dimensions、execution_path、完整 Trace、输出、耗时和重试记录；每个失败维度必须说明对应的输出或 Trace 内容，明确 Skill/Agent/环境归因。只有请求了基线时才返回 without_skill_baseline_case_results。",
-                "attribution": "必须包含 failure_clusters（数组）和 conflicts（数组）；结合逐 Case 结论与 Skill 原文区分 Skill 本身问题、Agent/模型执行偏差、工具/环境问题和评测标准问题，并给出可证伪的根因假设、对应事实、影响 Case、Skill 原文依据和置信度；不得只罗列 Case 名称或日志路径。",
-                "proposal": "必须包含 proposed_changes（数组）和 target_scope（可编辑路径数组）；每个 proposed_change 必须写明 Skill 原文中的目标段落/规则、具体新增或改写内容、解决的证据事实、受影响与保护 Case、验证步骤；禁止返回泛化的‘根据失败维度修改 Skill’。",
+                "semantic_grading": "必须包含 case_results（数组；每项含 case_id、status、reason、evidence_refs；建议同时返回 dimensions、skill_factors、agent_model_factors、environment_factors、attribution、attribution_confidence）。每次只分析一个 Case，并结合 Skill 原文、evaluation_goal、evaluation_standards、Case goal/重点检查项/scoring_dimensions、execution_path、冻结会话 Trace、输出、耗时和重试记录。reason 必须是 1 句不超过 120 字的事实结论，格式为‘未满足/满足什么：对应的 1 个输出或 Trace 事实’，禁止复制完整输出、Markdown、表格、执行过程回顾或分析过程；evidence_refs 只填证据路径/事件引用，不把正文塞进 reason。只有请求了基线时才返回 without_skill_baseline_case_results。",
+                "attribution": "必须包含 failure_clusters（数组）、conflicts（数组）和 overall_diagnosis（对象，含 verdict=defect|can_optimize|ready、problem、evidence、recommendation）；结合逐 Case 结论与 Skill 原文区分 Skill 本身问题、Agent/模型执行偏差、工具/环境问题和评测标准问题。overall_diagnosis 每个文本字段只写1句：problem说明实质问题，evidence只保留1个最关键事实，recommendation说明在Skill哪个位置增加什么规则；禁止拼接多个Case结论。若Skill已明确要求但Agent跳过，verdict用can_optimize并建议增加完成前证据门禁。每个问题簇只保留一个可证伪根因假设、一个事实摘要（不超过180字）、对应Skill规则位置和影响Case；不得复制Case输出、罗列日志原文、Case名称或日志路径充当结论。",
+                "proposal": "必须包含 proposed_changes（数组）和 target_scope（可编辑路径数组）；每个 proposed_change 必须写明 Skill 原文中的目标段落/规则、具体新增或改写内容、解决的证据事实、受影响与保护 Case、验证步骤。change、why、target_guidance 各不超过 180 字，使用‘在何处增加什么规则，以解决哪个已观察事实；如何验证’的格式；禁止返回完整报告、原始输出或泛化的‘根据失败维度修改 Skill’。",
             }.get(stage, "严格遵循当前阶段契约字段。")
             reply = self.model.complete([{"role": "system", "content": "请为 %s 阶段只返回一个 JSON 对象。%s 所有 reason、root_cause、change、why、description 和 evidence 说明必须使用简体中文。不要使用 Markdown 围栏、前后解释、注释或多个对象；reason 保持在 240 字以内。" % (stage, contract_hint)}, {"role": "user", "content": request_text}], ())
             receipt.update({"usage": dict(reply.usage or {}), "duration_ms": int((time.monotonic() - started) * 1000), "output_hash": _hash(reply.content)})
@@ -1342,8 +1686,16 @@ class IterationBrain:
         #重点检查项 and scoring dimensions so the UI can explain *why* it
         # passed and keep a regression baseline for later rounds.
         semantic_ids = sorted(str(c.get("id")) for c in cases if c.get("id"))
+        # Preserve the immutable execution verdict before semantic rows are
+        # merged.  A complete Trace is sufficient to make a Case evaluable;
+        # a semantic model returning ``not_evaluable`` is a model-contract
+        # limitation, not an evidence failure.
+        execution_fact_results = {str(cid): dict(value) for cid, value in heuristic.items()}
         semantic_input = {
+            "node_skill_contract": node_skill_context("single-case-evaluator"),
             "api_version": SEMANTIC_VERDICT_API_VERSION,
+            "evaluation_goal": str(kwargs.get("goal") or ""),
+            "evaluation_standards": [str(item) for item in kwargs.get("standards", ())],
             "skill_resources": kwargs.get("skill_resources", {}),
             "cases": [_model_compact(dict(c), max_string=1200) for c in cases if str(c.get("id")) in set(semantic_ids) | set(baseline_unresolved)],
             "evidence": [_model_case_context(x) for x in bundle["cases"] if str(x.get("case_id")) in set(semantic_ids)],
@@ -1408,25 +1760,61 @@ class IterationBrain:
                     chunk_baseline_ids = [item for item in baseline_unresolved if item in chunk_ids]
                     chunk_input["requested_case_ids"] = chunk_case_ids
                     chunk_input["requested_baseline_case_ids"] = chunk_baseline_ids
+                    def semantic_fallback(exc: Exception) -> Mapping[str, Any]:
+                        return {
+                            # A malformed/mismatched semantic response is a
+                            # grading evidence gap, not a failed Skill. Do
+                            # not copy the deterministic provisional status
+                            # here: that used to turn parser errors into
+                            # Skill-improvement candidates.
+                            "case_results": [{"case_id": cid, "status": "not_evaluable", "reason": "语义模型返回结果无法按契约解析，当前 Case 暂不能判定：%s" % str(exc)[:240], "evidence_refs": heuristic.get(cid, {}).get("evidence_refs", [])} for cid in chunk_case_ids],
+                            "without_skill_baseline_case_results": [],
+                        }
                     try:
                         chunk_semantic = self._model_stage(
                             "semantic_grading",
                             chunk_input,
                             lambda value, ids=chunk_case_ids, baseline_ids=chunk_baseline_ids: _parse_semantic(value, ids, baseline_ids),
                         )
-                    except (ClaudeProfileError, ReferenceRuntimeError) as exc:
+                    except (ClaudeProfileError, ReferenceRuntimeError, ValueError) as exc:
+                        # Invalid JSON itself is still a hard model-call
+                        # failure so the receipt can be retried. Only the
+                        # known semantic contract/shape errors are safe to
+                        # downgrade here; otherwise malformed transport
+                        # would be mistaken for a deterministic verdict.
+                        if isinstance(exc, ValueError) and "case_results" not in str(exc):
+                            raise
                         # A transient upstream 502 must not discard the
-                        # already-frozen execution evidence. Continue with a
-                        # deterministic per-Case verdict and expose the model
-                        # failure as analysis metadata instead of forcing a
-                        # full evaluation rerun.
-                        chunk_semantic = {
-                            "case_results": [{"case_id": cid, "status": heuristic.get(cid, {}).get("status", "fail"), "reason": "语义模型暂时不可用，已依据冻结执行事实完成分析：%s" % str(exc)[:240], "evidence_refs": heuristic.get(cid, {}).get("evidence_refs", [])} for cid in chunk_case_ids],
-                            "without_skill_baseline_case_results": [],
-                        }
+                        # already-frozen execution evidence. Model contract or
+                        # parsing failures are handled the same way: continue
+                        # with a deterministic per-Case verdict and expose the
+                        # model failure as analysis metadata instead of
+                        # forcing a full evaluation rerun. The immutable trace
+                        # remains the source of truth for later review/retry.
+                        chunk_semantic = semantic_fallback(exc)
+                    except Exception as exc:
+                        # Keep a final compatibility boundary for older
+                        # parser implementations or gateway wrappers that
+                        # still raise the former ``case_results must be an
+                        # array or case-id object`` message as a generic
+                        # exception. Only that semantic-shape family is
+                        # downgraded; unrelated bugs must remain visible.
+                        if "case_results" not in str(exc):
+                            raise
+                        chunk_semantic = semantic_fallback(exc)
                     semantic_rows.extend(chunk_semantic["case_results"])
                     baseline_rows.extend(chunk_semantic["without_skill_baseline_case_results"])
                 semantic = {"case_results": semantic_rows, "without_skill_baseline_case_results": baseline_rows}
+                for row in semantic["case_results"]:
+                    cid = str(row.get("case_id") or "")
+                    fact = execution_fact_results.get(cid, {})
+                    if row.get("status") == "not_evaluable" and fact.get("status") in ("pass", "fail"):
+                        row["status"] = fact["status"]
+                        row["reason"] = (
+                            "语义模型未返回可判定状态；依据完整会话 Trace 和执行路径记录为%s。"
+                            % ("通过" if fact["status"] == "pass" else "未通过")
+                        )
+                        row["evidence_refs"] = list(fact.get("evidence_refs", ()))
                 # A single chunk already has the full input identity and was
                 # persisted by _model_stage.  Only write an aggregate alias
                 # when multiple chunk artifacts need to be joined.
@@ -1447,27 +1835,17 @@ class IterationBrain:
             self._attempt_counter += 1; self._save_stage("semantic_grading", semantic_input_hash, semantic, self._attempt_counter)
         else:
             semantic = {"case_results": [], "without_skill_baseline_case_results": []}; self._save_stage("semantic_grading", semantic_input_hash, semantic, self._attempt_counter)
-        # A valid completed session is always an analyzable observation.  If a
-        # semantic judge answers ``not_evaluable`` despite a complete artifact
-        # and Trace, retain its explanation as a hypothesis but materialize a
-        # normal failed outcome so the Case enters diagnosis/optimization
-        # instead of an endless evidence-retry loop.
+        # Only a failed/incomplete remote session may create an evidence gap.
+        # Once the immutable artifact contains a complete Trace and output,
+        # parser/model uncertainty is resolved from the execution facts above
+        # instead of being shown to the user as spurious "证据不足".
         evidence_by_id = {str(item.get("case_id")): item for item in bundle.get("cases", ()) if isinstance(item, Mapping)}
-        for cid, value in list(heuristic.items()):
-            if value.get("status") != "not_evaluable":
-                continue
-            item = evidence_by_id.get(cid, {})
-            trace = item.get("trace") if isinstance(item.get("trace"), Mapping) else {}
-            if item.get("artifact") and item.get("trace_complete") is True and int(trace.get("event_count") or 0) > 0:
-                updated = dict(value)
-                updated["status"] = "fail"
-                updated["analysis_status"] = "not_evaluable"
-                updated["reason"] = str(value.get("reason") or "语义模型未给出通过结论") + "；会话证据完整，按可分析的目标偏差进入归因"
-                heuristic[cid] = updated
         results_by_id = {str(c.get("id")): heuristic[str(c.get("id"))] for c in cases}
         # Re-apply frozen deterministic facts after semantic grading.
         for cid, value in self._hard_results(cases, bundle["cases"]).items(): results_by_id[cid] = value
-        inventory = list(kwargs.get("editable_resource_inventory") or ("SKILL.md",)); failures = [cid for cid, x in results_by_id.items() if x.get("status") == "fail"]
+        inventory = list(kwargs.get("editable_resource_inventory") or ("SKILL.md",))
+        entrypoint = skill_entrypoint_path(inventory)
+        failures = [cid for cid, x in results_by_id.items() if x.get("status") == "fail"]
         # Give cross-Case attribution the deterministic dimension evidence as
         # well as the semantic rows.  Previously this context was only
         # materialized later in ``_assemble``; the model therefore saw Case
@@ -1514,7 +1892,18 @@ class IterationBrain:
                 "stable_pass": aggregate.stable_pass,
                 "failed_dimensions": failed_dimensions[:8],
             })
-        attribution_input = _model_compact({"api_version": ATTRIBUTION_REPORT_API_VERSION, "evidence_hash": bundle["input_hash"], "skill_resources": kwargs.get("skill_resources", {}), "semantic_verdict": semantic, "case_results": list(results_by_id.values()), "cases": [dict(c) for c in cases], "case_review_context": semantic_input.get("case_review_context", []), "verification_evidence": list(bundle["verification_evidence"]), "editable_resource_inventory": inventory, "instructions": "跨 Case 汇总前先保留每个 Case 独立结论；只有多个 Case 的失败维度/证据指向同一 Skill 机制时才聚类，明确潜在冲突。必须引用 Skill 原文中的具体规则/段落，说明哪些失败是 Skill 缺口，哪些是 Agent/模型执行偏差，哪些是工具/环境或评测标准问题；不得只罗列 Case 名称或日志路径。"})
+        attribution_input = _model_compact({"api_version": ATTRIBUTION_REPORT_API_VERSION, "evidence_hash": bundle["input_hash"], "evaluation_goal": str(kwargs.get("goal") or ""), "evaluation_standards": [str(item) for item in kwargs.get("standards", ())], "skill_resources": kwargs.get("skill_resources", {}), "semantic_verdict": semantic, "case_results": list(results_by_id.values()), "cases": [dict(c) for c in cases], "case_review_context": semantic_input.get("case_review_context", []), "verification_evidence": list(bundle["verification_evidence"]), "editable_resource_inventory": inventory, "instructions": "跨 Case 汇总前先保留每个 Case 独立结论；只有多个失败事实指向同一 Skill 规则时才聚类。逐 Case 先做覆盖性核对：检查该 Case 的 Fixture 实际 changed_paths、文件扩展名、diff 内容和可用工具，若评测点要求 TS/Vue/脚本/性能/测试但 Fixture 未包含对应文件或证据通道，必须标记为‘评测覆盖不足’，不能归因 Skill；若 Fixture 已覆盖且 Agent 有执行机会，再判断是 Skill 缺口还是 Agent/模型偏差。‘未观察到’只能在有执行机会且应当产出该检查点时使用。必须引用 Skill 原文中的具体规则/段落，区分 Skill 缺口、Agent/模型执行偏差、工具/环境问题和评测标准问题。每个问题簇只输出 problem_summary（用户能看懂的实质缺口，1句≤120字，禁止复述检查点长句）、evidence_summary（1条最关键的输出或Trace事实，≤160字）、root_cause_hypothesis、skill_rule_reference；problem_summary 必须使用‘Skill 缺少/未明确/未强制……，导致……’或‘Agent 未执行……，但 Skill 已明确要求……’的结构；不得复制输出、Markdown表格、执行过程回顾、Case名称列表或日志路径充当结论。"})
+        attribution_input["node_skill_contract"] = node_skill_context("skill-diagnostician")
+        attribution_input["fixture_coverage"] = [
+            {
+                "case_id": str(case.get("id") or ""),
+                "changed_paths": list(((case.get("metadata") or {}).get("fixture_generation") or {}).get("changed_paths", ())) if isinstance(case.get("metadata"), Mapping) else [],
+                "fixture_branch": str(((case.get("metadata") or {}).get("fixture_branch") or "")) if isinstance(case.get("metadata"), Mapping) else "",
+                "base_commit": str(((case.get("metadata") or {}).get("base_commit") or "")) if isinstance(case.get("metadata"), Mapping) else "",
+                "head_commit": str(((case.get("metadata") or {}).get("head_commit") or "")) if isinstance(case.get("metadata"), Mapping) else "",
+            }
+            for case in cases
+        ]
         attribution_input["deterministic_case_context"] = deterministic_case_context
         # Re-compact after adding the cross-case projection.  Stage inputs are
         # hashed before transport, but the payload itself must fit the local
@@ -1525,11 +1914,12 @@ class IterationBrain:
         if self.model is not None and (failures or semantic_ids):
             try:
                 attribution = self._model_stage("attribution", attribution_input, _parse_attribution)
-            except (ClaudeProfileError, ReferenceRuntimeError):
+            except (ClaudeProfileError, ReferenceRuntimeError, ValueError):
                 attribution = {"failure_clusters": ([{"id": "observed-failures", "case_ids": failures, "root_cause": "根据冻结执行事实，失败 Case 未满足 Skill 要求；需由用户确认最小 Skill 修改", "skill_change_authorized": bool(failures)}] if failures else []), "conflicts": []}
         else:
             attribution = {"failure_clusters": ([{"id": "observed-failures", "case_ids": failures, "root_cause": "requires cross-case Skill repair analysis", "skill_change_authorized": bool(failures)}] if failures else []), "conflicts": []}; self._save_stage("attribution", _hash(attribution_input), attribution, self._attempt_counter)
-        proposal_input = _model_compact({"api_version": OPTIMIZATION_PLAN_API_VERSION, "evidence_hash": bundle["input_hash"], "skill_resources": kwargs.get("skill_resources", {}), "semantic_verdict": semantic, "attribution_report": attribution, "cases": [dict(c) for c in cases], "case_review_context": semantic_input.get("case_review_context", []), "editable_resource_inventory": inventory, "instructions": "提出最小、可验证且不让一个 Case 的修复破坏另一个 Case 的修改；必须针对 Skill 原文给出具体章节/规则改法、修改后应新增的行为约束或自检清单；列出受影响 Case、保护 Case、验证步骤和可能冲突。禁止使用‘根据失败维度修改 Skill’‘保留通过 Case’等无信息量句子。"})
+        proposal_input = _model_compact({"api_version": OPTIMIZATION_PLAN_API_VERSION, "evidence_hash": bundle["input_hash"], "evaluation_goal": str(kwargs.get("goal") or ""), "evaluation_standards": [str(item) for item in kwargs.get("standards", ())], "skill_resources": kwargs.get("skill_resources", {}), "semantic_verdict": semantic, "attribution_report": attribution, "cases": [dict(c) for c in cases], "case_review_context": semantic_input.get("case_review_context", []), "editable_resource_inventory": inventory, "instructions": "提出最小、可验证且不让一个 Case 的修复破坏另一个 Case 的修改；必须针对 Skill 原文给出具体章节/规则改法、修改后应新增的行为约束或自检清单；列出受影响 Case、保护 Case、验证步骤和可能冲突。每个 proposed_change 的 change、why、target_guidance 各只写1句，≤180字，明确‘修改位置 + 新规则/自检 + 要解决的事实 + 验证方式’；禁止拼接完整输出、Markdown报告、执行过程回顾或使用‘根据失败维度修改 Skill’‘保留通过 Case’等无信息量句子。"})
+        proposal_input["node_skill_contract"] = node_skill_context("skill-diagnostician")
         proposal_input["deterministic_case_context"] = deterministic_case_context
         proposal_input = _model_compact(proposal_input, max_string=1200)
         if isinstance(kwargs.get("skill_resources"), Mapping):
@@ -1537,10 +1927,10 @@ class IterationBrain:
         if self.model is not None and (failures or semantic_ids):
             try:
                 proposal = self._model_stage("proposal", proposal_input, lambda x: _parse_proposal(x, inventory))
-            except (ClaudeProfileError, ReferenceRuntimeError):
-                proposal = {"proposed_changes": ([{"target": "SKILL.md", "change": "根据逐 Case 失败事实补充明确的执行步骤、产出要求和自检标准", "why": "分析模型暂时不可用，但冻结执行证据显示目标未满足", "case_ids": failures}] if failures else []), "target_scope": ["SKILL.md"] if failures else []}
+            except (ClaudeProfileError, ReferenceRuntimeError, ValueError):
+                proposal = {"proposed_changes": ([{"target": entrypoint, "change": "根据逐 Case 失败事实补充明确的执行步骤、产出要求和自检标准", "why": "分析模型暂时不可用，但冻结执行证据显示目标未满足", "case_ids": failures}] if failures else []), "target_scope": [entrypoint] if failures else []}
         else:
-            proposal = {"proposed_changes": ([{"target": "SKILL.md", "change": "repair the shared cause supported by failed case evidence", "why": "one or more frozen expectations failed", "case_ids": failures}] if failures else []), "target_scope": ["SKILL.md"] if failures else []}; self._save_stage("proposal", _hash(proposal_input), proposal, self._attempt_counter)
+            proposal = {"proposed_changes": ([{"target": entrypoint, "change": "repair the shared cause supported by failed case evidence", "why": "one or more frozen expectations failed", "case_ids": failures}] if failures else []), "target_scope": [entrypoint] if failures else []}; self._save_stage("proposal", _hash(proposal_input), proposal, self._attempt_counter)
         _write(self.artifact_root / "analysis-state.json", {"stage": "proposal", "evidence_hash": bundle["input_hash"], "completed": True})
         return self._assemble(kwargs, cases, bundle, results_by_id, verification_heuristic, baseline_heuristic, attribution, proposal)
 
@@ -1578,6 +1968,7 @@ class IterationBrain:
             str(item)
             for item in (kwargs.get("editable_resource_inventory") or ("SKILL.md",))
         )
+        entrypoint = skill_entrypoint_path(sorted(inventory))
 
         primary_passes = [item["case_id"] for item in results if item["status"] == "pass"]
 
@@ -1641,7 +2032,7 @@ class IterationBrain:
             flaky = []
 
         failed = [item["case_id"] for item in results if item["status"] == "fail"] + flaky
-        authorizable_failure_ids = set(failed).intersection(eligible)
+        eligible_failure_ids = set(failed).intersection(eligible)
 
         # A model may explain or group any observed row, but only a real
         # failed/flaky Case with a trusted Oracle may authorize a Skill edit.
@@ -1649,20 +2040,76 @@ class IterationBrain:
         for cluster in attribution.get("failure_clusters", []):
             value = dict(cluster)
             original = [str(item) for item in value.get("case_ids", [])]
-            authorized_ids = [item for item in original if item in authorizable_failure_ids]
+            authorized_ids = [item for item in original if item in eligible_failure_ids]
             value["case_ids"] = authorized_ids
             value["excluded_unready_case_ids"] = [item for item in original if item not in eligible]
             value["excluded_non_failure_case_ids"] = [
-                item for item in original if item in eligible and item not in authorizable_failure_ids
+                item for item in original if item in eligible and item not in eligible_failure_ids
             ]
             # Trusted deterministic Case eligibility is the mutation gate. A
             # model may explicitly veto a Skill attribution, but omitting the
             # redundant cluster boolean must not hide a real authorized
             # failure from the diagnosis/optimization panels.
+            category = str(value.get("category") or "").strip().casefold()
+            explicit_authorization = value.get("skill_change_authorized")
+            skill_category = (not category) or any(token in category for token in ("skill", "技能", "skill_design", "skill_definition"))
+            # A diagnostician may describe an Agent/model, environment or
+            # evaluation-standard failure in detail, but that is not evidence
+            # for changing SKILL.md.  Only an explicitly Skill-classified
+            # cluster (or the legacy no-category + explicit authorization
+            # shape) can authorize a Skill candidate.
+            if category and not skill_category:
+                authorized_ids = []
+            value["case_ids"] = authorized_ids
             value["skill_change_authorized"] = bool(
-                value.get("skill_change_authorized") is not False and authorized_ids
+                skill_category
+                and explicit_authorization is not False
+                and authorized_ids
             )
             clusters.append(value)
+
+        # A clear Agent execution miss can still reveal a legitimate Skill
+        # robustness opportunity: the rule exists, but the Skill does not
+        # make compliance observable or block unsupported completion.  Keep
+        # the causal attribution as Agent/model while allowing a narrowly
+        # scoped pre-output gate or self-check improvement.  This is surfaced
+        # as "可优化" rather than falsely claiming a missing capability.
+        resilience_case_ids: set[str] = set()
+        for result in results:
+            case_id = str(result.get("case_id") or "")
+            attribution_label = str(result.get("attribution") or result.get("responsibility") or "").casefold()
+            skill_factors = _text_list(result.get("skill_factors", result.get("skill_issue", [])))
+            if (
+                case_id in eligible_failure_ids
+                and skill_factors
+                and any(token in attribution_label for token in ("agent", "model", "模型", "执行偏差"))
+            ):
+                resilience_case_ids.add(case_id)
+                clusters.append({
+                    "id": "skill-resilience-%s" % case_id,
+                    "category": "skill_resilience",
+                    "case_ids": [case_id],
+                    "problem_summary": "Skill 已说明该步骤，但缺少完成前的强制证据校验，Agent 跳过后仍能提交结果。",
+                    "evidence_summary": _decision_text(result.get("reason") or "Trace 显示 Agent 未执行 Skill 已明确要求的步骤。", 160),
+                    "root_cause_hypothesis": "把关键步骤的执行证据设为完成门禁，可降低模型跳步和虚构执行结果的概率。",
+                    "skill_rule_location": "在对应必需步骤之后、最终输出之前增加证据自检门禁",
+                    "skill_change_authorized": True,
+                    "optimization_kind": "resilience",
+                    "causal_attribution": "agent_model",
+                })
+
+        skill_authorized_case_ids = {
+            case_id
+            for cluster in clusters
+            if cluster.get("skill_change_authorized") is True
+            for case_id in cluster.get("case_ids", ())
+        }
+        authorizable_failure_ids = eligible_failure_ids.intersection(skill_authorized_case_ids)
+        # Re-filter after attribution classification so an Agent/environment
+        # cluster can never leak its Cases into the fallback Skill proposal.
+        for cluster in clusters:
+            cluster["case_ids"] = [case_id for case_id in cluster.get("case_ids", ()) if case_id in authorizable_failure_ids]
+            cluster["skill_change_authorized"] = bool(cluster.get("skill_change_authorized") and cluster["case_ids"])
 
         changes = []
         for change in proposal.get("proposed_changes", []):
@@ -1684,12 +2131,24 @@ class IterationBrain:
         # preserve the evidence boundary and create a conservative fallback
         # proposal scoped to the existing Skill resource.
         if authorizable_failure_ids and not changes:
-            changes.append({
-                "target": "SKILL.md",
-                "change": "根据失败维度和目标核对结果修正 Skill，并保留通过 Case 作为回归保护",
-                "why": "一个或多个可信失败 Case 已绑定不可变会话证据",
-                "case_ids": sorted(authorizable_failure_ids),
-            })
+            resilience_ids = sorted(authorizable_failure_ids.intersection(resilience_case_ids))
+            defect_ids = sorted(authorizable_failure_ids.difference(resilience_case_ids))
+            if resilience_ids:
+                changes.append({
+                    "target": entrypoint,
+                    "change": "在对应必需步骤后增加完成前证据门禁：未观察到实际工具调用及成功结果时必须停止并说明，禁止声称已执行或继续输出相关结论。",
+                    "why": "Trace 显示 Agent 跳过 Skill 已明确要求的步骤，却仍提交了基于该步骤的错误结论。",
+                    "target_guidance": "对应必需步骤之后、最终报告之前的自检规则",
+                    "validation_steps": ["同一 Case 重跑时必须观察到实际工具调用", "脚本失败时必须停止或明确降级，不得编造结果"],
+                    "case_ids": resilience_ids,
+                })
+            if defect_ids:
+                changes.append({
+                    "target": entrypoint,
+                    "change": "根据失败维度和目标核对结果修正 Skill，并保留通过 Case 作为回归保护",
+                    "why": "一个或多个可信失败 Case 已绑定不可变会话证据",
+                    "case_ids": defect_ids,
+                })
 
         eligible_flaky = [case_id for case_id in flaky if case_id in eligible]
         if eligible_flaky:
@@ -1702,15 +2161,16 @@ class IterationBrain:
                 "skill_change_authorized": True,
             })
             changes.append({
-                "target": "SKILL.md",
+                "target": entrypoint,
                 "change": "make the affected workflow deterministic",
                 "why": "a trusted primary pass was not stable",
                 "case_ids": eligible_flaky,
             })
 
         requested_scope = [str(item) for item in proposal.get("target_scope", [])]
-        if eligible_flaky and "SKILL.md" not in requested_scope:
-            requested_scope.append("SKILL.md")
+        requested_scope = [normalize_skill_path(item, inventory) for item in requested_scope]
+        if eligible_flaky and entrypoint not in requested_scope:
+            requested_scope.append(entrypoint)
         for change in changes:
             target = str(change.get("target") or "")
             if target and target not in requested_scope:
@@ -1718,9 +2178,23 @@ class IterationBrain:
         unsupported_scope = [item for item in requested_scope if item not in inventory]
         scope = [item for item in requested_scope if item in inventory]
 
+        # A transport/binding failure can be serialized as ``fail`` by an
+        # upstream adapter even though no Agent run occurred.  Such a row is
+        # evidence-incomplete, never a Skill failure.  Promote it into the
+        # evidence-gap path before building user-facing assessments.
+        environment_gaps = []
+        for item in results:
+            dimensions = item.get("dimensions") if isinstance(item.get("dimensions"), Mapping) else {}
+            if (
+                item.get("attribution") == "environment"
+                and (dimensions.get("binding") in ("failed", "fail") or dimensions.get("runtime") in ("failed", "error", "environment_error"))
+                and not item.get("artifact")
+            ):
+                environment_gaps.append(item["case_id"])
         not_eval = sorted(set(
             [item["case_id"] for item in results if item["status"] == "not_evaluable"]
             + [item.case_id for item in aggregates if item.status == "not_evaluable"]
+            + environment_gaps
         ))
         result_by_id = {str(item.get("case_id")): item for item in results}
         evidence_issues = [
@@ -1735,10 +2209,12 @@ class IterationBrain:
             aggregate = aggregate_by_id.get(case_id)
             aggregate_status = aggregate.status if aggregate is not None else str(result.get("status") or "not_evaluable")
             issue = issue_by_id.get(case_id)
+            if issue is not None:
+                aggregate_status = "not_evaluable"
             raw_result_status = str(result.get("status") or "not_evaluable")
             pending_verification = bool(
                 aggregate is not None
-                and aggregate_status == "fail"
+                and aggregate_status == "pass"
                 and raw_result_status == "pass"
                 and not aggregate.flaky
                 and not aggregate.stable_pass
@@ -1760,8 +2236,12 @@ class IterationBrain:
                 skill_recommendation = "暂不修改 Skill；当前没有已证实的 Skill 缺陷。"
                 fixture_recommendation = "保持现有测试分支和 commit 绑定，优先复验同一分支。"
             elif aggregate_status == "fail" and case_id in authorizable_failure_ids:
-                responsibility = "skill_improvement_candidate"
-                conclusion = "可信评测未达标，可作为 Skill 改进候选；仍需通过下一轮回归验证归因。"
+                responsibility = "skill_optimization_candidate" if case_id in resilience_case_ids else "skill_improvement_candidate"
+                conclusion = (
+                    "本次未通过源于 Agent 跳过已声明步骤；Skill 可通过增加完成前证据门禁来提升执行稳定性。"
+                    if case_id in resilience_case_ids
+                    else "可信评测未达标，可作为 Skill 改进候选；仍需通过下一轮回归验证归因。"
+                )
                 recommended_action = "检查下方根因假设与最小修改提案，确认后生成 Skill 候选并使用同一批 Case 回归。"
                 skill_recommendation = "根据失败维度和根因假设修改 Skill；保留通过 Case 作为回归保护。"
                 fixture_recommendation = "当前证据已足以评估测试分支；除非发现代码改动或 commit 绑定错误，否则不应修改 Fixture。"
@@ -1793,6 +2273,10 @@ class IterationBrain:
             dimension_summaries = _dimension_summaries(attempts)
             for summary in dimension_summaries:
                 summary["evidence_detail"] = _dimension_evidence_detail(summary, evidence_item, case)
+                summary["summary_reason"] = _compact_failure_fact(
+                    {"case_id": case_id, "status": aggregate_status, "goal_observations": _case_goal_observations(case, evidence_item, result, aggregate, issue)},
+                    summary,
+                )
             hard_failures = [
                 str(item.get("label") or _dimension_label_cn(item.get("dimension")))
                 for item in dimension_summaries
@@ -1833,7 +2317,7 @@ class IterationBrain:
                 for item in dimension_summaries
                 if item.get("status") == "fail"
             ]
-            if responsibility == "skill_improvement_candidate" and not skill_factors:
+            if responsibility in {"skill_improvement_candidate", "skill_optimization_candidate"} and not skill_factors:
                 skill_factors = [
                     "Skill 未能稳定满足%s" % ("、".join(failed_dimension_labels[:4]) if failed_dimension_labels else "该 Case 的目标与执行要求")
                 ]
@@ -1846,7 +2330,8 @@ class IterationBrain:
             case_assessments.append({
                 "case_id": case_id,
                 "status": aggregate_status,
-                "display_status": "pending_verification" if pending_verification else aggregate_status,
+                "display_status": aggregate_status,
+                "stability_status": "pending" if pending_verification else "stable" if aggregate is not None and aggregate.stable_pass else "not_applicable",
                 "semantic_status": str(result.get("status") or "not_evaluable"),
                 "reason": str(result.get("reason") or "没有形成结论说明"),
                 "attribution": responsibility,
@@ -1869,6 +2354,11 @@ class IterationBrain:
                 "retry_count": next((item.get("retry_count", 0) for item in evidence if str(item.get("case_id")) == case_id), 0),
                 "dimensions": [dimension for attempt in attempts for dimension in attempt.get("dimensions", ())],
                 "dimension_summaries": dimension_summaries,
+                "summary_fact": "；".join(
+                    "%s：%s" % (item.get("label") or _dimension_label_cn(item.get("dimension")), item.get("summary_reason") or "未记录具体依据")
+                    for item in dimension_summaries
+                    if item.get("status") in ("fail", "not_evaluable")
+                )[:520],
                 "hard_failed_dimensions": hard_failures,
                 "hard_evidence_gaps": hard_gaps,
                 "goal_completion": {
@@ -1879,12 +2369,15 @@ class IterationBrain:
                 },
                 "goal_observations": goal_observations,
             })
-        if primary_passes and kwargs.get("verification_batch") is None:
-            next_action = "verify_passes"
-        elif not_eval:
+        # Present one complete decision before any repeat run. Real failures
+        # or evidence gaps are handled first; stability verification is only
+        # offered when every Case passed its initial attempt.
+        if not_eval:
             next_action = "needs_evidence"
         elif failed:
             next_action = "await_user_confirmation"
+        elif primary_passes and kwargs.get("verification_batch") is None:
+            next_action = "verify_passes"
         else:
             next_action = "converged"
 
@@ -1904,6 +2397,7 @@ class IterationBrain:
             elif unsupported_scope:
                 next_action = "needs_evidence"
                 blocker = "target scope is not an editable existing Skill resource: %s" % ", ".join(unsupported_scope)
+        attribution_extensions = attribution.get("model_extensions") if isinstance(attribution.get("model_extensions"), Mapping) else {}
         overall_assessment = _overall_assessment(
             cases,
             case_assessments,
@@ -1911,6 +2405,8 @@ class IterationBrain:
             changes,
             evidence_issues,
             next_action,
+            entrypoint,
+            attribution_extensions.get("overall_diagnosis") if isinstance(attribution_extensions, Mapping) else None,
         )
         diagnosis = compile_diagnosis_graph(
             case_assessments,

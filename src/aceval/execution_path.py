@@ -380,12 +380,22 @@ def _command_text(event: Mapping[str, Any]) -> Optional[str]:
     """
 
     event_type = str(event.get("kind") or event.get("type") or "")
-    if event_type not in ("tool_call", "tool", "tool_start"):
+    if event_type not in (
+        "tool_call", "tool", "tool_start", "agent.tool_use",
+        "assistant.tool_use", "function_call",
+    ):
         return None
     values = []
     for path in (
         "command",
         "argv",
+        # CATX Agent traces keep the executable payload directly under
+        # ``input`` (for example ``{"type":"agent.tool_use",
+        # "input":{"command":"node ..."}}``).  The previous matcher only
+        # looked through provider-specific wrappers, so a real command was
+        # silently reported as missing.
+        "input.command",
+        "input.argv",
         "payload.command",
         "payload.argv",
         "payload.input.command",
@@ -404,8 +414,24 @@ def _command_text(event: Mapping[str, Any]) -> Optional[str]:
 def _matches(event: Mapping[str, Any], matcher: Mapping[str, Any]) -> bool:
     event_type = event.get("kind") or event.get("type")
     tool_name = event.get("tool") or event.get("name") or _field(event, "payload.name")
-    if "event_type" in matcher and event_type not in _one_or_many(matcher["event_type"]):
-        return False
+    if "event_type" in matcher:
+        expected_types = _one_or_many(matcher["event_type"])
+        # CATX/Agent traces use ``agent.tool_use`` for the same semantic
+        # action represented as ``tool_call`` in the execution-path IR. Keep
+        # the IR provider-neutral while still requiring an actual tool event.
+        tool_event_aliases = {"tool_call", "tool", "tool_start", "agent.tool_use", "assistant.tool_use", "function_call"}
+        output_event_aliases = {"agent.output", "agent.message", "assistant.message", "assistant.output", "message"}
+        type_matches = event_type in expected_types
+        if not type_matches and "tool_call" in expected_types and event_type in tool_event_aliases:
+            type_matches = True
+        # Output checkpoints are authored as ``agent.output`` in generated
+        # paths, while CATX receipts expose the same final text as an
+        # ``agent.message`` event.  Treat these provider-neutral aliases as
+        # equivalent, but never treat a tool result as an output event.
+        if not type_matches and "agent.output" in expected_types and event_type in output_event_aliases:
+            type_matches = True
+        if not type_matches:
+            return False
     if "tool_name" in matcher and tool_name not in _one_or_many(matcher["tool_name"]):
         return False
     text = json.dumps(event, ensure_ascii=False, sort_keys=True, default=str)

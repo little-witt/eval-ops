@@ -51,6 +51,7 @@ from .model_case_generation import (
     model_profile,
     parse_model_case_design,
 )
+from .evaluation_skills import node_skill_manifest
 from .registry import build_builtin_registry
 from .remote_batch import RemoteBatchCoordinator, RemoteBatchError, SessionGateway
 from .repository_checkout import GitCheckoutManager
@@ -1410,17 +1411,41 @@ class IterationKernel:
             if duplicate_ids and user_input.cases:
                 raise IterationKernelError("user Case ids conflict with custom EvalPack: %s" % ", ".join(sorted(duplicate_ids)))
             seeds = tuple(seeds) + tuple(pack_seeds) if (user_input.cases or (blueprint and blueprint.get("selected_proposal_ids"))) else tuple(pack_seeds)
+        planning_root = root / "planning"
+        if planning_root.exists() or planning_root.is_symlink():
+            # A prior model attempt may have left immutable planning artifacts
+            # behind. Never overwrite them; create an auditable retry sibling.
+            retry_index = 1
+            while (root / ("planning-retry-%03d" % retry_index)).exists():
+                retry_index += 1
+            planning_root = root / ("planning-retry-%03d" % retry_index)
         planning = create_planning_artifacts(
             _skill_root(str(config.skill_repository.local_path)),
             {"name": "%s-kernel" % user_input.skill_name, "version": "0.1.0", "cases": list(seeds)},
             goal,
-            root / "planning",
+            planning_root,
             runtime_capabilities=tuple(sorted(set(REFERENCE_RUNTIME_CAPABILITIES).union(("network", "authentication", "browser", "screenshot", "remote_state_snapshot", "observability_tools", "approval_gate", "artifact_output")))),
-            max_generated_cases=config.policy.max_generated_cases,
+            # Code-review flows stay intentionally small and comparable: one
+            # primary Case plus at most four high-value generated Cases. This
+            # prevents every checklist bullet/state variant becoming a near-
+            # duplicate remote session.
+            max_generated_cases=(
+                min(4, config.policy.max_generated_cases)
+                if config.code_repository is not None
+                else config.policy.max_generated_cases
+            ),
         )
         cases_document = dict(planning.case_generation.cases_document)
         raw_cases = cases_document.get("cases", ())
         cases = [dict(item) for item in raw_cases if isinstance(item, Mapping)]
+        # ``auto-primary-goal`` is only a bootstrap placeholder for an empty
+        # input.  In code-review flows it has no declared oracle or concrete
+        # review target, so once the planner produced real requirement-backed
+        # Cases it would dilute the result and could be marked failed despite
+        # every scored dimension passing.  Keep the substantive generated
+        # Cases and record the omission in the design provenance instead.
+        if config.code_repository is not None and not user_input.cases and len(cases) > 1:
+            cases = [item for item in cases if str(item.get("id")) != "auto-primary-goal"]
         graph = planning.capability_graph.to_dict()
         capability_contract = contract_hash(graph)
         default_applicability = {
@@ -1468,13 +1493,13 @@ class IterationKernel:
                 standards=standards,
                 seed_cases=seeds,
                 cases=cases,
-                artifact_root=root / "planning",
+                artifact_root=planning_root,
             )
             self.store.append_event(task_id, "evaluation.case_generation_completed" if model_case_provenance.get("status") == "validated" else "evaluation.case_generation_failed", dict(model_case_provenance), iteration=int(state.get("iteration", 0)))
         except Exception as exc:
             model_case_provenance = dict(model_case_provenance)
             model_case_provenance.update({"status": "fallback", "error": str(exc)[:500]})
-            _atomic_json(root / "planning" / "model-case-generation.json", {"api_version": MODEL_CASE_DESIGN_API_VERSION, "provenance": model_case_provenance})
+            _atomic_json(planning_root / "model-case-generation.json", {"api_version": MODEL_CASE_DESIGN_API_VERSION, "provenance": model_case_provenance})
             self.store.append_event(task_id, "evaluation.case_generation_failed", {"provider": "cc-switch", "model_id": config.local_analysis.model_id, "error": str(exc)[:500], "fallback": True}, iteration=int(state.get("iteration", 0)))
         cases = [
             dict(_normalize_case_identity(
@@ -1682,6 +1707,7 @@ class IterationKernel:
             "planning": planning.summary(),
             "test_design": planning.test_design(),
             "case_generation": model_case_provenance,
+            "node_skills": node_skill_manifest(),
             "fixture_summary": fixture_summary,
             "path_strategy": {
                 "fixed_count": False,
@@ -1775,7 +1801,10 @@ class IterationKernel:
         remote = config.remote_agent
         return RemoteBatchCoordinator(
             self.gateway_factory(config), self.store,
-            max_parallel=remote.max_parallel,
+            # Keep remote provider fan-out conservative even when an imported
+            # profile requests a larger value. Four active sessions avoids
+            # bursting the local model / CATX rate limit.
+            max_parallel=min(5, max(1, int(remote.max_parallel))),
             poll_interval_seconds=remote.poll_interval_seconds,
             max_wait_seconds=remote.max_wait_seconds,
             max_prompt_chars=config.policy.max_remote_prompt_chars,
@@ -1793,6 +1822,7 @@ class IterationKernel:
     ) -> Mapping[str, Any]:
         config = self._config(task_id)
         state = self.state(task_id)
+        design = self._design(task_id)
         expected_phase = "verification_ready" if purpose == "pass-verification" else "evaluation_ready"
         if purpose not in ("evaluation", "pass-verification", "without-skill-baseline"):
             raise IterationKernelError("unsupported remote batch purpose")
@@ -1803,7 +1833,6 @@ class IterationKernel:
             allowed_phases.add("design_ready")
         if state.get("phase") not in allowed_phases:
             raise IterationKernelError("remote batch %s requires phase %s" % (purpose, expected_phase))
-        design = self._design(task_id)
         wanted = set(case_ids)
         auto_selected = not wanted and purpose in ("evaluation", "without-skill-baseline")
         approved_ids = set(str(item) for item in state.get("approved_case_ids", ()) if str(item))
@@ -1858,6 +1887,24 @@ class IterationKernel:
             state=state,
             iteration=int(state.get("iteration", 0)),
         )
+        # Fail closed if a Challenger was published but the frozen execution
+        # contract still points at the Champion (or a stale local checkout).
+        # Without this guard a technically successful remote run could test
+        # the wrong Skill revision and make two optimization rounds appear
+        # unchanged.
+        expected_skill_revision = str(state.get("challenger_commit") or state.get("champion_commit") or state.get("candidate_commit") or "").lower()
+        contract_skill = environment_contract.get("skill") if isinstance(environment_contract.get("skill"), Mapping) else {}
+        actual_skill_revision = str(contract_skill.get("revision") or "").lower()
+        if (
+            isinstance(self.publisher, GitSkillPublisher)
+            and expected_skill_revision
+            and actual_skill_revision
+            and expected_skill_revision != actual_skill_revision
+        ):
+            raise IterationKernelError(
+                "frozen execution contract Skill revision mismatch: expected %s, got %s"
+                % (expected_skill_revision, actual_skill_revision)
+            )
         execution_bindings: dict[str, CatxExecutionBinding] = {}
         coordinator = self._coordinator(task_id)
         if code_review_mode:
@@ -1978,6 +2025,16 @@ class IterationKernel:
         else:
             batch = coordinator.collect_once(task_id, int(state.get("iteration", 0)), purpose)
         if batch.get("status") == "completed":
+            failed_rows = [row for row in batch.get("cases", ()) if isinstance(row, Mapping) and row.get("status") == "failed"]
+            if failed_rows:
+                self.store.update(task_id, status="blocked")
+                self._transition(
+                    task_id,
+                    "needs_evidence",
+                    active_batch=purpose,
+                    evaluation_blocker="%d 个远端会话失败，必须先重跑失败会话；未形成完整 Trace 的 Case 不进入分析。" % len(failed_rows),
+                )
+                return batch
             phase = {
                 "pass-verification": "verification_collected",
                 "without-skill-baseline": "baseline_collected",
@@ -2074,15 +2131,19 @@ class IterationKernel:
             raise IterationKernelError("targeted evidence retry requires an analysis decision")
         decision = _load_json(Path(str(decision_path)), "analysis decision")
         case_ids = tuple(str(item) for item in decision.get("not_evaluable_case_ids", ()) if str(item))
-        if not case_ids:
-            raise IterationKernelError("analysis decision has no not-evaluable Cases to retry")
+        # Older analysis versions could leave a complete, failed Case in
+        # ``needs_evidence`` when their path matcher rejected a valid CATX
+        # event.  Re-analysis is still safe in that state: it reuses the
+        # immutable batch and only recalculates local evidence/attribution.
+        # An empty list therefore means “reconcile the whole existing
+        # decision”, not “there is nothing to retry”.
         self.store.append_event(
             task_id,
             "evidence.analysis_reopened",
             {
                 "case_ids": list(case_ids),
                 "remote_session_recreated": False,
-                "reason": "失败/偏离 Case 基于原始 Trace 做归因，不重复执行同一会话",
+                "reason": "失败/偏离 Case 基于原始 Trace 做归因，不重复执行同一会话" if case_ids else "使用修复后的判定器重新分析现有完整 Trace，不重复执行远端会话",
             },
             iteration=int(state.get("iteration", 0)),
         )
@@ -3250,7 +3311,7 @@ class IterationKernel:
             )
             return {"commit": commit, "iteration": 0, "state": next_state, "initial_build": True}
         next_iteration = int(state.get("iteration", 0)) + 1
-        self.store.append_event(task_id, "candidate.published", {"commit": commit, "branch": config.skill_repository.branch, "candidate": state.get("candidate")}, iteration=next_iteration)
+        self.store.append_event(task_id, "candidate.published", {"commit": commit, "branch": config.skill_repository.branch, "candidate": state.get("candidate"), "next_phase": "evaluation_ready", "case_ids": list(state.get("approved_case_ids", ())), "case_count": len(state.get("approved_case_ids", ()))}, iteration=next_iteration)
         self.store.update(task_id, current_iteration=next_iteration, status="ready")
         next_state = self._transition(
             task_id,
@@ -3295,9 +3356,18 @@ class IterationKernel:
             return self.dispatch(task_id)
         if phase in ("remote_collected", "verification_collected", "evidence_ready", "semantic_grading", "attribution", "proposal"):
             decision = self.analyze(task_id)
-            if decision.get("next_action") == "verify_passes":
-                return self.dispatch(task_id, purpose="pass-verification", case_ids=tuple(decision["verification_required_case_ids"]))
+            # Analysis is a visible user gate.  Do not create verification
+            # Sessions in the same step that produces the decision; the user
+            # must first see that every Case passed and explicitly start the
+            # unified stability run.
             return decision
+        if phase == "verification_ready":
+            decision = self.snapshot(task_id).get("decision") or {}
+            return self.dispatch(
+                task_id,
+                purpose="pass-verification",
+                case_ids=tuple(decision.get("verification_required_case_ids", ())),
+            )
         if phase == "ready_to_optimize":
             return self.optimize(task_id)
         if phase == "candidate_ready":
@@ -3311,7 +3381,7 @@ class IterationKernel:
 
         if not isinstance(max_steps, int) or isinstance(max_steps, bool) or max_steps <= 0:
             raise IterationKernelError("max_steps must be a positive integer")
-        gates = {"blueprint_ready", "discovery_ready", "initial_candidate_ready", "design_ready", "awaiting_confirmation", "needs_evidence", "blocked", "converged"}
+        gates = {"blueprint_ready", "discovery_ready", "initial_candidate_ready", "design_ready", "verification_ready", "awaiting_confirmation", "needs_evidence", "blocked", "converged"}
         for _ in range(max_steps):
             phase = str(self.state(task_id).get("phase"))
             if (

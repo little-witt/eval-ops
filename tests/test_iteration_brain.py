@@ -4,7 +4,7 @@ import unittest
 from pathlib import Path
 
 from aceval.agent_runtime import ModelReply
-from aceval.iteration_brain import EvidenceQueryError, IterationBrain, LocalEvidenceQueryPort, _json, _parse_semantic
+from aceval.iteration_brain import EvidenceQueryError, IterationBrain, LocalEvidenceQueryPort, _json, _overall_assessment, _parse_semantic
 
 
 class StagedModel:
@@ -115,14 +115,54 @@ class IterationBrainTests(unittest.TestCase):
         self.assertEqual([], decision["not_evaluable_case_ids"])
         self.assertEqual([], decision["evidence_issues"])
 
+    def test_complete_trace_downgrades_semantic_not_evaluable_to_execution_verdict(self):
+        decision = IterationBrain(StagedModel(semantic_status="not_evaluable"), self.root / "analysis-semantic-gap").analyze(**self.args())
+        self.assertEqual([], decision["not_evaluable_case_ids"])
+        self.assertEqual("pass", decision["case_results"][0]["status"])
+        self.assertEqual("pass", decision["case_assessments"][0]["display_status"])
+
     def test_pending_stability_is_not_reported_as_skill_failure(self):
         decision = IterationBrain(None, self.root / "analysis").analyze(**self.args(cases=({"id": "c", "prompt": "judge", "expected_output": "observed"},)))
         assessment = decision["case_assessments"][0]
-        self.assertEqual("pending_verification", assessment["display_status"])
+        self.assertEqual("pass", assessment["display_status"])
+        self.assertEqual("pending", assessment["stability_status"])
         self.assertEqual("pass_pending_verification", assessment["attribution"])
         self.assertIn("稳定性复验", assessment["conclusion"])
         self.assertIn("不要修改 Skill", assessment["recommended_action"])
         self.assertIn("测试分支", assessment["fixture_recommendation"])
+
+    def test_mixed_pass_and_fail_waits_for_repair_before_stability(self):
+        class MixedModel(StagedModel):
+            def complete(self, messages, tools):
+                stage = next(name for name in ("semantic_grading", "attribution", "proposal") if name in messages[0]["content"])
+                request = json.loads(messages[-1]["content"])
+                self.calls.append((stage, request))
+                if stage == "semantic_grading":
+                    return ModelReply(content=json.dumps({
+                        "case_results": [
+                            {"case_id": c["id"], "status": "fail" if c["id"] == "bad" else "pass", "verification_status": "not_run", "reason": "mixed result", "evidence_refs": []}
+                            for c in request["cases"]
+                        ],
+                        "without_skill_baseline_case_results": [],
+                    }))
+                if stage == "attribution":
+                    return ModelReply(content=json.dumps({"failure_clusters": [{"id": "bad-cluster", "case_ids": ["bad"], "root_cause": "defect", "skill_change_authorized": True}], "conflicts": []}))
+                return ModelReply(content=json.dumps({"proposed_changes": [{"target": "SKILL.md", "change": "fix defect", "why": "evidence", "case_ids": ["bad"]}], "target_scope": ["SKILL.md"]}))
+
+        decision = IterationBrain(MixedModel(), self.root / "analysis-mixed").analyze(**self.args(
+            cases=(
+                {"id": "good", "prompt": "judge good"},
+                {"id": "bad", "prompt": "judge bad"},
+            ),
+            primary_batch={"cases": [
+                {"case_id": "good", "status": "completed", "artifact": str(self.run)},
+                {"case_id": "bad", "status": "completed", "artifact": str(self.run)},
+            ]},
+        ))
+        self.assertIn(decision["next_action"], {"await_user_confirmation", "needs_evidence"})
+        self.assertNotEqual("verify_passes", decision["next_action"])
+        self.assertEqual(["bad"], decision["failed_case_ids"])
+        self.assertEqual(["good"], decision["verification_required_case_ids"])
 
     def test_case_goal_observations_and_overall_optimization_summary(self):
         case = {
@@ -145,7 +185,8 @@ class IterationBrainTests(unittest.TestCase):
             },
         }
         self.run.write_text(json.dumps({"session": {"completeness": {"trace": True, "output": True}, "observation": {"output": "读取 git diff 后输出结构化审查报告", "trace": [{"kind": "tool_call", "tool": "shell", "command": "git diff"}], "metadata": {}, "error": None}}}), encoding="utf-8")
-        decision = IterationBrain(StagedModel(), self.root / "analysis").analyze(**self.args(
+        model = StagedModel()
+        decision = IterationBrain(model, self.root / "analysis").analyze(**self.args(
             cases=(case,),
             primary_batch={"cases": [{"case_id": "review", "status": "completed", "artifact": str(self.run)}]},
         ))
@@ -158,8 +199,15 @@ class IterationBrainTests(unittest.TestCase):
         overall = decision["overall_assessment"]
         self.assertTrue(overall["skill_optimization_plan"])
         self.assertEqual("optimize_skill_then_verify", overall["next_action"])
-        self.assertIn("先结合用户意见", overall["next_step"])
+        self.assertIn("同一批冻结 Case", overall["next_step"])
         self.assertEqual(["SKILL.md"], decision["target_scope"])
+        self.assertEqual("goal", model.calls[0][1]["evaluation_goal"])
+        self.assertEqual(["correct"], model.calls[0][1]["evaluation_standards"])
+        verdict = overall["user_verdict"]
+        self.assertEqual("needs_improvement", verdict["status"])
+        self.assertTrue(verdict["problem"])
+        self.assertTrue(verdict["evidence"])
+        self.assertTrue(verdict["fix"])
 
     def test_oversized_stage_context_is_compacted_before_model_call(self):
         model = StagedModel()
@@ -209,6 +257,24 @@ class IterationBrainTests(unittest.TestCase):
         self.assertEqual("c", parsed["case_results"][0]["case_id"])
         self.assertEqual("not_evaluable", parsed["case_results"][0]["status"])
 
+    def test_semantic_parser_accepts_single_case_row_and_status_shorthand(self):
+        parsed = _parse_semantic(
+            {"case_id": "c", "status": "通过", "reason": "ok", "evidence_refs": []},
+            ["c"],
+            [],
+        )
+        self.assertEqual("c", parsed["case_results"][0]["case_id"])
+        self.assertEqual("pass", parsed["case_results"][0]["status"])
+        parsed = _parse_semantic(
+            {"semantic_verdict": {"status": "fail", "reason": "missing evidence", "evidence_refs": []}},
+            ["c"],
+            [],
+        )
+        self.assertEqual("c", parsed["case_results"][0]["case_id"])
+        self.assertEqual("fail", parsed["case_results"][0]["status"])
+        parsed = _parse_semantic({"case_results": "not_evaluable"}, ["c"], [])
+        self.assertEqual("not_evaluable", parsed["case_results"][0]["status"])
+
     def test_semantic_parser_accepts_localized_and_qualified_statuses(self):
         parsed = _parse_semantic({
             "case_results": [
@@ -217,6 +283,25 @@ class IterationBrainTests(unittest.TestCase):
             ]
         }, ["a", "b"], [])
         self.assertEqual(["fail", "not_evaluable"], [item["status"] for item in parsed["case_results"]])
+
+    def test_semantic_parser_allows_baseline_only_chunk_without_primary_rows(self):
+        parsed = _parse_semantic(
+            {"without_skill_baseline_case_results": [{"case_id": "base", "status": "fail", "reason": "x", "evidence_refs": []}]},
+            [],
+            ["base"],
+        )
+        self.assertEqual([], parsed["case_results"])
+        self.assertEqual("fail", parsed["without_skill_baseline_case_results"][0]["status"])
+
+    def test_semantic_parser_conservatively_handles_null_single_case_results(self):
+        parsed = _parse_semantic({"case_results": None}, ["c"], [])
+        self.assertEqual("not_evaluable", parsed["case_results"][0]["status"])
+
+    def test_semantic_parser_downgrades_unshaped_case_results_instead_of_blocking(self):
+        parsed = _parse_semantic({"case_results": ["fail", "pass"]}, ["a", "b"], [])
+        self.assertEqual(["fail", "pass"], [item["status"] for item in parsed["case_results"]])
+        parsed = _parse_semantic({"case_results": {"unexpected": ["not-a-row"]}}, ["c"], [])
+        self.assertEqual("not_evaluable", parsed["case_results"][0]["status"])
 
     def test_semantic_parser_downgrades_unknown_status_without_blocking_confirmation(self):
         parsed = _parse_semantic({
@@ -247,6 +332,102 @@ class IterationBrainTests(unittest.TestCase):
         outcome = next(item for item in decision["case_assessments"][0]["dimensions"] if item["dimension"] == "outcome")
         self.assertIn("未声明精确期望", outcome["evidence_detail"])
         self.assertNotIn("期望「未声明精确期望」", outcome["evidence_detail"])
+
+    def test_overall_summary_does_not_copy_long_agent_report(self):
+        assessment = {
+            "case_id": "c",
+            "status": "fail",
+            "attribution": "skill_improvement_candidate",
+            "dimension_summaries": [{
+                "dimension": "outcome",
+                "label": "结果是否符合 Case 目标",
+                "status": "fail",
+                "reason": "模型给出完整报告：执行过程总结 | 步骤 | 结果 |",
+                "evidence_detail": "未声明精确期望；实际输出「以上即为完整的 PR 审查报告……执行过程总结……」",
+                "evidence_refs": [],
+            }],
+            "goal_observations": {"missing_requirements": []},
+        }
+        overall = _overall_assessment(
+            [{"id": "c"}],
+            [assessment],
+            [{"case_ids": ["c"], "skill_change_authorized": True, "root_cause": "缺少目标核对规则"}],
+            [{"target": "SKILL.md", "change": "在输出前增加目标核对清单", "why": "结果未满足目标", "case_ids": ["c"]}],
+            [],
+            "await_user_confirmation",
+        )
+        verdict = overall["user_verdict"]
+        self.assertNotIn("执行过程总结", verdict["evidence"])
+        self.assertNotIn("以上即为完整", verdict["evidence"])
+        self.assertIn("Case 目标", verdict["evidence"])
+
+    def test_overall_uses_compact_model_diagnosis_without_case_concatenation(self):
+        assessment = {
+            "case_id": "script",
+            "status": "fail",
+            "attribution": "skill_optimization_candidate",
+            "dimension_summaries": [],
+            "goal_observations": {"missing_requirements": []},
+        }
+        overall = _overall_assessment(
+            [{"id": "script"}],
+            [assessment],
+            [{
+                "case_ids": ["script"],
+                "skill_change_authorized": True,
+                "optimization_kind": "resilience",
+                "problem_summary": "Skill 缺少完成前证据门禁。",
+                "evidence_summary": "Trace 未出现脚本调用，但输出声称使用了脚本结果。",
+            }],
+            [{
+                "target": "SKILL.md",
+                "change": "在最终输出前校验脚本调用和成功结果。",
+                "why": "阻止跳步提交",
+                "case_ids": ["script"],
+            }],
+            [],
+            "await_user_confirmation",
+            model_summary={
+                "problem": "关键步骤缺少可观察的完成门禁。",
+                "evidence": "Agent 未运行脚本却引用了脚本结果。",
+                "recommendation": "在最终输出前强制校验脚本调用及成功回执。",
+            },
+        )
+        verdict = overall["user_verdict"]
+        self.assertEqual("can_optimize", verdict["status"])
+        self.assertEqual("关键步骤缺少可观察的完成门禁。", verdict["problem"])
+        self.assertNotIn("Case", verdict["summary"])
+
+    def test_overall_never_calls_all_pass_when_an_unauthorized_case_failed(self):
+        assessments = [
+            {
+                "case_id": "failed",
+                "status": "fail",
+                "attribution": "failure_not_authorized",
+                "reason": "评测口径仍需校准",
+                "dimension_summaries": [],
+                "goal_observations": {"missing_requirements": []},
+            },
+            {
+                "case_id": "pending",
+                "status": "pass",
+                "attribution": "pass_pending_verification",
+                "pending_verification": True,
+                "dimension_summaries": [],
+                "goal_observations": {"missing_requirements": []},
+            },
+        ]
+        overall = _overall_assessment(
+            [{"id": "failed"}, {"id": "pending"}],
+            assessments,
+            [],
+            [],
+            [],
+            "needs_evidence",
+        )
+        self.assertNotEqual("verification_pending", overall["user_verdict"]["status"])
+        self.assertIn("未通过", overall["conclusion"])
+        self.assertNotEqual("verify_passes", overall["next_action"])
 
 
 if __name__ == "__main__":

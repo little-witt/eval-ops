@@ -497,7 +497,7 @@ class RemoteBatchCoordinator:
         # Starting every session before polling gives real fan-out without
         # adding thread-safety assumptions to a company API client.
         persisted_ids = {str(row.get("case_id")) for row in case_states}
-        for case_id, prompt, case_title in prepared_cases:
+        for index, (case_id, prompt, case_title) in enumerate(prepared_cases):
             if case_id in persisted_ids:
                 continue
             case_binding = case_bindings.get(case_id)
@@ -552,6 +552,16 @@ class RemoteBatchCoordinator:
                 self.store.append_event(task_id, "case_run.failed", {"purpose": purpose, "error": str(exc)}, iteration=iteration, case_id=case_id, run_id=purpose)
             batch["updated_at"] = _now()
             _atomic_json(path, batch)
+            # Rate-limit session creation as well as polling: do not create
+            # the next group until this group of at most max_parallel
+            # sessions has reached a terminal state.
+            if (index + 1) % self.max_parallel == 0 and index + 1 < len(prepared_cases):
+                while any(row.get("status") == "running" for row in case_states):
+                    self.collect_once(task_id, iteration, purpose)
+                    batch = dict(_load(path))
+                    case_states = [dict(item) for item in batch.get("cases", ())]
+                    if any(row.get("status") == "running" for row in case_states):
+                        time.sleep(self.poll_interval_seconds)
         batch["status"] = "running" if any(row["status"] == "running" for row in case_states) else "completed"
         batch["updated_at"] = _now()
         _atomic_json(path, batch)
@@ -816,6 +826,13 @@ class RemoteBatchCoordinator:
         ]
         if not failed:
             raise RemoteBatchError("remote batch has no selected or failed cases to retry")
+        # A retry is a fresh remote run.  The original batch deadline may have
+        # expired while the user was reviewing the failure (or while an
+        # earlier retry was running); retaining it would make collect_once
+        # mark the newly-created session as ``remote batch deadline exceeded``
+        # without polling CATX at all.
+        batch["deadline_at_epoch"] = time.time() + self.max_wait_seconds
+        batch["retry_started_at"] = _now()
         per_case_bindings = dict(execution_bindings or {})
         for row in failed:
             case_id = str(row.get("case_id") or "")

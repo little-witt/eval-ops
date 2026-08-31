@@ -25,6 +25,39 @@ class EvidenceAnalysisError(RuntimeError):
     pass
 
 
+def skill_entrypoint_path(inventory: Optional[Sequence[str]] = None) -> str:
+    """Return the editable Skill entrypoint used by the current checkout.
+
+    Evaluation workspaces may expose the subject as either ``SKILL.md`` or
+    ``src/SKILL.md``.  Analysis used to fall back to the former even when the
+    latter was the only editable resource, which made an otherwise valid
+    proposal fail the scope gate after the user approved it.
+    """
+
+    values = []
+    for item in inventory or ():
+        value = str(item or "").strip()
+        if value and value not in values:
+            values.append(value)
+    for candidate in ("SKILL.md", "src/SKILL.md"):
+        if candidate in values:
+            return candidate
+    for value in values:
+        if value.replace("\\", "/").rstrip("/").split("/")[-1] == "SKILL.md":
+            return value
+    return "SKILL.md"
+
+
+def normalize_skill_path(path: Any, inventory: Optional[Sequence[str]] = None) -> str:
+    """Normalize the legacy root entrypoint alias against an editable scope."""
+
+    value = str(path or "").strip()
+    allowed = {str(item) for item in (inventory or ()) if str(item).strip()}
+    if value == "SKILL.md" and value not in allowed and "src/SKILL.md" in allowed:
+        return "src/SKILL.md"
+    return value
+
+
 def _read_json(path: str) -> Mapping[str, Any]:
     try:
         value = json.loads(Path(path).read_text(encoding="utf-8"))
@@ -106,16 +139,50 @@ def _trace_summary(trace: Sequence[Mapping[str, Any]], maximum_chars: int) -> Ma
     errors = []
     evidence = []
     remaining = maximum_chars
+    candidates = []
     for index, event in enumerate(trace):
         if event.get("error"):
             errors.append({"index": index, "error": str(event.get("error"))[:800]})
         kind = str(event.get("kind") or event.get("type") or "")
-        if kind not in ("tool_result", "tool_call") or remaining <= 0:
+        # CATX receipts use provider-specific Agent event names rather than
+        # the compact tool_call/tool_result names used by the legacy path IR.
+        # Keep those events in the bounded evidence index so deterministic
+        # goal checks and the semantic reviewer can see the actual command
+        # and final report, instead of inferring from a tool-count summary.
+        if kind not in (
+            "tool_result", "tool_call", "tool", "tool_start",
+            "agent.tool_use", "assistant.tool_use", "function_call",
+            "agent.tool_result", "assistant.tool_result",
+            "agent.message", "assistant.message", "agent.output", "assistant.output",
+        ) or remaining <= 0:
             continue
         text = json.dumps(event, ensure_ascii=False, sort_keys=True, default=str)
+        # Prefer executable commands and high-signal report markers over the
+        # first few setup messages.  A bounded window that only contains
+        # todo/list_dir events can otherwise hide the later script invocation
+        # and make a successful Case look like it skipped the required step.
+        signal = 3
+        if any(
+            isinstance(event.get(key), str) and event.get(key).strip()
+            for key in ("command", "argv")
+        ) or any(
+            isinstance(event.get(key), Mapping)
+            and (isinstance(event[key].get("command"), str) or isinstance(event[key].get("argv"), (list, tuple)))
+            for key in ("input", "payload", "arguments")
+        ):
+            signal = 0
+        elif any(marker in text for marker in ("analyze_complexity.js", "git diff", "SKILL.md", "行数", "风险", "必须修复", "快速检查清单")):
+            signal = 1
+        elif kind in {"agent.message", "assistant.message", "agent.output", "assistant.output"}:
+            signal = 2
+        candidates.append((signal, index, text))
+    candidates.sort(key=lambda item: (item[0], item[1]))
+    for _, index, text in candidates:
         clipped = text[: min(900, remaining)]
         evidence.append({"index": index, "text": clipped})
         remaining -= len(clipped)
+        if remaining <= 0:
+            break
     return {"event_count": len(trace), "kinds": dict(kinds), "tools": dict(tools), "errors": errors[:8], "selected_evidence": evidence}
 
 
@@ -694,6 +761,7 @@ class CrossCaseAnalyzer:
         editable_resource_inventory: Optional[Sequence[str]] = None,
         evalpack_ref: Optional[str] = None,
     ) -> Mapping[str, Any]:
+        entrypoint = skill_entrypoint_path(editable_resource_inventory)
         rows = {str(item.get("case_id")): item for item in primary_batch.get("cases", ()) if isinstance(item, Mapping)}
         verification_rows = {
             str(item.get("case_id")): item
@@ -781,7 +849,7 @@ class CrossCaseAnalyzer:
                     "goal": goal,
                     "standards": list(standards),
                     "capability_summary": capability_summary or {},
-                    "editable_resource_inventory": list(editable_resource_inventory or ("SKILL.md",)),
+                    "editable_resource_inventory": list(editable_resource_inventory or (entrypoint,)),
                     "cases": [dict(case) for case in cases],
                     "evidence": evidence,
                     "verification_evidence": verification_evidence,
@@ -870,7 +938,12 @@ class CrossCaseAnalyzer:
                 failure_clusters = list(decision["failure_clusters"])
                 conflicts = list(decision["conflicts"])
                 proposed_changes = list(decision["proposed_changes"])
-                target_scope = list(decision["target_scope"])
+                target_scope = [normalize_skill_path(item, editable_resource_inventory or (entrypoint,)) for item in decision["target_scope"]]
+                proposed_changes = [
+                    dict(item, target=normalize_skill_path(item.get("target"), editable_resource_inventory or (entrypoint,)))
+                    if isinstance(item, Mapping) and item.get("target") else dict(item)
+                    for item in proposed_changes
+                ]
                 model_usage = dict(reply.usage)
         if not model_called:
             for case_id in baseline_unresolved:
@@ -884,8 +957,8 @@ class CrossCaseAnalyzer:
             failed_ids = [case_id for case_id, result in heuristic.items() if result["status"] == "fail"]
             failure_clusters = ([{"id": "observed-failures", "case_ids": failed_ids, "root_cause": "requires cross-case Skill repair analysis", "skill_change_authorized": bool(failed_ids)}] if failed_ids else [])
             conflicts = []
-            proposed_changes = ([{"target": "SKILL.md", "change": "repair the shared cause supported by failed case evidence", "why": "one or more frozen expectations failed", "case_ids": failed_ids}] if failed_ids else [])
-            target_scope = ["SKILL.md"] if failed_ids else []
+            proposed_changes = ([{"target": entrypoint, "change": "repair the shared cause supported by failed case evidence", "why": "one or more frozen expectations failed", "case_ids": failed_ids}] if failed_ids else [])
+            target_scope = [entrypoint] if failed_ids else []
 
         optimization_eligible_case_ids = {
             str(case.get("id")) for case in cases if _optimization_case_ready(case)
@@ -1020,14 +1093,14 @@ class CrossCaseAnalyzer:
             ]
             proposed_changes = list(proposed_changes) + [
                 {
-                    "target": "SKILL.md",
+                    "target": entrypoint,
                     "change": "make the affected workflow deterministic and preserve its required evidence",
                     "why": "a trusted primary pass was not stable on verification",
                     "case_ids": list(eligible_flaky),
                 }
             ]
-            if "SKILL.md" not in target_scope:
-                target_scope = list(target_scope) + ["SKILL.md"]
+            if entrypoint not in target_scope:
+                target_scope = list(target_scope) + [entrypoint]
         aggregate_not_evaluable = [
             item.case_id for item in aggregates if item.status == "not_evaluable"
         ]
@@ -1053,7 +1126,7 @@ class CrossCaseAnalyzer:
                 isinstance(cluster, Mapping) and cluster.get("skill_change_authorized") is True
                 for cluster in failure_clusters
             )
-            supported_scope = set(str(item) for item in (editable_resource_inventory or ("SKILL.md",)))
+            supported_scope = set(str(item) for item in (editable_resource_inventory or (entrypoint,)))
             unsupported_scope = [str(item) for item in target_scope if not isinstance(item, str) or item not in supported_scope]
             if not authorized:
                 next_action = "needs_evidence"
@@ -1132,4 +1205,10 @@ class CrossCaseAnalyzer:
         return result
 
 
-__all__ = ["CrossCaseAnalyzer", "EvidenceAnalysisError", "compact_case_evidence"]
+__all__ = [
+    "CrossCaseAnalyzer",
+    "EvidenceAnalysisError",
+    "compact_case_evidence",
+    "normalize_skill_path",
+    "skill_entrypoint_path",
+]

@@ -352,7 +352,12 @@ def materialize_candidate(
 def _skill_file(subject: Path) -> Path:
     path = subject.resolve()
     if path.is_dir():
-        path = path / "SKILL.md"
+        # Skills in the wild use both a repository-root entrypoint and the
+        # conventional src/SKILL.md layout.  The iteration Kernel already
+        # accepts both; the candidate materializer must use the same contract
+        # or optimization fails before the model is even called.
+        candidates = (path / "SKILL.md", path / "src" / "SKILL.md")
+        path = next((candidate for candidate in candidates if candidate.is_file()), candidates[0])
     if not path.is_file():
         raise CandidateRejected("SKILL.md not found: %s" % path)
     return path

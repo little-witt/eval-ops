@@ -41,7 +41,7 @@ CATX 输出按“从后向前寻找最后一条有效 `agent.message`”提取�
 - `repositories[].url`：CATX 可以拉取的远程 Git URL，不能填写本机目录；
 - `repositories[].authorization_token_env`：仓库 PAT 所在环境变量名；多个仓库可以引用同一个变量；
 - `repositories[].mount_path`：仓库在 Agent 沙箱中的唯一绝对路径；
-- `events_limit`：单次读取事件数，默认 200，最大 1000；
+- `events_limit`：单次读取事件数，默认 1000，最大 1000；如需兼容较旧网关可显式调低。
 - `stream.base_url`：Supabase 项目 URL；
 - `stream.path`：Edge Function 路径；
 - `stream.action`：默认 `getMessage`；

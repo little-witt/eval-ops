@@ -108,6 +108,7 @@ class KernelV2Tests(unittest.TestCase):
         case = {"id": "case-1", "expected_output": "ok"}
         result = {"case_id": "case-1", "status": "pass", "reason": "oracle", "evidence_refs": []}
         first = build_case_aggregates([case], [result], [evidence()], required_k=2)
+        self.assertEqual("pass", first[0].status)
         self.assertFalse(first[0].stable_pass)
         verified = build_case_aggregates(
             [case], [result], [evidence()], [evidence()],
@@ -271,6 +272,19 @@ class KernelV2Tests(unittest.TestCase):
             "pass",
             next(item for item in valid.dimensions if item.dimension == "grounding").status,
         )
+        basename = build_attempt_verdict(
+            case,
+            item,
+            {
+                "case_id": "semantic",
+                "status": "pass",
+                "reason": "anchored by compact artifact name",
+                "evidence_refs": ["semantic.json#terminal.message"],
+            },
+            attempt_id="basename-ref",
+            run_context_hash="sha256:test",
+        )
+        self.assertEqual("pass", basename.status)
 
     def test_malformed_formal_grading_cannot_be_overridden_by_claimed_pass(self):
         item = evidence("malformed-formal", exact=None)

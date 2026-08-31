@@ -375,6 +375,23 @@ class RemoteBatchTests(unittest.TestCase):
             retried_case["attempts"][0]["retry_reason"],
         )
 
+    def test_retry_refreshes_expired_batch_deadline(self):
+        gateway = RetryGateway()
+        coordinator = RemoteBatchCoordinator(gateway, self.store, poll_interval_seconds=1, max_wait_seconds=30)
+        first = coordinator.dispatch(
+            "batch-task-001", 0, "evaluation", ({"id": "a", "prompt": "Review A"},),
+            goal="goal", standards=("correct",),
+        )
+        self.assertEqual("failed", first["cases"][0]["status"])
+        path = coordinator.batch_path("batch-task-001", 0, "evaluation")
+        expired = json.loads(path.read_text(encoding="utf-8"))
+        expired["deadline_at_epoch"] = time.time() - 1
+        path.write_text(json.dumps(expired), encoding="utf-8")
+
+        retried = coordinator.retry_failed("batch-task-001", 0, "evaluation")
+        self.assertEqual("running", retried["status"])
+        self.assertGreater(float(retried["deadline_at_epoch"]), time.time())
+
     def test_completed_legacy_failure_batch_is_retried_when_bindings_become_available(self):
         first_gateway = AlwaysFailGateway()
         first = RemoteBatchCoordinator(first_gateway, self.store).dispatch(

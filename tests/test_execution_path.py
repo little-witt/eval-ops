@@ -26,6 +26,60 @@ def spec():
 
 
 class ExecutionPathTests(unittest.TestCase):
+    def test_tool_call_matcher_accepts_agent_tool_use_trace_events(self):
+        result = evaluate_trace_conformance(
+            ExecutionPathSpec.from_mapping({
+                "api_version": EXECUTION_PATH_SPEC_API_VERSION,
+                "steps": [{
+                    "id": "read-skill",
+                    "label": "Read instructions",
+                    "kind": "required",
+                    "match": {"event_type": "tool_call", "contains": "SKILL.md"},
+                }],
+            }),
+            [{"type": "agent.tool_use", "name": "read_file", "input": {"target_file": "/workspace/skill/SKILL.md"}}],
+            trace_complete=True,
+        )
+        self.assertEqual("pass", result["status"])
+        self.assertTrue(result["steps"][0]["observed"])
+
+    def test_agent_tool_use_command_is_read_from_direct_input_payload(self):
+        result = evaluate_trace_conformance(
+            ExecutionPathSpec.from_mapping({
+                "api_version": EXECUTION_PATH_SPEC_API_VERSION,
+                "steps": [{
+                    "id": "complexity",
+                    "label": "Run complexity script",
+                    "kind": "required",
+                    "match": {"event_type": "agent.tool_use", "command_contains": "analyze_complexity.js"},
+                }],
+            }),
+            [{
+                "type": "agent.tool_use",
+                "name": "bash",
+                "input": {"command": "cd /workspace/repo && node /workspace/skill/scripts/analyze_complexity.js"},
+            }],
+            trace_complete=True,
+        )
+        self.assertEqual("pass", result["status"])
+        self.assertTrue(result["steps"][0]["observed"])
+
+    def test_agent_message_is_accepted_for_generated_output_checkpoint(self):
+        result = evaluate_trace_conformance(
+            ExecutionPathSpec.from_mapping({
+                "api_version": EXECUTION_PATH_SPEC_API_VERSION,
+                "steps": [{
+                    "id": "report",
+                    "label": "Output report",
+                    "kind": "required",
+                    "match": {"event_type": "agent.output", "contains": "行数"},
+                }],
+            }),
+            [{"type": "agent.message", "content": [{"type": "text", "text": "Markdown 表格：文件行数与风险等级"}]}],
+            trace_complete=True,
+        )
+        self.assertEqual("pass", result["status"])
+
     def test_v3_nodes_and_edges_are_read_only_normalized_to_v1(self):
         source = {
             "api_version": PATH_ANALYSIS_API_VERSION,

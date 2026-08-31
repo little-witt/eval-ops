@@ -2,6 +2,8 @@ import tempfile
 import unittest
 from pathlib import Path
 import json
+import threading
+import time
 
 from aceval.desktop_service import DESKTOP_SERVICE_API_VERSION, DesktopService
 
@@ -10,6 +12,41 @@ FIXTURE_CODEX = Path(__file__).parent / "fixtures" / "fake_codex_app_server.py"
 
 
 class DesktopServiceTests(unittest.TestCase):
+    def test_retry_failed_serializes_rapid_requests_before_batch_mutation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            service = DesktopService(Path(directory) / "tasks")
+            entered = threading.Event()
+            release = threading.Event()
+
+            def fake_retry(task_id, *, purpose):
+                entered.set()
+                release.wait(timeout=2)
+                return {"cases": []}
+
+            service.kernel.retry_failed = fake_retry
+            service._start_operation = lambda *args, **kwargs: {"status": "running"}
+            results = []
+
+            def invoke():
+                try:
+                    results.append(("ok", service.handle("tasks.retry_failed", {"task_id": "task-1", "purpose": "evaluation"})))
+                except Exception as exc:
+                    results.append(("error", str(exc)))
+
+            first = threading.Thread(target=invoke)
+            first.start()
+            self.assertTrue(entered.wait(timeout=1))
+            second = threading.Thread(target=invoke)
+            second.start()
+            second.join(timeout=1)
+            release.set()
+            first.join(timeout=2)
+
+            self.assertEqual(2, len(results))
+            self.assertEqual(1, sum(item[0] == "ok" for item in results))
+            self.assertTrue(any(item[0] == "error" and "正在重试" in item[1] for item in results))
+            service.executor.shutdown(wait=True)
+
     def test_bootstrap_reports_real_local_capabilities_without_opening_a_port(self):
         with tempfile.TemporaryDirectory() as directory:
             service = DesktopService(Path(directory) / "tasks")

@@ -16,6 +16,7 @@ from typing import Any, Mapping, Sequence, Tuple
 
 from .agent_runtime import ModelClient
 from .test_planning import TestPlan
+from .evaluation_skills import node_skill_context
 
 
 MODEL_CASE_DESIGN_API_VERSION = "aceval.model-case-design/v1"
@@ -125,13 +126,14 @@ def build_case_generation_prompt(
     skill = skill_text[:24000]
     return (
         "你是 FORGE 的评测设计模型。根据给定 SKILL.md、能力图和确定性测试要求，"
+        + node_skill_context("eval-case-planner") + "\n"
         "为 target_case_ids 中每个 Case 生成一个不同测试意图的可执行评测。"
         "不要发明未出现在 requirements 或 SKILL.md 的事实；每个 source_refs 必须使用 requirements 中已有的 source_refs（如 cap.x#source-0）。"
         "Case 必须覆盖不同维度（happy_path、edge/negative、recovery、boundary、idempotency 等），"
-        "prompt 必须写成真实用户任务而不是模板句。路径 steps 要描述可观测的读取、工具、输出和禁止动作。"
+        "prompt 必须写成真实用户任务而不是模板句。每个 Case 的 path 必须有独立 purpose 和至少一个只属于该 Case 的可观测检查点；除系统强制的读取 Skill / 不发布步骤外，不得复制另一 Case 的完整 steps。路径 steps 要描述可观测的读取、工具、输出和禁止动作。"
         "所有面向用户展示的字段必须使用简体中文，包括 title、prompt、family、generation_reason、expected_observables、"
         "oracle_strategy、path purpose 和 step label；文件名、工具名、Case/Requirement/source ref 等技术标识可保留原文。"
-        "只返回严格 JSON，不要 Markdown 或代码围栏；JSON 字符串内部的双引号必须使用反斜杠转义，不能原样嵌入。"
+        "只返回严格 JSON，不要 Markdown 或代码围栏；建议压缩成单行 JSON；JSON 字符串内部的双引号必须使用反斜杠转义，不能原样嵌入，字符串中的换行必须写成 \\n 而不能写真实换行。"
         "每个 path step 的 match 只允许 event_type、tool_name、contains、command_contains、fields 五种键，例如 "
         "{\"event_type\":\"agent.tool_use\",\"tool_name\":\"read_file\",\"contains\":\"SKILL.md\"}；"
         "禁止使用 tool、pattern、output、regex 等其它键。\n\n"
@@ -165,7 +167,7 @@ def build_case_generation_repair_prompt(
         "所有面向用户展示的字段继续使用简体中文。"
         "必须返回完整 aceval.model-case-design/v1 对象；保留原 target Case ids、Requirement ids 和 source_refs，"
         "每个 Case 的真实任务 Prompt 必须保持互异。path step.match 仍只允许 event_type、tool_name、contains、command_contains、fields。"
-        "修复后的结果会从头重新经过 JSON、Case 覆盖、Requirement、Skill source refs、runtime 和 Path 校验。\n\n"
+        "修复后的结果会从头重新经过 JSON、Case 覆盖、Requirement、Skill source refs、runtime 和 Path 校验；请输出单行紧凑 JSON，所有字符串换行写成 \\n。\n\n"
         "校验错误：%s\n\n待修复的模型输出：\n%s" % (error, response)
     )
 
@@ -245,6 +247,7 @@ def parse_model_case_design(
     if not isinstance(paths_raw, list):
         raise ModelCaseGenerationError("model paths must be an array")
     by_case = {}
+    path_signatures = {}
     for path in paths_raw:
         if not isinstance(path, Mapping):
             raise ModelCaseGenerationError("model path must be an object")
@@ -287,7 +290,19 @@ def parse_model_case_design(
             if kind == "alternative":
                 normalized_step["alternative_group"] = str(step["alternative_group"])
             normalized_steps.append(normalized_step)
-        by_case[case_id] = {"case_id": case_id, "purpose": _text(path.get("purpose") or "Case-specific execution path", "path purpose", 500), "steps": normalized_steps}
+        normalized_purpose = _text(path.get("purpose") or "Case-specific execution path", "path purpose", 500)
+        # Purpose text is presentation-only; identical observable steps are
+        # still duplicate paths even when the model invents different names.
+        signature = json.dumps(
+            [(item["label"], item["kind"], item["match"]) for item in normalized_steps],
+            ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+        )
+        if signature in path_signatures and str((value.get("generation_summary") or {}).get("strategy") or "") != "fake":
+            raise ModelCaseGenerationError(
+                "model generated duplicate execution paths for %s and %s" % (path_signatures[signature], case_id)
+            )
+        path_signatures[signature] = case_id
+        by_case[case_id] = {"case_id": case_id, "purpose": normalized_purpose, "steps": normalized_steps}
     if set(by_case) != set(target):
         raise ModelCaseGenerationError("model paths must cover exactly the generated Cases")
     summary = value.get("generation_summary", {})

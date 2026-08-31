@@ -117,11 +117,20 @@ class DesktopService:
         self.executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="aceval-desktop")
         self.operations: dict[str, dict[str, Any]] = {}
         self.task_operations: dict[str, str] = {}
+        # Retry dispatch mutates the persisted batch before the background
+        # operation is registered.  Serialize that short critical section per
+        # task so two rapid IPC requests cannot both read the same failed row
+        # and create duplicate CATX sessions.
+        self.task_retry_locks: dict[str, threading.Lock] = {}
         # Keep the terminal operation receipt visible after the worker leaves
         # the active-operation map.  Without this, a failed one-button run
         # looked like a no-op once its background thread exited.
         self.task_last_operations: dict[str, dict[str, Any]] = {}
         self.lock = threading.RLock()
+
+    def _task_retry_lock(self, task_id: str) -> threading.Lock:
+        with self.lock:
+            return self.task_retry_locks.setdefault(task_id, threading.Lock())
 
     def _local_analysis(self, raw: Any) -> Mapping[str, Any]:
         if not isinstance(raw, Mapping) or raw.get("provider") not in ("codex", "claude"):
@@ -217,8 +226,50 @@ class DesktopService:
                     if task_id:
                         self.task_last_operations[task_id] = dict(operation)
             except Exception as exc:
+                failure = str(exc)
+                phase = None
+                state_value = None
+                if task_id:
+                    try:
+                        state_value = self.kernel.state(task_id)
+                        phase = str(state_value.get("phase") or "")
+                    except Exception:
+                        phase = None
+                if phase == "ready_to_optimize":
+                    stage = "skill_optimization"
+                    recovery = "已保留用户批准的修改范围和冻结证据；修复模型/路径问题后可直接重试，不会重跑远端 Case。"
+                elif phase in {"needs_evidence", "evidence_ready", "semantic_grading", "attribution", "proposal", "remote_collected"}:
+                    stage = "analysis"
+                    recovery = "已保留冻结会话证据；点击继续自动执行可从当前分析阶段恢复。"
+                else:
+                    stage = "workflow"
+                    recovery = "请查看错误详情后重试当前自动流程。"
+                if task_id and stage == "skill_optimization":
+                    try:
+                        self.store.append_event(
+                            task_id,
+                            "optimization.failed",
+                            {
+                                "error": failure[:1000],
+                                "error_type": type(exc).__name__,
+                                "retryable": True,
+                                "approved_scope_preserved": True,
+                            },
+                            iteration=int((state_value or {}).get("iteration", 0)),
+                        )
+                    except Exception:
+                        # Never mask the original optimization exception if
+                        # persisting the diagnostic event itself fails.
+                        pass
                 with self.lock:
-                    operation.update({"status": "failed", "error": str(exc), "updated_at": _now()})
+                    operation.update({
+                        "status": "failed",
+                        "error": failure,
+                        "error_type": type(exc).__name__,
+                        "failure_stage": stage,
+                        "recovery": recovery,
+                        "updated_at": _now(),
+                    })
                     if task_id:
                         self.task_last_operations[task_id] = dict(operation)
             finally:
@@ -386,25 +437,42 @@ class DesktopService:
         if method == "tasks.retry_failed":
             task_id = str(params.get("task_id") or "")
             purpose = str(params.get("purpose") or "evaluation")
-            result = self.kernel.retry_failed(task_id, purpose=purpose)
-            return {
-                "retry": result,
-                "operation": self._start_operation(
-                    "kernel.run_until_gate",
-                    lambda: self.kernel.run_until_gate(task_id),
-                    task_id=task_id,
-                ),
-            }
+            if not task_id:
+                raise ValueError("task_id is required")
+            retry_lock = self._task_retry_lock(task_id)
+            if not retry_lock.acquire(blocking=False):
+                raise ValueError("该任务已有失败会话正在重试，请等待当前重试完成")
+            try:
+                # Check before mutating the batch as well as in
+                # _start_operation.  The latter alone is too late: concurrent
+                # requests could both call Kernel.retry_failed first.
+                with self.lock:
+                    operation_id = self.task_operations.get(task_id)
+                    operation = self.operations.get(operation_id) if operation_id else None
+                    if operation and operation.get("status") == "running":
+                        raise ValueError("该任务已有自动流程正在运行，请等待当前流程完成")
+                result = self.kernel.retry_failed(task_id, purpose=purpose)
+                return {
+                    "retry": result,
+                    "operation": self._start_operation(
+                        "kernel.run_until_gate",
+                        lambda: self.kernel.run_until_gate(task_id),
+                        task_id=task_id,
+                    ),
+                }
+            finally:
+                retry_lock.release()
         if method == "tasks.retry_evidence":
             task_id = str(params.get("task_id") or "")
-            result = self.kernel.retry_evidence(task_id)
-            # This action deliberately re-enters local analysis only.  Starting
-            # ``run_until_gate`` here could see a provisional ``verify_passes``
-            # result and silently create a new remote verification Session,
-            # defeating the evidence-preserving contract.
             return {
-                "retry": result,
-                "operation": None,
+                # Run the evidence-preserving analysis in the bounded worker
+                # so the renderer receives an operation receipt immediately
+                # and can show progress/allow refresh while Claude responds.
+                "operation": self._start_operation(
+                    "kernel.reanalyze_existing",
+                    lambda: self.kernel.retry_evidence(task_id),
+                    task_id=task_id,
+                ),
             }
         if method == "tasks.reopen_case_review":
             task_id = str(params.get("task_id") or "")

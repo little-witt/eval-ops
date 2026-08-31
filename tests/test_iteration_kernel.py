@@ -349,8 +349,8 @@ Steps:
                 self.kernel.collect(task_id)
                 self.kernel._transition(task_id, phase, brain_stage=phase)
                 result = self.kernel.advance(task_id)
-                self.assertEqual("running", result["status"])
-                self.assertEqual("verification_running", self.kernel.state(task_id)["phase"])
+                self.assertEqual("verify_passes", result["next_action"])
+                self.assertEqual("verification_ready", self.kernel.state(task_id)["phase"])
                 receipts = list(
                     (self.root / "tasks" / task_id / "iterations" / "iteration-000" / "analysis").glob(
                         "agent-call-receipt-*.json"
@@ -788,6 +788,10 @@ Steps:
             "one-button-task", approve=True, selected_case_ids=("review-1",)
         )
         self.assertEqual("evaluation_ready", approved["phase"])
+        result = self.kernel.run_until_gate("one-button-task")
+        self.assertEqual("verification_ready", result["gate"])
+        # The user explicitly continues after reading the complete decision.
+        self.kernel.advance("one-button-task")
         result = self.kernel.run_until_gate("one-button-task")
         self.assertEqual("converged", result["gate"])
         self.assertEqual("converged", result["snapshot"]["state"]["phase"])

@@ -42,6 +42,93 @@ def make_alert_skill(root: Path) -> None:
 
 
 class SkillTreeOptimizerTests(unittest.TestCase):
+    def test_accepts_fenced_candidate_json_with_short_preface(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            skill = root / "skill"
+            skill.mkdir()
+            make_alert_skill(skill)
+            response = {
+                "changes": [{
+                    "path": "SKILL.md",
+                    "operation": "replace_text",
+                    "old_text": "Run `scripts/collect.py`, then follow `workflow/fast/stage-3-grade.md`.",
+                    "new_text": "Run `scripts/collect.py`, then follow `workflow/fast/stage-3-grade.md`; report the evidence.",
+                    "reason": "make evidence observable",
+                }],
+                "rationale": "Add an explicit evidence requirement.",
+            }
+            content = "已生成候选：\n```json\n%s\n```" % json.dumps(response)
+            candidate = SkillTreeOptimizer(
+                ScriptedModelClient([ModelReply(content=content)])
+            ).propose(
+                skill,
+                [FailureEvidence("case", "grader", "missing evidence")],
+                root / "candidates",
+                target_scope=("SKILL.md",),
+            )
+            self.assertIn("report the evidence", (candidate.path / "SKILL.md").read_text())
+
+    def test_repairs_unparseable_candidate_json_once(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            skill = root / "skill"
+            skill.mkdir()
+            make_alert_skill(skill)
+            repaired = {
+                "changes": [{
+                    "path": "SKILL.md",
+                    "operation": "replace_text",
+                    "old_text": "Run `scripts/collect.py`, then follow `workflow/fast/stage-3-grade.md`.",
+                    "new_text": "Run `scripts/collect.py`, then follow `workflow/fast/stage-3-grade.md`; report the evidence.",
+                    "reason": "make evidence observable",
+                }],
+                "rationale": "Repair the invalid response.",
+            }
+            model = ScriptedModelClient([
+                ModelReply(content="I cannot provide JSON right now."),
+                ModelReply(content=json.dumps(repaired)),
+            ])
+            candidate = SkillTreeOptimizer(model).propose(
+                skill,
+                [FailureEvidence("case", "grader", "missing evidence")],
+                root / "candidates",
+                target_scope=("SKILL.md",),
+            )
+            self.assertIn("report the evidence", (candidate.path / "SKILL.md").read_text())
+
+    def test_src_entrypoint_accepts_legacy_root_alias_in_scope_and_model_edit(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            skill = root / "skill"
+            (skill / "src").mkdir(parents=True)
+            (skill / "src" / "SKILL.md").write_text(
+                "# Review\n\nRun the review workflow.\n", encoding="utf-8"
+            )
+            response = {
+                "changes": [{
+                    "path": "SKILL.md",
+                    "operation": "replace_text",
+                    "old_text": "Run the review workflow.",
+                    "new_text": "Run the review workflow and report evidence.",
+                    "reason": "make the required evidence observable",
+                }],
+                "rationale": "Keep the conventional root alias compatible with src/SKILL.md.",
+            }
+            candidate = SkillTreeOptimizer(
+                ScriptedModelClient([ModelReply(content=json.dumps(response))])
+            ).propose(
+                skill,
+                [FailureEvidence("case", "grader", "missing evidence")],
+                root / "candidates",
+                target_scope=("SKILL.md",),
+            )
+            self.assertIn(
+                "report evidence",
+                (candidate.path / "src" / "SKILL.md").read_text(encoding="utf-8"),
+            )
+            self.assertEqual(("src/SKILL.md",), candidate.changed_paths)
+
     def test_repairs_empty_changes_response_with_a_second_strict_edit_request(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -70,6 +157,42 @@ class SkillTreeOptimizerTests(unittest.TestCase):
                 target_scope=("SKILL.md",),
             )
             self.assertIn("report each required check", (candidate.path / "SKILL.md").read_text())
+
+    def test_repairs_non_unique_old_text_with_a_second_edit_request(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            skill = root / "skill"
+            skill.mkdir()
+            make_alert_skill(skill)
+            (skill / "SKILL.md").write_text(
+                "# Alert level\n\nRepeat me.\n\nRepeat me.\n",
+                encoding="utf-8",
+            )
+            first = {
+                "changes": [{
+                    "path": "SKILL.md", "operation": "replace_text",
+                    "old_text": "Repeat me.", "new_text": "Always report evidence.", "reason": "evidence",
+                }],
+                "rationale": "initial edit",
+            }
+            repaired = {
+                "changes": [{
+                    "path": "SKILL.md", "operation": "replace_text",
+                    "old_text": "# Alert level", "new_text": "# Alert level\n\nAlways report evidence.", "reason": "use a unique heading",
+                }],
+                "rationale": "repair duplicate match",
+            }
+            model = ScriptedModelClient([
+                ModelReply(content=json.dumps(first)),
+                ModelReply(content=json.dumps(repaired)),
+            ])
+            candidate = SkillTreeOptimizer(model).propose(
+                skill,
+                [FailureEvidence("case", "grader", "missing evidence")],
+                root / "candidates",
+                target_scope=("SKILL.md",),
+            )
+            self.assertIn("Always report evidence", (candidate.path / "SKILL.md").read_text())
 
     def test_materializes_two_resource_edits_without_mutating_source(self):
         with tempfile.TemporaryDirectory() as directory:

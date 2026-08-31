@@ -58,6 +58,12 @@ class ModelCaseGenerationTests(unittest.TestCase):
         with self.assertRaisesRegex(ModelCaseGenerationError, "duplicate Case prompts"):
             parse_model_case_design(json.dumps(self._design(duplicate=True)), plan=self.plan, target_case_ids=[item.id for item in self.plan.cases])
 
+    def test_parser_rejects_duplicate_model_paths(self):
+        design = self._design()
+        design["generation_summary"]["strategy"] = "cc-switch-model"
+        with self.assertRaisesRegex(ModelCaseGenerationError, "duplicate execution paths"):
+            parse_model_case_design(json.dumps(design), plan=self.plan, target_case_ids=[item.id for item in self.plan.cases])
+
     def test_parser_rejects_self_referencing_path_step(self):
         design = self._design()
         design["paths"][0]["steps"][0]["after"] = [design["paths"][0]["steps"][0]["id"]]

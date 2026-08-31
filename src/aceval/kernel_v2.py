@@ -12,6 +12,7 @@ from dataclasses import dataclass, field
 import hashlib
 import json
 import math
+from pathlib import Path
 import re
 from typing import Any, Iterable, Mapping, Optional, Sequence, Tuple
 
@@ -241,7 +242,10 @@ class CaseAggregate:
     def status(self) -> str:
         if not self.evaluable_attempts:
             return "not_evaluable"
-        if self.stable_pass:
+        # Outcome and stability are separate facts. A successful first
+        # attempt passes immediately; ``stable_pass`` records whether the
+        # configured repeat budget has also been satisfied.
+        if self.successes == len(self.evaluable_attempts):
             return "pass"
         return "fail"
 
@@ -371,7 +375,17 @@ def _has_grounded_reference(refs: Sequence[str], artifact_refs: Sequence[str]) -
             continue
         for artifact in artifact_refs:
             anchor = str(artifact).strip()
-            if anchor and (value == anchor or value.startswith(anchor + "#")):
+            basename = Path(anchor).name if anchor else ""
+            if anchor and (
+                value == anchor
+                or value.startswith(anchor + "#")
+                # The local grader intentionally receives a compact evidence
+                # envelope and commonly cites the immutable artifact by its
+                # filename.  That is still an unambiguous binding inside one
+                # per-Case grading request.
+                or value == basename
+                or value.startswith(basename + "#")
+            ):
                 return True
     return False
 
@@ -835,8 +849,8 @@ def compile_diagnosis_graph(
                 "status": status,
                 "score": dimension.get("score"),
                 "hard": dimension.get("hard") is True,
-                "reason": str(dimension.get("reason") or dimension.get("evidence_detail") or "该维度未达到通过标准"),
-                "evidence_detail": str(dimension.get("evidence_detail") or ""),
+                "reason": str(dimension.get("summary_reason") or dimension.get("reason") or dimension.get("evidence_detail") or "该维度未达到通过标准"),
+                "evidence_detail": str(dimension.get("summary_reason") or dimension.get("evidence_detail") or ""),
                 "evidence_refs": [str(ref) for ref in dimension.get("evidence_refs", ()) if str(ref)],
             })
         return result
@@ -849,7 +863,12 @@ def compile_diagnosis_graph(
             if str(value)
         ] if isinstance(item.get("goal_observations"), Mapping) else []
         fragments = []
+        compact_summary = str(item.get("summary_fact") or "").strip()
+        if compact_summary:
+            fragments.append(compact_summary)
         for dimension in dimensions:
+            if compact_summary:
+                continue
             detail = dimension.get("evidence_detail") or dimension.get("reason")
             score = dimension.get("score")
             score_text = "" if score is None else "（评分 %.0f%%）" % (float(score) * 100)
@@ -1142,7 +1161,13 @@ def _aggregate_contract_errors(
             )
             if value.get("stable_pass") is not derived_stable:
                 errors.append("stable_pass does not match attempt receipts")
-            derived_status = "not_evaluable" if not evaluable_attempts else "pass" if derived_stable else "fail"
+            derived_status = (
+                "not_evaluable"
+                if not evaluable_attempts
+                else "pass"
+                if successes == evaluable_attempts
+                else "fail"
+            )
             if value.get("status") is not None and value.get("status") != derived_status:
                 errors.append("status does not match attempt receipts")
         elif value.get("stable_pass") is True:
@@ -1150,8 +1175,8 @@ def _aggregate_contract_errors(
             # the one observed attempt passed.  Keep this as a malformed
             # authorization record rather than treating it as a stable pass.
             errors.append("stable_pass requires required_k")
-        if value.get("status") == "pass" and value.get("stable_pass") is not True:
-            errors.append("pass status requires stable_pass")
+        # ``status=pass`` does not imply repeat verification; callers inspect
+        # ``stable_pass`` for that independent guarantee.
     return tuple(errors)
 
 
