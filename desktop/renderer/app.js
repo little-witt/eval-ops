@@ -718,6 +718,8 @@
       for (const [key, position] of Object.entries(preservedScroll)) { const node = app.querySelector(`[data-preserve-scroll="${CSS.escape(key)}"]`); if (node) { node.scrollTop = position.top; node.scrollLeft = position.left; } }
     }
     if (state.view === "create") {
+      const view = app.querySelector(".create-view");
+      if (view) view.scrollTop = viewScroll;
       const form = app.querySelector("#create-form");
       for (const [name,value] of Object.entries(state.createDraft)) {
         const element = form?.elements.namedItem(name);
@@ -949,6 +951,21 @@
       else if (action === "clear-secret") { await forge.saveSecrets({ [button.dataset.name]:null }); state.secrets = await forge.secretStatus(); toast(`${button.dataset.name} 已从安全存储移除`); render(); }
     } catch (error) { state.busy = null; toast(error.message || String(error), true); render(); }
   });
+
+  // The create form is a dedicated scroll surface.  On some macOS profiles,
+  // native wheel momentum does not advance an absolutely positioned overflow
+  // container reliably, so forward wheel deltas to that surface explicitly.
+  app.addEventListener("wheel", (event) => {
+    if (state.view !== "create") return;
+    const view = app.querySelector(".create-view");
+    if (!view || !view.contains(event.target) || event.deltaY === 0) return;
+    const multiplier = event.deltaMode === WheelEvent.DOM_DELTA_LINE ? 16 : event.deltaMode === WheelEvent.DOM_DELTA_PAGE ? view.clientHeight : 1;
+    const maxScrollTop = view.scrollHeight - view.clientHeight;
+    const nextScrollTop = Math.max(0, Math.min(maxScrollTop, view.scrollTop + event.deltaY * multiplier));
+    if (nextScrollTop === view.scrollTop) return;
+    event.preventDefault();
+    view.scrollTop = nextScrollTop;
+  }, { passive:false });
 
   app.addEventListener("change", (event) => {
     if (event.target.name === "model_id" || event.target.id === "settings-model") {

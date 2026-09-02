@@ -111,8 +111,15 @@ assert.match(styles, /\.sticky-actions/);
 assert.match(styles, /\.case-calibration/);
 assert.match(styles, /\.next-step-card/);
 assert.match(styles, /\.case-assessment/);
-assert.match(styles, /\.create-view\{height:100%;min-height:0;overflow-y:auto/);
-assert.match(styles, /\.shell,\.workspace,\.view\{min-height:0\}/);
+assert.match(styles, /\.workspace>\.create-view\{position:absolute;inset:0;height:auto;min-height:0;overflow-y:scroll;overflow-x:hidden;overscroll-behavior:contain;scrollbar-gutter:stable\}/);
+assert.match(styles, /\.shell\{grid-template-rows:minmax\(0,1fr\);overflow:hidden\}/);
+assert.match(styles, /\.rail,\.sidebar,\.workspace,\.view\{min-height:0\}/);
+assert.match(styles, /\.sidebar\{height:100%;overflow:hidden\}/);
+assert.match(styles, /\.task-list\{min-height:0\}/);
 assert.match(styles, /\.workspace\{display:flex;flex-direction:column\}/);
+assert.match(styles, /\.workspace>\.view\{flex:1 1 0;min-height:0\}/);
+assert.match(renderer, /if \(state\.view === "create"\) \{\s*const view = app\.querySelector\("\.create-view"\);\s*if \(view\) view\.scrollTop = viewScroll;/);
+assert.match(renderer, /app\.addEventListener\("wheel", \(event\) => \{\s*if \(state\.view !== "create"\) return;/);
+assert.match(renderer, /event\.preventDefault\(\);\s*view\.scrollTop = nextScrollTop;/);
 
 process.stdout.write("renderer security and product contracts passed\n");

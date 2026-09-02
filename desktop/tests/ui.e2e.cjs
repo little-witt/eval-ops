@@ -51,6 +51,7 @@ const decision = {
 const events = [
   [1,"kernel.created",null],[2,"evaluation.design_compiled",null],[3,"case_run.started","react-effect-cleanup"],[4,"case_run.completed","react-effect-cleanup"],[5,"case_run.started","miniprogram-request-race"],[6,"case_run.completed","miniprogram-request-race"],[7,"analysis.completed",null],[8,"optimization.proposal_ready",null],
 ].map(([seq,type,case_id]) => ({ seq,event_id:`review-skill-001:${String(seq).padStart(8,"0")}`,timestamp:new Date(2026,7,26,10,20,seq).toISOString(),type,iteration:1,case_id,run_id:case_id?"evaluation":null,payload:type==="evaluation.design_compiled"?{case_count:2,generated_case_count:1,pack_source:"reused"}:type==="analysis.completed"?{stable_pass_case_ids:["react-effect-cleanup"],failed_case_ids:["miniprogram-request-race"],next_action:"await_user_confirmation"}:type==="case_run.started"?{session_id:`session-${seq}`}:{}}));
+const historyTasks = Array.from({ length:24 }, (_, index) => ({ ...task, id:`review-skill-${String(index + 1).padStart(3,"0")}`, current_iteration:index % 3 + 1 }));
 const snapshot = { task,state,design,decision,events,iterations:[{ name:"iteration-001",session_logs:[{case_id:"react-effect-cleanup",purpose:"evaluation",session_id:"session-3",status:"completed",artifact:"/tmp/log.json"},{case_id:"miniprogram-request-race",purpose:"evaluation",session_id:"session-5",status:"completed",artifact:"/tmp/log2.json"}] }] };
 const modelProfile = { id:"default",provider:"codex",ready:true,config_ready:true,auth_ready:true,codex_ready:true,inference_mode:"responses-direct",imports:{config:{sha256:"a".repeat(64)},auth:{sha256:"b".repeat(64)}},models:[{id:"gpt-5-test",model:"gpt-5-test",display_name:"GPT-5 Test",description:"Fixture local analysis model",is_default:true,is_gpt:true,default_reasoning_effort:"medium",probe:{ready:true},reasoning_efforts:[{id:"low",description:"Fast"},{id:"medium",description:"Balanced"},{id:"high",description:"Deep"}]}] };
 
@@ -79,7 +80,7 @@ let browser;
       platform:"darwin",
       rpc:async(method) => {
         if(method==="system.bootstrap") return { version:"0.2.1",d2c_profile:{},d2c_health:{ready:true,versions:{chrome:"Chrome 140",node:"v24"}},environment_health:{kernel:{ready:true,version:"0.2.1"},git:{ready:true,version:"git 2.50"},d2c:{ready:true,chrome:"Chrome 140",node:"v24"},codex:{ready:true,version:"codex-cli 0.148.0"}} };
-        if(method==="tasks.list") return {tasks:[summary]};
+        if(method==="tasks.list") return {tasks:historyTasks.map(item => ({ ...summary, id:item.id, current_iteration:item.current_iteration }))};
         if(method==="tasks.get") return snapshot;
         if(method==="tasks.log") return {session:{observation:{output:"发现 1 个问题",trace:[{kind:"tool_call",name:"read_file"},{kind:"tool_result",content:"source"}]}}};
         return {};
@@ -88,7 +89,7 @@ let browser;
       modelProfiles:async()=>({profiles:[modelProfile]}), importCodexFile:async()=>modelProfile, importCodexCcSwitch:async()=>modelProfile, refreshCodexProfile:async()=>modelProfile, testCodexProfile:async()=>({ready:true,model:"gpt-5-test",reasoning_effort:"medium",duration_seconds:1.2}),
       selectDirectory:async()=>null, selectFile:async()=>null, selectImage:async()=>null, openPreview:async()=>({opened:true}), saveSecrets:async()=>[], installExtension:async()=>null,
     };
-  }, { snapshot,task,state,modelProfile });
+  }, { snapshot,task,state,modelProfile,historyTasks });
   await page.goto("http://127.0.0.1:8877/index.html");
   await page.getByRole("heading", { name:"frontend-code-reviewer" }).waitFor();
   await page.getByRole("button", { name:"Case / 路径" }).click();
@@ -103,6 +104,22 @@ let browser;
   await page.screenshot({ path:path.join(output,"forge-desktop-task-detail.png"), fullPage:true });
   await page.locator('[data-action="new-task"]').first().click();
   await page.getByRole("heading", { name:"创建一次可追溯的 Skill 升级" }).waitFor();
+  const createView = page.locator(".create-view");
+  const layoutMetrics = await page.locator(".shell").evaluate(node => ({ clientHeight:node.clientHeight, scrollHeight:node.scrollHeight, rows:getComputedStyle(node).gridTemplateRows }));
+  if (layoutMetrics.scrollHeight !== layoutMetrics.clientHeight) throw new Error(`历史任务不能撑高应用布局：${JSON.stringify(layoutMetrics)}`);
+  const sidebarMetrics = await page.locator(".sidebar").evaluate(node => ({ clientHeight:node.clientHeight, scrollHeight:node.scrollHeight, overflowY:getComputedStyle(node).overflowY }));
+  if (sidebarMetrics.scrollHeight !== sidebarMetrics.clientHeight || sidebarMetrics.overflowY !== "hidden") throw new Error(`侧栏应保持窗口高度并裁剪到内部任务列表：${JSON.stringify(sidebarMetrics)}`);
+  const taskListMetrics = await page.locator(".task-list").evaluate(node => ({ clientHeight:node.clientHeight, scrollHeight:node.scrollHeight, overflowY:getComputedStyle(node).overflowY }));
+  if (taskListMetrics.scrollHeight <= taskListMetrics.clientHeight || taskListMetrics.overflowY !== "auto") throw new Error(`历史任务列表应在侧栏内滚动：${JSON.stringify(taskListMetrics)}`);
+  const createMetrics = await createView.evaluate(node => ({ clientHeight:node.clientHeight, scrollHeight:node.scrollHeight }));
+  if (createMetrics.scrollHeight <= createMetrics.clientHeight) throw new Error(`创建页应由自身承载纵向滚动：${JSON.stringify(createMetrics)}`);
+  await createView.hover();
+  await page.mouse.wheel(0, 480);
+  const wheelMetrics = await createView.evaluate(node => ({ scrollTop:node.scrollTop, clientHeight:node.clientHeight, scrollHeight:node.scrollHeight }));
+  if (wheelMetrics.scrollTop <= 0) throw new Error(`创建页未响应真实滚轮输入：${JSON.stringify(wheelMetrics)}`);
+  await createView.evaluate(node => { node.scrollTop = node.scrollHeight; });
+  const bottomMetrics = await createView.evaluate(node => ({ scrollTop:node.scrollTop, clientHeight:node.clientHeight, scrollHeight:node.scrollHeight }));
+  if (bottomMetrics.scrollTop <= 0 || bottomMetrics.scrollHeight - bottomMetrics.clientHeight - bottomMetrics.scrollTop > 1) throw new Error(`创建页无法滚动至表单底部：${JSON.stringify(bottomMetrics)}`);
   await page.screenshot({ path:path.join(output,"forge-desktop-create-task.png"), fullPage:true });
   await page.locator('[data-action="settings"]').first().click();
   await page.getByRole("heading", { name:"安全配置与运行环境" }).waitFor();

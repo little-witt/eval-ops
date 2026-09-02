@@ -150,14 +150,19 @@ button:focus-visible,input:focus-visible,textarea:focus-visible,select:focus-vis
 .overall-validation,.overall-causal{margin-top:11px;padding:9px;background:#f4f1e9;border:1px solid #d6d0c4;border-radius:6px}.overall-validation h5,.overall-causal h5{margin:0 0 5px;font-size:9px}.overall-validation p{margin:0;color:#69746a;font-size:8px}.overall-causal article{padding:7px;margin-top:5px;background:rgba(255,255,255,.45);border-radius:5px}.overall-causal article header{display:flex;justify-content:space-between;gap:7px}.overall-causal article header b{font:600 8px var(--mono)}.overall-causal article header span{color:#815f1d;font-size:7px}.overall-causal article p,.overall-causal article small{display:block;margin-top:4px;color:#69746a;font-size:8px;line-height:1.45}.overall-causal article small{color:#7b8078;font-size:7px}.assessment-meta{display:flex;gap:7px;flex-wrap:wrap;margin:6px 0;color:#7b8078;font:7px var(--mono)}
 @media(max-width:900px){.overall-counts{grid-template-columns:repeat(2,1fr)}.overall-columns{grid-template-columns:1fr}}
 
-/* The workspace is a fixed-height grid child.  Without an explicit minimum
-   height of zero, the grid item's automatic minimum can push the create form
-   beyond the viewport while the parent clips overflow, leaving no scroll
-   container for the user. */
-.shell,.workspace,.view{min-height:0}
+/* Keep the application grid at viewport height.  A long task history must
+   scroll inside the sidebar instead of expanding the grid's implicit row and
+   leaving the create form taller than the clipped window. */
+.shell{grid-template-rows:minmax(0,1fr);overflow:hidden}
+.rail,.sidebar,.workspace,.view{min-height:0}
+.sidebar{height:100%;overflow:hidden}
+.task-list{min-height:0}
 .workspace{display:flex;flex-direction:column}
-.workspace>.view{flex:1 1 auto;min-height:0}
-.create-view{height:100%;min-height:0;overflow-y:auto;overflow-x:hidden;overscroll-behavior:contain}
+.workspace>.view{flex:1 1 0;min-height:0}
+/* The create form must not participate in the workspace flex sizing chain.
+   Anchor it to the fixed workspace so it is always the sole vertical scroll
+   container, whether the sidebar has task history or is empty. */
+.workspace>.create-view{position:absolute;inset:0;height:auto;min-height:0;overflow-y:scroll;overflow-x:hidden;overscroll-behavior:contain;scrollbar-gutter:stable}
 .dimension-evidence-detail{display:grid;gap:3px;margin-top:7px;padding:7px 8px;background:#f0f3f7;border-left:2px solid #7d91b7;border-radius:4px;color:#4f5d76;font-size:8px;line-height:1.45}.dimension-evidence-detail b{font-size:7px;color:#53698f}.dimension-evidence-detail span{overflow-wrap:anywhere}
 .overall-causal .failure-dimension-list{display:grid;gap:3px;margin-top:6px}.overall-causal .failure-dimension-list span{display:block;padding:5px 6px;background:rgba(255,255,255,.65);border-left:2px solid #d38d73;border-radius:3px;font-size:7px;line-height:1.4}.overall-causal .factor-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:4px;margin-top:6px}.overall-causal .factor-grid>div{padding:5px;background:rgba(255,255,255,.5);border-radius:3px}.overall-causal .factor-grid b{display:block;font-size:7px;color:#68748a}.overall-causal .factor-grid span{display:block;margin-top:3px;font-size:7px;line-height:1.35;overflow-wrap:anywhere}.overall-skill-facts{margin-top:6px;padding:7px 8px;background:#fff8ed;border-left:2px solid #c99348;border-radius:4px;color:#6b593b;font-size:8px;line-height:1.45}.overall-skill-facts b{display:block;margin-bottom:3px;font-size:7px}.overall-validation-steps{margin-top:6px;padding-left:16px;color:#5b6576;font-size:7px;line-height:1.5}
 .causal-note{margin:5px 0 7px;color:#7b8078;font-size:7px;line-height:1.4}.causal-evidence{margin-top:6px}.causal-evidence summary{color:#68748a;font-size:7px;cursor:pointer}.overall-causal code,.causal-evidence code{display:block;max-height:70px;margin-top:4px;overflow:auto;overflow-wrap:anywhere;color:#727a70;font:6px/1.35 var(--mono)}
