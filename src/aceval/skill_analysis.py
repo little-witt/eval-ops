@@ -788,6 +788,11 @@ def _load_frozen_source(
     if isinstance(source, SubjectSnapshot):
         skill_bytes = source.files.get("SKILL.md")
         manifest_bytes = source.files.get("subject.json")
+        resource_files = {
+            str(path): content
+            for path, content in source.files.items()
+            if path not in ("SKILL.md", "subject.json")
+        }
         if skill_bytes is None:
             if not isinstance(source.content, str):
                 raise SkillAnalysisError(
@@ -804,7 +809,7 @@ def _load_frozen_source(
             raise SkillAnalysisError("SKILL.md must be UTF-8") from exc
         if isinstance(source.content, str) and source.content != text:
             raise SkillAnalysisError("SubjectSnapshot content differs from frozen SKILL.md")
-        computed = hash_skill_subject(skill_bytes, manifest_bytes)
+        computed = hash_skill_subject(skill_bytes, manifest_bytes, resource_files)
         if source.content_hash != computed:
             raise SkillAnalysisError("SubjectSnapshot content hash mismatch")
         entrypoint = source.metadata.get("entrypoint", source_path)

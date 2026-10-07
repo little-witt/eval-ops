@@ -45,6 +45,9 @@ class ModelReply:
     content: str = ""
     tool_calls: Sequence[ToolCall] = ()
     usage: Mapping[str, Any] = field(default_factory=dict)
+    # Provider bridges may report the concrete model selected after resolving
+    # a CC Switch alias. Existing clients can omit this field.
+    model_id: Optional[str] = None
 
 
 class ModelClient(Protocol):
@@ -256,9 +259,17 @@ class CommandModelClient:
             if exceeded is not None:
                 raise ReferenceRuntimeError("model bridge %s exceeds byte limit" % exceeded)
             if process.returncode != 0:
-                raise ReferenceRuntimeError(
-                    "model bridge exited with status %s" % process.returncode
-                )
+                stderr_stream.seek(0)
+                stderr = stderr_stream.read(self._max_stderr_bytes + 1)
+                detail = stderr.decode("utf-8", errors="replace").strip()
+                # Keep the user-facing failure actionable while bounding the
+                # amount of subprocess output persisted in task events.
+                if len(detail) > 2000:
+                    detail = detail[-2000:]
+                message = "model bridge exited with status %s" % process.returncode
+                if detail:
+                    message = "%s: %s" % (message, detail)
+                raise ReferenceRuntimeError(message)
             stdout_stream.seek(0)
             return stdout_stream.read(self._max_stdout_bytes + 1)
 
@@ -317,6 +328,7 @@ class CommandModelClient:
                 content=content,
                 tool_calls=tuple(calls),
                 usage=_validated_usage(raw_usage, "invalid model bridge response"),
+                model_id=(str(payload.get("model_id")) if payload.get("model_id") else None),
             )
         except (
             KeyError,

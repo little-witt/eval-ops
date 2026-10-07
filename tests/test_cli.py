@@ -9,10 +9,12 @@ import shlex
 import sys
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 from typing import Any, Optional, Sequence, Tuple
 
 from aceval.cli import main
+from aceval.experiments import ExperimentPlan
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -56,6 +58,93 @@ class CliBlackBoxTests(unittest.TestCase):
             raise AssertionError(report)
         if not report_markdown.read_text(encoding="utf-8"):
             raise AssertionError(report_markdown)
+
+    def test_code_review_p0_lab_bundle_and_grade(self):
+        lab = self.output_root / "review-lab"
+        code, _, stderr, payload = self.invoke(
+            ["code-review", "init-lab", "--output", str(lab)]
+        )
+        self.assertEqual(0, code, stderr)
+        self.assertEqual(12, len(payload["cases"]))
+        self.assertEqual("java-sql-injection", payload["default_case"])
+        self.assertEqual(
+            {"typescript-web", "react-native", "wechat-miniprogram", "java-backend"},
+            set(payload["stacks"]),
+        )
+        self.assertTrue(all(case["stack"] in payload["stacks"] for case in payload["cases"]))
+        case = next(
+            item for item in payload["cases"]
+            if item["id"] == payload["default_case"]
+        )
+        oracle = json.loads(Path(case["oracle"]).read_text(encoding="utf-8"))
+        expected = oracle["expected_findings"][0]
+        findings = self.output_root / "findings.json"
+        findings.write_text(
+            json.dumps(
+                {
+                    "findings": [
+                        {
+                            "path": expected["path"],
+                            "line": expected["line_start"],
+                            "category": expected["category"],
+                            "severity": expected["severity"],
+                            "explanation": "actionable defect",
+                        }
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+        code, _, stderr, grade = self.invoke(
+            [
+                "code-review", "grade",
+                "--repository", case["repository"],
+                "--findings", "@" + str(findings),
+                "--oracle", "@" + case["oracle"],
+            ]
+        )
+        self.assertEqual(0, code, stderr)
+        self.assertEqual("pass", grade["status"])
+        candidate = self.output_root / "candidate.json"
+        code, _, stderr, bundle = self.invoke(
+            [
+                "environment", "bundle",
+                "--repository", case["repository"],
+                "--subject-hash", "sha256:" + "a" * 64,
+                "--producer-run-id", "prep-1",
+                "--base-commit", case["base_commit"],
+                "--head-commit", case["head_commit"],
+                "--output", str(candidate),
+            ]
+        )
+        self.assertEqual(0, code, stderr)
+        self.assertTrue(bundle["bundle_hash"].startswith("sha256:"))
+
+        filtered_lab = self.output_root / "java-review-lab"
+        code, _, stderr, filtered = self.invoke(
+            [
+                "code-review", "init-lab",
+                "--output", str(filtered_lab),
+                "--stack", "java-backend",
+            ]
+        )
+        self.assertEqual(0, code, stderr)
+        self.assertEqual(["java-backend"], filtered["stacks"])
+        self.assertEqual(3, len(filtered["cases"]))
+
+        skill = self.output_root / "SKILL.md"
+        skill.write_text("# Reviewer\n\nReview React Native TypeScript changes.\n", encoding="utf-8")
+        code, _, stderr, selection = self.invoke(
+            [
+                "code-review", "select-cases",
+                "--lab", str(lab),
+                "--skill", str(skill),
+            ]
+        )
+        self.assertEqual(0, code, stderr)
+        self.assertEqual(["react-native"], selection["stacks"])
+        self.assertEqual(3, len(selection["cases"]))
+        self.assertEqual(str((lab / "repository").resolve()), selection["repository"])
 
     def test_pack_lint_and_fake_pack_test(self) -> None:
         code, _, stderr, payload = self.invoke(["pack", "lint", str(PACK)])
@@ -141,10 +230,16 @@ class CliBlackBoxTests(unittest.TestCase):
         self.assertEqual(0, code, stderr)
         self.assertEqual("draft", payload["calibration_status"])
         self.assertFalse(payload["optimization_eligible"])
+        self.assertEqual(
+            Path(str(pack) + ".experiment.json").resolve(),
+            Path(payload["experiment"]),
+        )
         manifest = json.loads((pack / "pack.yaml").read_text(encoding="utf-8"))
+        self.assertNotIn("optimizer_policy", manifest)
+        experiment = ExperimentPlan.load(payload["experiment"])
         self.assertEqual(
             "total_tokens",
-            manifest["optimizer_policy"]["objective"]["source"]["key"],
+            experiment.optimization.objective.source.key,
         )
 
         code, _, stderr, payload = self.invoke(["pack", "calibrate", str(pack)])
@@ -352,6 +447,95 @@ Write a good answer as appropriate.
         self.assertTrue((plan / "case-drafts.json").is_file())
         self.assertTrue((pack / "design" / "test-plan.json").is_file())
         self.assertTrue((pack / "design" / "generation-provenance.json").is_file())
+
+    def test_doctor_compiles_evaluation_without_cases(self) -> None:
+        skill = self.output_root / "case-free-skill"
+        skill.mkdir()
+        (skill / "SKILL.md").write_text(
+            "# Answer Skill\n\n## Return JSON\n\nReturn an exact JSON answer.\n",
+            encoding="utf-8",
+        )
+        pack = self.output_root / "case-free-evaluation"
+        code, _, stderr, payload = self.invoke(
+            [
+                "doctor",
+                "--subject",
+                str(skill),
+                "--standards",
+                "The answer must equal 42.",
+                "--prompt",
+                "Return 42 as JSON.",
+                "--expected-output",
+                '{"answer": 42}',
+                "--pack-output",
+                str(pack),
+                "--runtime",
+                "fake",
+                "--output-root",
+                str(self.output_root / "case-free-runs"),
+            ]
+        )
+
+        self.assertEqual(0, code, stderr)
+        self.assertEqual("calibration_required", payload["status"])
+        self.assertEqual("generated", payload["evaluation"]["source"])
+        self.assertEqual([], payload["evaluation"]["required_inputs"])
+        self.assertTrue(pack.is_dir())
+
+    def test_doctor_case_free_flow_exposes_missing_expectation_not_pack_mechanics(self):
+        skill = self.output_root / "missing-expectation-skill"
+        skill.mkdir()
+        (skill / "SKILL.md").write_text(
+            "# Answer Skill\n\n## Return JSON\n\nReturn an answer.\n",
+            encoding="utf-8",
+        )
+        code, _, stderr, payload = self.invoke(
+            [
+                "doctor",
+                "--subject",
+                str(skill),
+                "--standards",
+                "The result must be correct JSON.",
+                "--pack-output",
+                str(self.output_root / "missing-expectation"),
+                "--runtime",
+                "fake",
+            ]
+        )
+
+        self.assertEqual(0, code, stderr)
+        self.assertEqual("needs_user_input", payload["status"])
+        self.assertEqual(
+            "expected_result",
+            payload["evaluation"]["required_inputs"][0]["field"],
+        )
+
+    def test_doctor_reports_runtime_gap_for_d2c_profile(self) -> None:
+        skill = self.output_root / "d2c-skill"
+        skill.mkdir()
+        (skill / "SKILL.md").write_text(
+            "# D2C Skill\n\nConvert a Figma 设计稿 into responsive UI code.\n",
+            encoding="utf-8",
+        )
+        code, _, stderr, payload = self.invoke(
+            [
+                "doctor",
+                "--subject",
+                str(skill),
+                "--standards",
+                "The rendered page must match the design.",
+                "--expected-output",
+                '{"files": ["index.html"]}',
+                "--pack-output",
+                str(self.output_root / "d2c-evaluation"),
+                "--runtime",
+                "fake",
+            ]
+        )
+
+        self.assertEqual(0, code, stderr)
+        self.assertEqual("runtime_adapter_required", payload["status"])
+        self.assertIn("browser", payload["evaluation"]["runtime_gaps"])
 
     def test_doctor_planned_subject_drift_requires_explicit_override(self) -> None:
         skill = self.output_root / "drift-skill"
@@ -811,6 +995,86 @@ Use `write_file` to create `response.json` with the exact answer.
             report["failure_cards"][0]["reason_code"],
         )
         self.assertTrue(diagnosis.is_file())
+
+    def test_catx_profile_execute_and_status_dispatch(self) -> None:
+        profile = self.output_root / "catx-profile.json"
+        profile.write_text(
+            json.dumps(
+                {
+                    "api_version": "aceval.catx-profile/v1",
+                    "name": "catx-online",
+                    "base_url": "https://api.catx.test/api/v1",
+                    "api_key_env": "CATX_API_KEY",
+                    "user_mis_id_env": "USER_MIS_ID",
+                    "agent_id_env": "CATX_AGENT_ID",
+                    "environment_id_env": "CATX_ENV_ID",
+                    "vault_ids": ["vlt_test"],
+                    "repository": {
+                        "url": "ssh://git@git.sankuai.com/org/repo.git",
+                        "authorization_token_env": "CATX_REPOSITORY_TOKEN",
+                        "mount_path": "/workspace/repo",
+                    },
+                    "stream": {
+                        "base_url": "https://project.supabase.test",
+                        "api_key_env": "SUPABASE_ANON_KEY",
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        code, _, stderr, payload = self.invoke(["profile", "validate", str(profile)])
+        self.assertEqual(0, code, stderr)
+        self.assertEqual("aceval.catx-profile/v1", payload["api_version"])
+        self.assertEqual("CATX_API_KEY", payload["credential_envs"]["api_key"])
+        self.assertEqual(
+            "CATX_REPOSITORY_TOKEN",
+            payload["credential_envs"]["repository_authorization_token"],
+        )
+        self.assertEqual("/workspace/repo", payload["repository"]["mount_path"])
+        self.assertTrue(payload["stream_configured"])
+        self.assertFalse(payload["secret_loaded"])
+
+        request = self.output_root / "catx-request.json"
+        request.write_text(
+            json.dumps({"title": "smoke", "prompt": "run once"}),
+            encoding="utf-8",
+        )
+        with mock.patch("aceval.cli.CatxAgentClient") as client_type:
+            client_type.return_value.start_session.return_value = "session-online"
+            code, _, stderr, payload = self.invoke(
+                [
+                    "session",
+                    "execute",
+                    "--profile",
+                    str(profile),
+                    "--request",
+                    str(request),
+                ]
+            )
+            self.assertEqual(0, code, stderr)
+            self.assertEqual("session-online", payload["session_id"])
+            client_type.return_value.start_session.assert_called_once_with(
+                {"title": "smoke", "prompt": "run once"}
+            )
+
+        with mock.patch("aceval.cli.CatxAgentClient") as client_type:
+            client_type.return_value.poll_session.return_value = {
+                "status": "RUNNING",
+                "round_count": 0,
+                "message": None,
+            }
+            code, _, stderr, payload = self.invoke(
+                [
+                    "session",
+                    "status",
+                    "--profile",
+                    str(profile),
+                    "--session-id",
+                    "session-online",
+                ]
+            )
+            self.assertEqual(0, code, stderr)
+            self.assertEqual("RUNNING", payload["status"])
 
     def test_reference_runtime_executes_json_bridge_and_file_tools(self) -> None:
         bridge = self.output_root / "deterministic_bridge.py"

@@ -1,0 +1,404 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>FORGE — Skill Evolution Studio</title>
+  <link rel="stylesheet" href="./styles.css">
+</head>
+<body>
+  <div class="desktop-shell">
+    <header class="window-bar">
+      <div class="traffic-lights" aria-hidden="true"><i></i><i></i><i></i></div>
+      <div class="window-title">FORGE · Skill Evolution Studio</div>
+      <div class="window-tools">
+        <button class="icon-button" title="搜索">⌘ K</button>
+        <button class="avatar" title="liuzhenni">LZ</button>
+      </div>
+    </header>
+
+    <div class="app-frame">
+      <aside class="sidebar">
+        <div class="brand">
+          <div class="brand-glyph" aria-hidden="true"><span></span><span></span><span></span></div>
+          <div><strong>FORGE</strong><small>Skill Studio</small></div>
+        </div>
+
+        <nav class="primary-nav" aria-label="主导航">
+          <button class="nav-item active" data-screen-target="home">
+            <span class="nav-icon">⌂</span><span>任务</span><b>3</b>
+          </button>
+          <button class="nav-item" data-screen-target="resources">
+            <span class="nav-icon">◇</span><span>资源</span>
+          </button>
+          <button class="nav-item" data-screen-target="settings">
+            <span class="nav-icon">◎</span><span>环境与设置</span><i class="healthy-dot"></i>
+          </button>
+        </nav>
+
+        <div class="sidebar-section">
+          <p>最近任务</p>
+          <button class="recent-task" data-screen-target="workbench">
+            <span class="recent-mark running"></span>
+            <span><strong>前端代码评审</strong><small>第 2 轮 · 运行中</small></span>
+          </button>
+          <button class="recent-task" data-screen-target="decision">
+            <span class="recent-mark review"></span>
+            <span><strong>告警分级</strong><small>候选待确认</small></span>
+          </button>
+          <button class="recent-task">
+            <span class="recent-mark done"></span>
+            <span><strong>文档证据摘要</strong><small>已完成</small></span>
+          </button>
+        </div>
+
+        <div class="sidebar-footer">
+          <div class="runtime-state">
+            <i></i><span><strong>运行环境正常</strong><small>4 项连接已验证</small></span>
+          </div>
+          <button class="quiet-button" data-screen-target="settings">查看诊断</button>
+        </div>
+      </aside>
+
+      <main class="content">
+        <!-- Task Center -->
+        <section class="screen active" data-screen="home">
+          <header class="page-header home-header">
+            <div>
+              <p class="kicker">8 月 25 日 · 星期二</p>
+              <h1>让每个 Skill<br>更值得依赖。</h1>
+              <p class="lead">从真实会话中发现问题，冻结评测证据，审阅每一次修改。</p>
+            </div>
+            <button class="primary-action" data-screen-target="new-task"><span>＋</span> 新建升级任务</button>
+          </header>
+
+          <div class="readiness-line">
+            <div><i class="pulse-dot"></i><strong>可以开始评测</strong><span>本地模型、CATX、Git 与浏览器环境均已就绪</span></div>
+            <button data-screen-target="settings">环境详情 →</button>
+          </div>
+
+          <section class="attention-queue">
+            <div class="section-title-row">
+              <div><p class="kicker">YOUR ATTENTION</p><h2>需要你处理</h2></div>
+              <span class="count-badge">2</span>
+            </div>
+            <div class="attention-grid">
+              <article class="attention-item feature" data-screen-target="decision" tabindex="0">
+                <div class="attention-type"><span>候选审批</span><time>12 分钟前</time></div>
+                <h3>告警分级 Skill</h3>
+                <p>3 个失败收敛为 2 个根因，建议修改 4 个文件。所有旧能力回归已通过。</p>
+                <div class="attention-footer"><strong>查看候选差异</strong><span>预计 +7.8 分 →</span></div>
+              </article>
+              <article class="attention-item">
+                <div class="attention-type"><span>能力选择</span><time>28 分钟前</time></div>
+                <h3>学城文档编辑 Skill</h3>
+                <p>发现 3 个可扩展方向，推荐优先增加“结构化表格保真编辑”。</p>
+                <div class="attention-footer"><strong>选择能力方案</strong><span>3 个方案 →</span></div>
+              </article>
+            </div>
+          </section>
+
+          <section class="task-table-section">
+            <div class="section-title-row compact">
+              <div><p class="kicker">ACTIVE WORK</p><h2>所有任务</h2></div>
+              <div class="table-filters"><button class="active">全部 8</button><button>运行中 2</button><button>已完成 3</button></div>
+            </div>
+            <div class="task-table">
+              <div class="task-row task-head"><span>Skill</span><span>意图</span><span>当前阶段</span><span>结果</span><span>更新时间</span><span></span></div>
+              <button class="task-row" data-screen-target="workbench">
+                <span class="skill-cell"><i class="skill-avatar cobalt">CR</i><span><strong>前端代码评审</strong><small>frontend-code-reviewer</small></span></span>
+                <span><b class="mode-tag">优化</b></span>
+                <span class="stage-cell"><i class="spinner"></i><span><strong>第 2 轮评测</strong><small>12 / 18 Case 已回收</small></span></span>
+                <span class="score-cell"><strong>73.4</strong><em class="up">+8.1</em></span>
+                <span class="muted">刚刚</span><span>›</span>
+              </button>
+              <button class="task-row" data-screen-target="decision">
+                <span class="skill-cell"><i class="skill-avatar amber">AL</i><span><strong>告警分级</strong><small>alert-level-with-kb</small></span></span>
+                <span><b class="mode-tag amber">修复</b></span>
+                <span class="stage-cell"><i class="review-dot"></i><span><strong>候选待确认</strong><small>4 个文件 · 96 行</small></span></span>
+                <span class="score-cell"><strong>81.2</strong><em class="up">+7.8</em></span>
+                <span class="muted">12 分钟前</span><span>›</span>
+              </button>
+              <button class="task-row">
+                <span class="skill-cell"><i class="skill-avatar sage">ES</i><span><strong>文档证据摘要</strong><small>evidence-summary</small></span></span>
+                <span><b class="mode-tag sage">新建</b></span>
+                <span class="stage-cell"><i class="done-dot">✓</i><span><strong>已完成</strong><small>相对无 Skill +21.4</small></span></span>
+                <span class="score-cell"><strong>88.6</strong><em class="up">+21.4</em></span>
+                <span class="muted">昨天</span><span>›</span>
+              </button>
+            </div>
+          </section>
+        </section>
+
+        <!-- New task wizard -->
+        <section class="screen" data-screen="new-task">
+          <header class="simple-header">
+            <button class="back-button" data-screen-target="home">←</button>
+            <div><p class="kicker">NEW EVOLUTION TASK</p><h1>升级一个 Skill</h1></div>
+            <button class="text-action">保存草稿</button>
+          </header>
+
+          <div class="wizard-layout">
+            <aside class="wizard-steps">
+              <button class="wizard-step active" data-wizard-step="1"><b>1</b><span><strong>Skill 与目标</strong><small>选择对象和意图</small></span></button>
+              <button class="wizard-step" data-wizard-step="2"><b>2</b><span><strong>Case 与预期</strong><small>可选，系统会补充</small></span></button>
+              <button class="wizard-step" data-wizard-step="3"><b>3</b><span><strong>环境检查</strong><small>执行与验证能力</small></span></button>
+              <button class="wizard-step" data-wizard-step="4"><b>4</b><span><strong>确认并启动</strong><small>预算与 Git 行为</small></span></button>
+              <div class="wizard-help"><span>?</span><p><strong>不知道怎么填？</strong><br>只选 Skill 并描述目标，其余由 FORGE 完成。</p></div>
+            </aside>
+
+            <div class="wizard-canvas">
+              <div class="wizard-panel active" data-wizard-panel="1">
+                <div class="form-intro"><span>01</span><div><h2>你想升级哪个 Skill？</h2><p>连接已有仓库，或从一个目标创建新 Skill。</p></div></div>
+                <label class="field-label">Skill 仓库</label>
+                <div class="repo-picker">
+                  <div class="repo-icon">⌘</div>
+                  <div><strong>frontend-code-reviewer</strong><small>ssh://git@git.sankuai.com/~liuzhenni/frontend-code-reviewer.git</small></div>
+                  <span class="verified-chip">✓ 已验证</span><button>更换</button>
+                </div>
+                <div class="branch-row"><label><span>分支</span><div>feature/test-and-optimize <i>⌄</i></div></label><label><span>入口</span><div>SKILL.md <i>自动识别</i></div></label></div>
+
+                <label class="field-label spaced">这次希望做什么？</label>
+                <div class="intent-options">
+                  <button class="intent-card selected"><i>✦</i><strong>自动判断</strong><small>根据目标和当前 Skill 选择修复、优化或扩展</small></button>
+                  <button class="intent-card"><i>＋</i><strong>增加能力</strong><small>已有明确功能，保留旧能力回归</small></button>
+                  <button class="intent-card"><i>⌁</i><strong>探索提升</strong><small>先发现高价值方向，再由你选择</small></button>
+                  <button class="intent-card"><i>○</i><strong>从零创建</strong><small>目标仓库当前不包含 Skill</small></button>
+                </div>
+
+                <label class="field-label spaced" for="goal">用你的话描述理想结果</label>
+                <div class="goal-composer">
+                  <textarea id="goal">希望它能稳定评审 React Native 和微信小程序代码，优先发现真实高风险问题，每条结论必须有代码证据，建议要能直接执行；不要为了召回制造大量误报。</textarea>
+                  <div><span>已识别：代码评审 · 质量优化 · 证据约束</span><button>让系统帮我补充标准</button></div>
+                </div>
+              </div>
+
+              <div class="wizard-panel" data-wizard-panel="2">
+                <div class="form-intro"><span>02</span><div><h2>有自己的 Case 就放进来</h2><p>没有也可以继续。你的 Case 优先保留，系统只补覆盖缺口。</p></div></div>
+                <div class="case-input-actions"><button class="secondary-action">＋ 添加 Case</button><button>从表格粘贴</button><button>导入 EvalPack</button><span>已有 2 个 Case</span></div>
+                <div class="case-editor-table">
+                  <div class="case-editor-head"><span>Case</span><span>输入 / 场景</span><span>预期结果</span><span>代码分支</span><span></span></div>
+                  <div class="case-editor-row"><span><b>01</b><strong>RN 列表性能</strong></span><p>评审 FlatList 渲染变更，关注重复渲染与 key 稳定性</p><p>识别高风险并引用具体代码</p><code>case/rn-flatlist</code><button>•••</button></div>
+                  <div class="case-editor-row"><span><b>02</b><strong>无关请求</strong></span><p>为页面写一段产品介绍文案</p><p>不应触发代码评审 Skill</p><code>—</code><button>•••</button></div>
+                </div>
+                <div class="generation-preview"><div class="spark">✦</div><div><strong>预计自动补充 10–14 个 Case</strong><p>TypeScript 正确性、React Hook、微信小程序生命周期、边界输入、负向触发和旧能力回归。</p></div><button>查看生成策略</button></div>
+              </div>
+
+              <div class="wizard-panel" data-wizard-panel="3">
+                <div class="form-intro"><span>03</span><div><h2>运行前先把环境问题排除</h2><p>执行与验证可以在不同环境，但必须绑定同一个代码快照。</p></div></div>
+                <div class="preflight-grid">
+                  <article><span class="checkmark">✓</span><div><strong>本地分析模型</strong><small>Claude Sonnet · 1.4s</small><p>结构化输出与预算检查通过</p></div><button>配置</button></article>
+                  <article><span class="checkmark">✓</span><div><strong>CATX 远程 Agent</strong><small>agent_06J… · env_g7I…</small><p>会话、仓库挂载与日志接口正常</p></div><button>详情</button></article>
+                  <article><span class="checkmark">✓</span><div><strong>Fixture 代码仓库</strong><small>base-repo · master</small><p>SSH、PAT 和目标分支可读取</p></div><button>更换</button></article>
+                  <article><span class="checkmark">✓</span><div><strong>本地验证能力</strong><small>Git · Node · Chrome</small><p>代码测试与浏览器证据可用</p></div><button>诊断</button></article>
+                </div>
+                <div class="snapshot-binding"><span>◉</span><div><strong>快照绑定已开启</strong><p>每个远程会话、验证结果和候选都会记录 Skill commit、代码 commit 与环境指纹。</p></div><button class="toggle on"><i></i></button></div>
+              </div>
+
+              <div class="wizard-panel" data-wizard-panel="4">
+                <div class="form-intro"><span>04</span><div><h2>确认这次运行</h2><p>下面是首次评测预算。任何 Skill 修改仍会单独向你确认。</p></div></div>
+                <div class="launch-summary">
+                  <article><span>目标 Skill</span><strong>frontend-code-reviewer</strong><small>feature/test-and-optimize</small></article>
+                  <article><span>评测规模</span><strong>约 14–18 Case</strong><small>并行 6 个会话</small></article>
+                  <article><span>预计 Token</span><strong>42k–68k</strong><small>达到 80k 自动暂停</small></article>
+                </div>
+                <div class="launch-policy">
+                  <h3>安全与发布</h3>
+                  <label><input type="checkbox" checked> 只在独立任务 worktree 中生成候选</label>
+                  <label><input type="checkbox" checked> 每轮具体 diff 必须由我批准</label>
+                  <label><input type="checkbox" checked> 默认创建任务分支，不推送 master</label>
+                  <label><input type="checkbox" checked> 环境问题不授权修改 Skill</label>
+                </div>
+                <div class="launch-note"><span>i</span><p>启动后会先冻结 Case 与标准，再创建线上会话。你可以随时暂停，不会丢失已回收日志。</p></div>
+              </div>
+
+              <footer class="wizard-footer">
+                <div><span>步骤 <b id="current-step">1</b> / 4</span><div class="step-progress"><i></i></div></div>
+                <div><button class="secondary-action" id="wizard-prev" disabled>上一步</button><button class="primary-action" id="wizard-next">继续：Case 与预期 →</button></div>
+              </footer>
+            </div>
+          </div>
+        </section>
+
+        <!-- Live Workbench -->
+        <section class="screen" data-screen="workbench">
+          <header class="task-header">
+            <div class="task-heading">
+              <button class="back-button" data-screen-target="home">←</button>
+              <div class="skill-avatar cobalt large">CR</div>
+              <div><div class="breadcrumbs">任务 / 前端代码评审 / <b>第 2 轮</b></div><h1>提升高风险缺陷召回与证据质量</h1><p>frontend-code-reviewer · feature/test-and-optimize</p></div>
+            </div>
+            <div class="run-controls"><span class="live-chip"><i></i> 正在运行</span><button class="secondary-action">暂停</button><button class="danger-quiet">停止</button></div>
+          </header>
+
+          <div class="budget-strip">
+            <div><span>当前进度</span><strong>12 / 18 Case</strong><i><b style="width:67%"></b></i></div>
+            <div><span>本轮 Token</span><strong>31.8k / 60k</strong><i><b style="width:53%"></b></i></div>
+            <div><span>远程会话</span><strong>12 完成 · 6 运行</strong></div>
+            <div><span>预计完成</span><strong>约 4 分钟</strong></div>
+          </div>
+
+          <nav class="workbench-tabs"><button class="active">旅程总览</button><button>Case 与标准 <span>18</span></button><button>线上会话 <span>18</span></button><button>文件与候选</button><button>高级证据</button></nav>
+
+          <div class="iteration-spine-wrap">
+            <div class="spine-title"><div><p class="kicker">ITERATION SPINE</p><h2>这次升级是怎么走到这里的</h2></div><button>收起已完成步骤</button></div>
+            <div class="iteration-spine">
+              <button class="spine-node complete"><i>✓</i><span><small>输入与标准</small><strong>已冻结</strong><em>3 项标准</em></span></button>
+              <button class="spine-node complete"><i>✓</i><span><small>自动 Case</small><strong>18 个</strong><em>6 个覆盖组</em></span></button>
+              <button class="spine-node complete"><i>✓</i><span><small>Baseline</small><strong>65.3</strong><em>7 个失败</em></span></button>
+              <button class="spine-node regressed"><i>1</i><span><small>第 1 轮</small><strong>61.8</strong><em>出现回退</em></span></button>
+              <button class="spine-node active"><i>2</i><span><small>第 2 轮</small><strong>运行中</strong><em>12 / 18</em></span></button>
+              <button class="spine-node future"><i>·</i><span><small>收敛判断</small><strong>等待</strong><em>—</em></span></button>
+            </div>
+          </div>
+
+          <div class="workbench-grid">
+            <section class="round-story">
+              <div class="panel-head"><div><p class="kicker">WHY THIS ROUND</p><h2>第 2 轮为什么继续</h2></div><span class="round-number">02</span></div>
+              <div class="cause-chain">
+                <div class="cause-block observed"><span>第 1 轮观察</span><strong>提高召回后，误报与路径偏离同时上升</strong><p>3 个 Case 改善，但 2 个已通过 Case 回退；Agent 跳过证据核验步骤。</p></div>
+                <div class="chain-arrow">↓</div>
+                <div class="cause-block hypothesis"><span>本轮假设</span><strong>问题不是规则不够多，而是检查顺序失去约束</strong><p>恢复“风险筛选 → 证据核验 → 输出建议”的单向门禁，并移出冗长框架清单。</p></div>
+                <div class="chain-arrow">↓</div>
+                <div class="cause-block change"><span>修改尝试</span><div class="change-files"><code>M SKILL.md</code><code>M references/review-policy.md</code><code>M workflow/evidence-gate.md</code></div><p>没有修改 Case、Grader 或源码 Fixture。</p></div>
+              </div>
+              <button class="inline-link" data-screen-target="decision">查看本轮候选 diff 与验证 →</button>
+            </section>
+
+            <section class="dimension-status">
+              <div class="panel-head"><div><p class="kicker">LIVE DIMENSIONS</p><h2>哪些维度正在改善</h2></div><button>评分说明</button></div>
+              <div class="dimension-list">
+                <div><span><i class="dim-icon quality">Q</i><strong>高风险召回</strong></span><div class="score-track"><b style="width:78%"></b><i style="left:65%"></i></div><em class="up">78.0 +12.7</em></div>
+                <div><span><i class="dim-icon evidence">E</i><strong>证据质量</strong></span><div class="score-track"><b style="width:84%"></b><i style="left:72%"></i></div><em class="up">84.0 +12.0</em></div>
+                <div><span><i class="dim-icon path">P</i><strong>执行路径</strong></span><div class="score-track"><b style="width:89%"></b><i style="left:61%"></i></div><em class="up">89.0 +28.0</em></div>
+                <div><span><i class="dim-icon false">F</i><strong>误报控制</strong></span><div class="score-track amber"><b style="width:64%"></b><i style="left:70%"></i></div><em class="down">64.0 −6.0</em></div>
+                <div class="dimension-legend"><span><i class="candidate-line"></i>当前候选</span><span><i class="baseline-mark"></i>Baseline</span></div>
+              </div>
+              <div class="watch-note"><span>!</span><p><strong>仍需关注误报控制</strong><br>2 个负向触发 Case 尚未回收，暂不进入收敛判断。</p></div>
+            </section>
+
+            <section class="case-matrix-panel">
+              <div class="panel-head"><div><p class="kicker">CASE MATRIX</p><h2>18 个 Case 的当前状态</h2></div><div class="mini-legend"><span><i class="pass"></i>通过 10</span><span><i class="running"></i>运行 6</span><span><i class="fail"></i>失败 2</span></div></div>
+              <div class="case-groups">
+                <article><div><strong>TypeScript 正确性</strong><small>3 Case</small></div><span class="case-dot pass">✓</span><span class="case-dot pass">✓</span><span class="case-dot pass">✓</span><em>100%</em></article>
+                <article><div><strong>React / RN 风险</strong><small>5 Case</small></div><span class="case-dot pass">✓</span><span class="case-dot pass">✓</span><span class="case-dot running"></span><span class="case-dot running"></span><span class="case-dot fail">×</span><em>60%</em></article>
+                <article><div><strong>小程序生命周期</strong><small>3 Case</small></div><span class="case-dot pass">✓</span><span class="case-dot pass">✓</span><span class="case-dot running"></span><em>67%</em></article>
+                <article><div><strong>证据与建议</strong><small>3 Case</small></div><span class="case-dot pass">✓</span><span class="case-dot running"></span><span class="case-dot fail">×</span><em>33%</em></article>
+                <article><div><strong>负向触发</strong><small>2 Case</small></div><span class="case-dot running"></span><span class="case-dot running"></span><em>—</em></article>
+                <article><div><strong>旧能力回归</strong><small>2 Case</small></div><span class="case-dot pass">✓</span><span class="case-dot pass">✓</span><em>100%</em></article>
+              </div>
+            </section>
+
+            <aside class="live-session-panel">
+              <div class="panel-head"><div><p class="kicker">LIVE SESSION</p><h2>RN Hook 依赖错误</h2></div><span class="session-id">s_18f…</span></div>
+              <div class="session-timeline">
+                <div class="session-event done"><i>✓</i><span><strong>仓库快照已绑定</strong><small>skill 81a92e · code f32bd1</small></span></div>
+                <div class="session-event done"><i>✓</i><span><strong>已读取候选 Skill</strong><small>/workspace/skill/SKILL.md</small></span></div>
+                <div class="session-event done"><i>⌘</i><span><strong>工具 · git diff</strong><code>src/hooks/useHotel.ts</code></span></div>
+                <div class="session-event active"><i></i><span><strong>正在核验证据</strong><small>workflow/evidence-gate.md · step 2/3</small></span></div>
+              </div>
+              <div class="session-output"><span>当前回复</span><p>发现 <code>useMemo</code> 的依赖数组遗漏 <code>hotelId</code>，会在切换酒店时继续使用旧缓存…</p></div>
+              <div class="session-actions"><button>查看完整日志</button><button>在 Case 中打开 →</button></div>
+            </aside>
+          </div>
+        </section>
+
+        <!-- Candidate review -->
+        <section class="screen" data-screen="decision">
+          <header class="task-header decision-header">
+            <div class="task-heading">
+              <button class="back-button" data-screen-target="home">←</button>
+              <div class="skill-avatar amber large">AL</div>
+              <div><div class="breadcrumbs">任务 / 告警分级 / 第 3 轮 / <b>候选审批</b></div><h1>让“证据不足”不再被判成低风险</h1><p>alert-level-with-kb · candidate 3a81f0c</p></div>
+            </div>
+            <span class="review-chip">等待你的决定</span>
+          </header>
+
+          <div class="decision-summary">
+            <div class="decision-copy"><p class="kicker">CANDIDATE REVIEW</p><h2>4 个文件，解决 2 个共同根因</h2><p>候选没有修改 Case、评分器或 Fixture。已通过的 11 个 Case 全部复测通过。</p></div>
+            <div class="decision-metrics"><div><span>质量分</span><strong>81.2</strong><em>+7.8</em></div><div><span>失败 Case</span><strong>2</strong><em>−3</em></div><div><span>Token / Case</span><strong>2.1k</strong><em>−9%</em></div></div>
+          </div>
+
+          <div class="decision-layout">
+            <aside class="root-cause-rail">
+              <div class="rail-title"><span>为什么修改</span><b>2</b></div>
+              <button class="cause-item active"><span>01</span><div><strong>空证据被当成低风险</strong><small>影响 3 个 Case</small></div></button>
+              <button class="cause-item"><span>02</span><div><strong>异常名称截断</strong><small>影响 2 个 Case</small></div></button>
+              <div class="protected-cases"><span>回归保护</span><strong>11 / 11 通过</strong><div class="tiny-dots"><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i></div></div>
+            </aside>
+
+            <section class="diff-workspace">
+              <div class="diff-toolbar">
+                <div class="file-tabs"><button class="active">workflow/fast/stage-3-grade.md <i>+8 −3</i></button><button>scripts/collectors/group_b_js.py <i>+6 −2</i></button></div>
+                <div><button>并排</button><button class="active">统一</button><button>⌕</button></div>
+              </div>
+              <div class="diff-context"><span>修改目的</span><p>只有在证据明确支持时才能判定低风险；缺少趋势数据必须进入不可评估分支。</p></div>
+              <div class="diff-code" aria-label="候选差异">
+                <div class="diff-line context"><b>38</b><b>38</b><code>### 风险判定</code></div>
+                <div class="diff-line context"><b>39</b><b>39</b><code></code></div>
+                <div class="diff-line removed"><b>40</b><b></b><code>- 当趋势数据为空时，默认按低风险处理。</code></div>
+                <div class="diff-line added"><b></b><b>40</b><code>+ 当趋势数据为空或查询失败时，不得推断风险等级。</code></div>
+                <div class="diff-line added"><b></b><b>41</b><code>+ 返回 <mark>NOT_EVALUABLE</mark>，并列出缺失证据与建议补充动作。</code></div>
+                <div class="diff-line added"><b></b><b>42</b><code>+ 只有以下证据同时存在时，才允许进入低风险分支：</code></div>
+                <div class="diff-line added"><b></b><b>43</b><code>+ 1. 查询成功且时间窗口完整；</code></div>
+                <div class="diff-line added"><b></b><b>44</b><code>+ 2. 异常量和影响面均低于阈值；</code></div>
+                <div class="diff-line added"><b></b><b>45</b><code>+ 3. 不存在持续恶化信号。</code></div>
+                <div class="diff-line context"><b>41</b><b>46</b><code></code></div>
+                <div class="diff-line context"><b>42</b><b>47</b><code>### 输出</code></div>
+              </div>
+              <div class="diff-file-list">
+                <div><span class="modified">M</span><strong>SKILL.md</strong><em>+5 −2</em><small>更新主流程路由</small></div>
+                <div class="selected"><span class="modified">M</span><strong>workflow/fast/stage-3-grade.md</strong><em>+8 −3</em><small>修复空证据判级</small></div>
+                <div><span class="modified">M</span><strong>scripts/collectors/group_b_js.py</strong><em>+6 −2</em><small>移除异常名截断</small></div>
+                <div><span class="modified">M</span><strong>scripts/tests/test_group_b.py</strong><em>+18 −0</em><small>新增回归测试</small></div>
+              </div>
+            </section>
+
+            <aside class="approval-panel">
+              <div class="approval-title"><p class="kicker">RELEASE CHECKLIST</p><h2>发布前检查</h2></div>
+              <div class="check-list">
+                <div class="check-row pass"><i>✓</i><span><strong>父版本一致</strong><small>1db17de · 无工作区漂移</small></span></div>
+                <div class="check-row pass"><i>✓</i><span><strong>仓库测试</strong><small>75 / 75 通过 · 4.8s</small></span></div>
+                <div class="check-row pass"><i>✓</i><span><strong>Case 泄漏</strong><small>未发现测试专用字面量</small></span></div>
+                <div class="check-row pass"><i>✓</i><span><strong>旧能力回归</strong><small>11 / 11 稳定通过</small></span></div>
+                <div class="check-row info"><i>i</i><span><strong>目标分支</strong><small>forge/alert-level/task-042</small></span></div>
+              </div>
+              <div class="approval-impact"><span>批准后</span><ol><li>创建独立任务分支</li><li>提交 4 个已声明文件</li><li>启动最终复测，不修改 master</li></ol></div>
+              <textarea class="review-note" placeholder="补充要求或拒绝原因（可选）"></textarea>
+              <button class="approve-button"><span>✓</span><div><strong>批准并创建任务分支</strong><small>仍需最终复测后才能完成</small></div></button>
+              <button class="request-change">要求调整候选</button>
+              <button class="reject-button">拒绝本轮修改</button>
+            </aside>
+          </div>
+        </section>
+
+        <!-- Settings -->
+        <section class="screen" data-screen="settings">
+          <header class="simple-header settings-header"><div><p class="kicker">LOCAL ENVIRONMENT</p><h1>环境与设置</h1><p>凭据保存在系统 Keychain，页面只显示连接状态。</p></div><button class="secondary-action">导出脱敏诊断</button></header>
+          <div class="settings-layout">
+            <nav class="settings-nav"><button class="active">连接与凭据</button><button>本地运行时</button><button>预算与并发</button><button>Git 行为</button><button>数据与隐私</button><button>关于 FORGE</button></nav>
+            <div class="settings-content">
+              <section><div class="settings-section-head"><div><h2>连接与凭据</h2><p>首次运行向导会自动完成这些检查。</p></div><button>全部重新检查</button></div>
+                <article class="connection-card"><div class="connection-symbol model">M</div><div><strong>本地分析模型</strong><small>Claude Sonnet · 自定义 API</small></div><span class="connection-status">✓ 正常 · 1.4s</span><button>配置</button></article>
+                <article class="connection-card"><div class="connection-symbol catx">C</div><div><strong>CATX 远程 Agent</strong><small>agent_06J… · env_g7I…</small></div><span class="connection-status">✓ 正常 · 820ms</span><button>配置</button></article>
+                <article class="connection-card"><div class="connection-symbol git">G</div><div><strong>Git 与公司仓库</strong><small>SSH + PAT · liuzhenni</small></div><span class="connection-status">✓ 读写已验证</span><button>配置</button></article>
+                <article class="connection-card"><div class="connection-symbol browser">B</div><div><strong>浏览器验证环境</strong><small>Chrome 139 · 1440×900</small></div><span class="connection-status">✓ 截图与 DOM 可用</span><button>详情</button></article>
+              </section>
+              <section class="keychain-panel"><div><span>⌘</span><p><strong>系统 Keychain 已启用</strong><br>3 个 API Key、2 个仓库 PAT。FORGE 不会把凭据写入任务、日志或页面。</p></div><button>管理凭据</button></section>
+            </div>
+          </div>
+        </section>
+
+        <!-- Placeholder resource screen -->
+        <section class="screen" data-screen="resources">
+          <header class="simple-header settings-header"><div><p class="kicker">RESOURCE LIBRARY</p><h1>Skill 与评测资源</h1><p>管理仓库、Fixture 和可复用评测资产。</p></div><button class="primary-action">＋ 添加资源</button></header>
+          <div class="resource-placeholder"><div class="resource-illustration"><i></i><i></i><i></i></div><h2>资源库将在设计确认后深化</h2><p>当前设计稿优先验证任务创建、实时迭代与候选审批三个核心工作流。</p><button data-screen-target="home">返回任务中心</button></div>
+        </section>
+      </main>
+    </div>
+  </div>
+  <div class="prototype-note">高保真设计稿 · 非生产实现 <button id="hide-note">×</button></div>
+  <script src="./app.js"></script>
+</body>
+</html>

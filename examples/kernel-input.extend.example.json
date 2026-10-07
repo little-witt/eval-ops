@@ -1,0 +1,29 @@
+{
+  "api_version": "aceval.kernel-input/v1",
+  "skill_name": "frontend-code-reviewer",
+  "operation": "extend",
+  "goal": "在保留现有前端代码评审能力的基础上增加 React Native 性能风险评审",
+  "capabilities": [
+    "识别 FlatList、重复渲染和主线程阻塞风险，并给出可定位到代码证据的建议"
+  ],
+  "non_goals": [
+    "不扩展到原生 iOS/Android 业务逻辑评审",
+    "不降低现有 TypeScript 正确性问题的召回"
+  ],
+  "standards": [
+    "新能力只在相关 React Native 变更中触发",
+    "每个结论引用明确代码证据",
+    "现有主能力无回归"
+  ],
+  "cases": [
+    {
+      "id": "user-rn-flatlist-001",
+      "prompt": "评审 fixture/rn-flatlist 分支中的列表性能变更",
+      "expected_output": "指出不稳定 renderItem 与缺少 keyExtractor 的风险",
+      "metadata": {
+        "expectation_mode": "semantic",
+        "fixture_branch": "case/rn-flatlist"
+      }
+    }
+  ]
+}

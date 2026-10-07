@@ -1,0 +1,116 @@
+{
+  "api_version": "aceval.d2c-validation-receipt/v1",
+  "artifacts": {
+    "console.json": {
+      "bytes": 3,
+      "path": "console.json",
+      "sha256": "sha256:37517e5f3dc66819f61f5a7bb8ace1921282415f10551d2defa5c3eb0985b570"
+    },
+    "dom.html": {
+      "bytes": 1539,
+      "path": "dom.html",
+      "sha256": "sha256:53ce83ec885b5ab2f93fd44fd1c6a0a0ffa0034115e591c8171cbee51203f5a3"
+    },
+    "driver-result.json": {
+      "bytes": 2444,
+      "path": "driver-result.json",
+      "sha256": "sha256:6b61ed68153503369d67b6fda1401182d7424fe00a503f2b83c2fcbd55b2720f"
+    },
+    "network.json": {
+      "bytes": 306,
+      "path": "network.json",
+      "sha256": "sha256:40281a90203fd11000fc0db4ac0e53b3d29d2211c243cdef8c21aa39fa3cedf6"
+    },
+    "screenshot.png": {
+      "bytes": 51617,
+      "path": "screenshot.png",
+      "sha256": "sha256:bafc125a722c5c69d4a393f1d462af1f61fa35a30bd5784648010631da08dcdf"
+    }
+  },
+  "candidate_commit": "cccccccccccccccccccccccccccccccccccccccc",
+  "case_id": "real-browser-smoke",
+  "driver_summary": {
+    "api_version": "aceval.d2c-browser-driver/v1",
+    "chrome_stderr_tail": "\nDevTools listening on ws://127.0.0.1:56761/devtools/browser/f35e67db-c22f-46bc-9649-64078b3fb3bb\nTrying to load the allocator multiple times. This is *not* supported.\n",
+    "console_errors": 0,
+    "console_events": 0,
+    "failure": null,
+    "final_url": "http://127.0.0.1:8878/",
+    "metrics": {
+      "devicePixelRatio": 1,
+      "height": 900,
+      "navigation": {
+        "activationStart": 0,
+        "confidence": {},
+        "connectEnd": 0.9000000059604645,
+        "connectStart": 0.9000000059604645,
+        "contentEncoding": "",
+        "contentType": "text/html",
+        "criticalCHRestart": 0,
+        "decodedBodySize": 1414,
+        "deliveryType": "",
+        "domComplete": 52.60000002384186,
+        "domContentLoadedEventEnd": 52.30000001192093,
+        "domContentLoadedEventStart": 52.30000001192093,
+        "domInteractive": 52.30000001192093,
+        "domainLookupEnd": 0.9000000059604645,
+        "domainLookupStart": 0.9000000059604645,
+        "duration": 52.60000002384186,
+        "encodedBodySize": 1414,
+        "entryType": "navigation",
+        "fetchStart": 0.9000000059604645,
+        "finalResponseHeadersStart": 11.700000017881393,
+        "firstInterimResponseStart": 0,
+        "initiatorType": "navigation",
+        "loadEventEnd": 52.60000002384186,
+        "loadEventStart": 52.60000002384186,
+        "name": "http://127.0.0.1:8878/",
+        "navigationId": 1463,
+        "nextHopProtocol": "http/1.0",
+        "notRestoredReasons": null,
+        "redirectCount": 0,
+        "redirectEnd": 0,
+        "redirectStart": 0,
+        "renderBlockingStatus": "non-blocking",
+        "requestStart": 2.2000000178813934,
+        "responseEnd": 12.100000023841858,
+        "responseStart": 11.700000017881393,
+        "responseStatus": 200,
+        "secureConnectionStart": 0,
+        "serverTiming": [],
+        "startTime": 0,
+        "transferSize": 1714,
+        "type": "navigate",
+        "unloadEventEnd": 0,
+        "unloadEventStart": 0,
+        "workerCacheLookupStart": 0,
+        "workerFinalSourceType": "",
+        "workerMatchedSourceType": "",
+        "workerRouterEvaluationStart": 0,
+        "workerStart": 0
+      },
+      "title": "FORGE D2C Fixture",
+      "url": "http://127.0.0.1:8878/",
+      "width": 1440
+    },
+    "network_events": 2,
+    "success": true,
+    "title": "FORGE D2C Fixture",
+    "title_matched": true,
+    "viewport": {
+      "device_scale_factor": 1,
+      "height": 900,
+      "width": 1440
+    },
+    "visual": null
+  },
+  "duration_ms": 2040.329,
+  "environment_fingerprint": "sha256:2c97133d06356c310ea0a993693a59013bbb9143d5963c9fd26181ba2f8fb150",
+  "finished_at": "2026-08-26T08:31:10.846424+00:00",
+  "infrastructure_errors": [],
+  "profile": "real-local-chrome-smoke",
+  "receipt_hash": "sha256:64aa2d21120bcff97187997545197cc2ff7a12b05db0ac29d835e22f43f82b52",
+  "request_hash": "sha256:b198ed982b0c241f03633ce3ce673d534e6d5bb877345101fecca49d8d072d61",
+  "started_at": "2026-08-26T08:31:08.805753+00:00",
+  "status": "succeeded"
+}

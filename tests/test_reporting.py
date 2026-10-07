@@ -262,6 +262,58 @@ class ReportingTests(unittest.TestCase):
                 report["summary"]["measured_scenarios"],
             )
 
+    def test_run_summary_exposes_case_scores_and_process_evidence(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            run = make_run(root, "path-aware", GradeStatus.PASS)
+            first = run.scenarios[0]
+            observation = replace(
+                first.observation,
+                trace=(TraceEvent(kind="tool_call", tool="read_file"),),
+                metadata={
+                    "path_conformance": {
+                        "status": "pass",
+                        "coverage": 1.0,
+                        "violations": [],
+                    },
+                    "observation_completeness": {"trace": True},
+                    "attempt_count": 2,
+                    "retry_count": 1,
+                },
+            )
+            run = replace(run, scenarios=(replace(first, observation=observation), run.scenarios[1]))
+            summary = to_report_dict(run)["summary"]
+            self.assertEqual(1, summary["process_evidence"]["path_passes"])
+            self.assertEqual(1.0, summary["process_evidence"]["path_coverage"])
+            self.assertEqual(1, summary["process_evidence"]["retry_count"])
+            case = summary["case_scores"][0]
+            self.assertEqual("pass", case["path"]["status"])
+            self.assertEqual(1, case["trace"]["tool_call_count"])
+
+    def test_not_evaluable_path_is_not_counted_as_a_path_failure(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            run = make_run(root, "path-not-evaluable", GradeStatus.PASS)
+            first = run.scenarios[0]
+            observation = replace(
+                first.observation,
+                metadata={
+                    "path_conformance": {
+                        "status": "not_evaluable",
+                        "coverage": None,
+                        "violations": [],
+                    }
+                },
+            )
+            run = replace(
+                run,
+                scenarios=(replace(first, observation=observation), run.scenarios[1]),
+            )
+            process = to_report_dict(run)["summary"]["process_evidence"]
+            self.assertEqual(0, process["path_measured_cases"])
+            self.assertEqual(1, process["path_not_evaluable_cases"])
+            self.assertIsNone(process["path_pass_rate"])
+
     def test_gate_summary_distinguishes_infrastructure_outcomes(self):
         with TemporaryDirectory() as directory:
             root = Path(directory)
@@ -376,6 +428,9 @@ class ReportingTests(unittest.TestCase):
                 stop_reason="candidate passed dev and validation",
                 output_dir=root / "optimization-1",
                 limitations=("Optimizer only received dev evidence.",),
+                eval_suite_hash="suite-hash",
+                experiment_plan_hash="experiment-hash",
+                experiment_plan_source="external",
             )
 
             report = to_report_dict(optimization)
@@ -389,6 +444,13 @@ class ReportingTests(unittest.TestCase):
             self.assertEqual(report["summary"]["holdout_batch_count"], 0)
             self.assertEqual(report["summary"]["proposal_attempt_count"], 0)
             self.assertEqual(report["summary"]["experiment_usage"], {})
+            self.assertEqual(report["summary"]["eval_suite_hash"], "suite-hash")
+            self.assertEqual(
+                report["summary"]["experiment_plan_hash"], "experiment-hash"
+            )
+            self.assertEqual(
+                report["summary"]["experiment_plan_source"], "external"
+            )
             self.assertEqual(
                 report["summary"]["selected_candidate_hash"], "candidate-hash"
             )
@@ -406,6 +468,7 @@ class ReportingTests(unittest.TestCase):
             self.assertIn("## Candidate Gates", markdown)
             self.assertIn("| dev | pass |", markdown)
             self.assertIn("candidate passed dev and validation", markdown)
+            self.assertIn("| ExperimentPlan source | external |", markdown)
             self.assertIn("| Hidden regression rate | not measured |", markdown)
             self.assertIn("Optimizer only received dev evidence.", markdown)
 

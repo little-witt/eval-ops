@@ -1,0 +1,388 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>FORGE · Skill Evolution Studio</title>
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body data-moment="evaluation">
+    <div class="prototype-flag">DESIGN PROTOTYPE · V2</div>
+    <div class="app-shell">
+      <aside class="icon-rail" aria-label="主导航">
+        <button class="brand-mark" data-screen="task" aria-label="FORGE 首页">
+          <span>F</span>
+          <i></i>
+        </button>
+        <nav class="rail-nav">
+          <button class="rail-button is-active" data-screen="task" aria-label="任务">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 6.5h14M5 12h9M5 17.5h11"/><circle cx="18" cy="12" r="2.5"/></svg>
+            <span>任务</span>
+          </button>
+          <button class="rail-button" data-screen="resources" aria-label="资源">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m12 3 8 4.5-8 4.5-8-4.5L12 3Z"/><path d="m4 12 8 4.5 8-4.5M4 16.5 12 21l8-4.5"/></svg>
+            <span>资源</span>
+          </button>
+          <button class="rail-button" data-screen="runs" aria-label="运行">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 18V8m5 10V4m5 14v-7m5 7V6"/></svg>
+            <span>运行</span>
+          </button>
+        </nav>
+        <div class="rail-spacer"></div>
+        <button class="rail-button" data-screen="settings" aria-label="设置">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.8 1.8 0 0 0 .36 1.98l.05.05-2.78 2.78-.05-.05A1.8 1.8 0 0 0 15 19.4a1.8 1.8 0 0 0-1.1 1.65V21H10v-.07A1.8 1.8 0 0 0 8.9 19.3a1.8 1.8 0 0 0-1.98.36l-.05.05-2.78-2.78.05-.05A1.8 1.8 0 0 0 4.5 15a1.8 1.8 0 0 0-1.65-1.1H2.8V10h.07A1.8 1.8 0 0 0 4.5 8.9a1.8 1.8 0 0 0-.36-1.98l-.05-.05 2.78-2.78.05.05A1.8 1.8 0 0 0 8.9 4.5 1.8 1.8 0 0 0 10 2.85V2.8h3.9v.07A1.8 1.8 0 0 0 15 4.5a1.8 1.8 0 0 0 1.98-.36l.05-.05 2.78 2.78-.05.05A1.8 1.8 0 0 0 19.4 8.9a1.8 1.8 0 0 0 1.65 1.1h.07v3.9h-.07A1.8 1.8 0 0 0 19.4 15Z"/></svg>
+            <span>设置</span>
+          </button>
+          <button class="avatar" aria-label="当前用户">LZ</button>
+      </aside>
+
+      <aside class="task-rail">
+        <div class="task-rail-head">
+          <div>
+            <span class="eyebrow">EVOLUTION TASKS</span>
+            <h1>进化任务</h1>
+          </div>
+          <button class="icon-button" data-screen="create" aria-label="创建任务">＋</button>
+        </div>
+        <label class="search-box">
+          <svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="6.5"/><path d="m16 16 4 4"/></svg>
+          <input value="" placeholder="搜索 Skill 或任务" />
+          <kbd>⌘ K</kbd>
+        </label>
+        <div class="task-filter">
+          <button class="is-active">进行中 <span>3</span></button>
+          <button>待确认 <span class="attention-count">1</span></button>
+          <button>已完成</button>
+        </div>
+        <div class="task-list">
+          <button class="task-item is-active" data-screen="task">
+            <span class="task-signal is-running"><i></i></span>
+            <span class="task-item-copy">
+              <strong>前端 CR · 规则遵循提升</strong>
+              <small>评测中 · Round 02</small>
+            </span>
+            <span class="task-score">74</span>
+          </button>
+          <button class="task-item">
+            <span class="task-signal is-attention"></span>
+            <span class="task-item-copy">
+              <strong>告警分级 · 知识库扩展</strong>
+              <small>等待确认优化范围</small>
+            </span>
+            <span class="task-score is-warn">61</span>
+          </button>
+          <button class="task-item">
+            <span class="task-signal is-running"><i></i></span>
+            <span class="task-item-copy">
+              <strong>D2C · 视觉还原基线</strong>
+              <small>Case 生成 · 7 / 12</small>
+            </span>
+            <span class="task-score">—</span>
+          </button>
+        </div>
+        <div class="task-rail-foot">
+          <div class="environment-light"><i></i><span>本地与 CATX 环境正常</span></div>
+          <button data-screen="settings">检查环境 →</button>
+        </div>
+      </aside>
+
+      <main class="main-stage">
+        <section id="task-screen" class="screen is-visible">
+          <header class="task-header">
+            <div class="task-heading">
+              <div class="breadcrumb"><span>任务</span><b>/</b><span>frontend-code-reviewer</span><b>/</b><span>task_4F9C</span></div>
+              <div class="title-line">
+                <h2>让代码评审严格遵循 Skill 路径，减少漏报与泛化建议</h2>
+                <span class="live-badge"><i></i>评测进行中</span>
+              </div>
+              <p>基于 3 个用户 Case，自动补充边界与反例；优化范围允许覆盖 SKILL.md、scripts/ 与 references/。</p>
+            </div>
+            <div class="task-actions">
+              <button class="button quiet">暂停</button>
+              <button class="button quiet icon-only" aria-label="更多">•••</button>
+            </div>
+          </header>
+
+          <section class="task-meta-bar" aria-label="任务元数据">
+            <div><span>当前轮次</span><strong>Round 02 / 04</strong></div>
+            <div><span>Skill 版本</span><strong><code>8f4c2e1</code></strong></div>
+            <div><span>评测设计</span><strong>v3 · 已冻结</strong></div>
+            <div><span>本轮预算</span><strong>48.6k / 90k</strong></div>
+            <div class="meta-saved"><span>上下文复用</span><strong>节省 31%</strong></div>
+            <button class="audit-button" data-toast="已打开不可变事件审计记录">
+              <svg viewBox="0 0 24 24"><path d="M7 3h10v4H7zM5 7h14v14H5z"/><path d="M8 12h8M8 16h5"/></svg>
+              完整审计记录
+            </button>
+          </section>
+
+          <section class="pulse-board" aria-label="实时路径大盘">
+            <div class="pulse-board-title">
+              <div><span class="eyebrow dark">LIVE PATH</span><strong>实时路径大盘</strong></div>
+              <div class="moment-switcher" aria-label="设计稿时刻切换">
+                <button data-moment="cases">生成</button>
+                <button class="is-active" data-moment="evaluation">评测</button>
+                <button data-moment="decision">决策</button>
+                <button class="replay-button" data-replay><span>↻</span>重放</button>
+              </div>
+            </div>
+            <div class="stage-track">
+              <button class="stage-step stage-input is-done" data-focus="input">
+                <span class="stage-index">01</span><i class="stage-dot">✓</i>
+                <span><strong>输入解析</strong><small>3 Case · 4 标准</small></span>
+              </button>
+              <button class="stage-step stage-pack is-done" data-focus="pack">
+                <span class="stage-index">02</span><i class="stage-dot">✓</i>
+                <span><strong>EvalPack</strong><small>复用 62% · 门禁通过</small></span>
+              </button>
+              <button class="stage-step stage-cases is-done" data-focus="cases">
+                <span class="stage-index">03</span><i class="stage-dot">✓</i>
+                <span><strong>Case 与路径</strong><small>8 Case · 37 步</small></span>
+              </button>
+              <button class="stage-step stage-evaluation is-current" data-focus="evaluation">
+                <span class="stage-index">04</span><i class="stage-dot"><b></b></i>
+                <span><strong>线上评测</strong><small class="dynamic-stage-copy">5 / 8 会话完成</small></span>
+              </button>
+              <button class="stage-step stage-analysis" data-focus="analysis">
+                <span class="stage-index">05</span><i class="stage-dot"></i>
+                <span><strong>分析与决策</strong><small>等待日志完整回收</small></span>
+              </button>
+              <button class="stage-step stage-optimize" data-focus="optimize">
+                <span class="stage-index">06</span><i class="stage-dot"></i>
+                <span><strong>优化与回归</strong><small>尚未开始</small></span>
+              </button>
+            </div>
+          </section>
+
+          <div class="workbench-grid">
+            <section class="trace-panel">
+              <div class="panel-heading">
+                <div>
+                  <span class="eyebrow">TRACE CANVAS</span>
+                  <h3>进化轨迹</h3>
+                </div>
+                <div class="panel-tools">
+                  <button class="is-active">轨迹</button><button>矩阵</button><button>事件</button>
+                  <button class="compact-icon" aria-label="筛选">⌁</button>
+                </div>
+              </div>
+
+              <div class="trace-stream">
+                <article class="trace-event compact is-complete" data-node="input" tabindex="0">
+                  <div class="trace-rail-point"><span>✓</span></div>
+                  <div class="trace-card">
+                    <div class="trace-card-head">
+                      <div><span class="trace-kicker">14:02:11 · INPUT SNAPSHOT</span><h4>任务目标与约束已锁定</h4></div>
+                      <span class="status-pill success">已记录</span>
+                    </div>
+                    <div class="input-summary">
+                      <span><b>目标</b> 严格遵循代码评审步骤并提升关键问题召回</span>
+                      <span><b>输入</b> 3 个用户 Case + frontend-code-reviewer</span>
+                      <span><b>非目标</b> 不修改业务代码；不扩大安全工具权限</span>
+                    </div>
+                  </div>
+                </article>
+
+                <article class="trace-event is-complete" data-node="pack" tabindex="0">
+                  <div class="trace-rail-point"><span>✓</span></div>
+                  <div class="trace-card artifact-card pack-card">
+                    <div class="trace-card-head">
+                      <div><span class="trace-kicker">14:02:18–14:02:39 · EVAL DESIGN</span><h4>EvalPack v3 已生成并冻结</h4></div>
+                      <div class="trace-head-actions"><span class="reuse-pill">复用 62%</span><span class="status-pill success">4/4 门禁</span></div>
+                    </div>
+                    <p class="artifact-intro">结合 Skill 的 9 个规定步骤、用户的 4 条验收标准，以及历史代码评审模板生成。</p>
+                    <div class="dimension-row">
+                      <button class="dimension-card is-primary" data-node="dimension-path"><span>36%</span><strong>路径遵循</strong><small>9 个必经步骤 · 2 个禁止动作</small></button>
+                      <button class="dimension-card" data-node="dimension-recall"><span>30%</span><strong>问题召回</strong><small>高风险漏报不可接受</small></button>
+                      <button class="dimension-card" data-node="dimension-evidence"><span>22%</span><strong>证据质量</strong><small>定位、原因与修复闭合</small></button>
+                      <button class="dimension-card" data-node="dimension-noise"><span>12%</span><strong>低噪声</strong><small>避免泛化与重复建议</small></button>
+                    </div>
+                    <div class="artifact-foot"><span>评分规则 11</span><span>Oracle 8</span><span>环境契约 2</span><button data-node="pack">查看完整评测设计 →</button></div>
+                  </div>
+                </article>
+
+                <article class="trace-event is-complete trace-cases-event" data-node="cases" tabindex="0">
+                  <div class="trace-rail-point"><span>✓</span></div>
+                  <div class="trace-card artifact-card cases-card">
+                    <div class="trace-card-head">
+                      <div><span class="trace-kicker">14:02:40–14:03:26 · CASE SYNTHESIS</span><h4>8 个评测 Case 与 37 个路径步骤已就绪</h4></div>
+                      <span class="status-pill success">覆盖 4/4 维度</span>
+                    </div>
+                    <div class="synthesis-map">
+                      <div class="map-column source-column">
+                        <span class="map-label">依据</span>
+                        <div class="source-node"><i class="user-source"></i><span><strong>用户 Case</strong><small>3 个 · 原样保留</small></span></div>
+                        <div class="source-node"><i class="skill-source"></i><span><strong>Skill 步骤</strong><small>9 条 · 自动抽取</small></span></div>
+                      </div>
+                      <div class="map-flow"><i></i><i></i><i></i></div>
+                      <div class="map-column case-column">
+                        <span class="map-label">Case</span>
+                        <button class="case-node is-selected" data-case="CR-004"><b>CR-004</b><span>跨文件状态竞态</span><em>USER</em></button>
+                        <button class="case-node" data-case="CR-006"><b>CR-006</b><span>副作用依赖漏审</span><em>GEN</em></button>
+                        <button class="case-node" data-case="CR-008"><b>CR-008</b><span>无问题反例</span><em>GEN</em></button>
+                        <button class="more-node" data-node="cases">＋ 5 个 Case</button>
+                      </div>
+                      <div class="map-flow path-flow"><i></i><i></i><i></i></div>
+                      <div class="map-column path-column">
+                        <span class="map-label">CR-004 预期路径</span>
+                        <button class="path-mini-step is-done" data-case="CR-004"><i>1</i><span><strong>读取改动范围</strong><small>git diff + 跨文件调用</small></span></button>
+                        <button class="path-mini-step is-done" data-case="CR-004"><i>2</i><span><strong>按清单逐项检查</strong><small>状态、闭包、副作用</small></span></button>
+                        <button class="path-mini-step is-active" data-case="CR-004"><i>3</i><span><strong>证据化输出</strong><small>文件 + 行号 + 触发链</small></span></button>
+                        <button class="path-mini-step" data-case="CR-004"><i>4</i><span><strong>判定与去噪</strong><small>严重度 + 无重复项</small></span></button>
+                      </div>
+                    </div>
+                    <div class="coverage-strip"><span>路径遵循 <b>8/8</b></span><span>关键召回 <b>6/6</b></span><span>反例 <b>2</b></span><span>边界 <b>3</b></span><button data-node="cases">打开 Case 图谱 →</button></div>
+                  </div>
+                </article>
+
+                <article class="trace-event is-current trace-evaluation-event" data-node="evaluation" tabindex="0">
+                  <div class="trace-rail-point"><span class="active-core"></span></div>
+                  <div class="trace-card artifact-card evaluation-card">
+                    <div class="trace-card-head">
+                      <div><span class="trace-kicker">14:03:31–NOW · REMOTE EVALUATION</span><h4>线上评测：5 / 8 个会话已完整回收</h4></div>
+                      <div class="trace-head-actions"><span class="stream-indicator"><i></i>持续回收</span><span class="eta">ETA 01:42</span></div>
+                    </div>
+                    <div class="batch-summary">
+                      <div class="batch-progress"><i style="--progress: 68%"></i></div>
+                      <span>CATX 并发 4</span><span>成功 5</span><span>运行中 2</span><span>排队 1</span><span>日志完整度 100%</span>
+                    </div>
+                    <div class="session-table">
+                      <div class="session-row session-table-head"><span>CASE / SESSION</span><span>路径执行</span><span>最近事件</span><span>耗时</span><span>状态</span></div>
+                      <button class="session-row is-selected" data-case="CR-004">
+                        <span class="session-identity"><b>CR-004</b><small>ses_7Qf…9a2 · Attempt 1</small></span>
+                        <span class="path-progress"><i class="done"></i><i class="done"></i><i class="active"></i><i></i><small>3 / 4</small></span>
+                        <span class="latest-event"><code>agent.tool_result</code><small>读取跨文件引用</small></span>
+                        <span class="duration">01:18</span><span class="status-pill running">运行中</span>
+                      </button>
+                      <button class="session-row" data-case="CR-006">
+                        <span class="session-identity"><b>CR-006</b><small>ses_a8P…41f · Attempt 1</small></span>
+                        <span class="path-progress"><i class="done"></i><i class="done"></i><i class="done"></i><i class="done"></i><small>4 / 4</small></span>
+                        <span class="latest-event"><code>session.status_idle</code><small>日志已归档</small></span>
+                        <span class="duration">00:54</span><span class="status-pill success">完成</span>
+                      </button>
+                      <button class="session-row" data-case="CR-007">
+                        <span class="session-identity"><b>CR-007</b><small>ses_k2D…80c · Attempt 1</small></span>
+                        <span class="path-progress has-violation"><i class="done"></i><i class="failed"></i><i></i><i></i><small>偏离步骤 2</small></span>
+                        <span class="latest-event"><code>agent.message</code><small>提前给出泛化建议</small></span>
+                        <span class="duration">00:47</span><span class="status-pill danger">未通过</span>
+                      </button>
+                      <button class="session-row muted-row" data-case="CR-008">
+                        <span class="session-identity"><b>CR-008</b><small>等待调度</small></span>
+                        <span class="path-progress"><i></i><i></i><i></i><i></i><small>0 / 4</small></span>
+                        <span class="latest-event"><small>并发槽位释放后开始</small></span>
+                        <span class="duration">—</span><span class="status-pill neutral">排队</span>
+                      </button>
+                    </div>
+                    <div class="artifact-foot evaluation-foot"><span><i class="legend-dot expected"></i>预期路径</span><span><i class="legend-dot actual"></i>实际事件</span><span><i class="legend-dot violation"></i>路径偏离</span><button data-case="CR-004">查看 Case / 路径 / 日志 →</button></div>
+                  </div>
+                </article>
+
+                <article class="trace-event trace-analysis-event" data-node="analysis" tabindex="0">
+                  <div class="trace-rail-point"><span class="waiting-dot"></span></div>
+                  <div class="trace-card analysis-card">
+                    <div class="trace-card-head">
+                      <div><span class="trace-kicker">LOCAL ANALYSIS AGENT</span><h4>汇总诊断与优化决策</h4></div>
+                      <span class="status-pill neutral analysis-status">等待 3 个会话</span>
+                    </div>
+                    <div class="analysis-waiting">
+                      <span class="analysis-orbit"><i></i><i></i><i></i></span>
+                      <div><strong>日志完整回收后自动开始</strong><p>只上传结构化判定和必要证据片段，预计使用 12–18k tokens。</p></div>
+                    </div>
+                    <div class="analysis-results">
+                      <div class="analysis-score"><span>本轮质量</span><strong>74<small>/100</small></strong><em>较上轮 +9</em></div>
+                      <div class="issue-summary">
+                        <button data-issue="path"><i class="severity high"></i><span><strong>未稳定执行跨文件检查</strong><small>影响 3 Case · 路径遵循 -18</small></span><b>01</b></button>
+                        <button data-issue="evidence"><i class="severity medium"></i><span><strong>证据链在复杂分支中断裂</strong><small>影响 2 Case · 证据质量 -8</small></span><b>02</b></button>
+                        <button data-issue="noise"><i class="severity low"></i><span><strong>无问题场景仍输出泛化建议</strong><small>影响 1 Case · 低噪声 -4</small></span><b>03</b></button>
+                      </div>
+                      <button class="review-proposal-button" data-node="analysis">审阅 3 项兼容优化建议 <span>→</span></button>
+                    </div>
+                  </div>
+                </article>
+
+                <article class="trace-event trace-optimize-event" data-node="optimize" tabindex="0">
+                  <div class="trace-rail-point"><span class="waiting-dot"></span></div>
+                  <div class="trace-card optimize-card">
+                    <div class="trace-card-head">
+                      <div><span class="trace-kicker">HUMAN GATE → CANDIDATE</span><h4>确认范围后生成多文件候选</h4></div>
+                      <span class="status-pill neutral optimize-status">尚未开始</span>
+                    </div>
+                    <div class="optimize-placeholder"><span>SKILL.md</span><span>scripts/checklist.ts</span><span>references/react-review.md</span><i></i><b>回归路由</b><em>重新评测 / 补充 Case</em></div>
+                  </div>
+                </article>
+              </div>
+            </section>
+
+            <aside class="inspector-panel">
+              <div class="inspector-head">
+                <div><span class="eyebrow">EVIDENCE INSPECTOR</span><h3>CR-004 · 执行证据</h3></div>
+                <button class="compact-icon" aria-label="关闭检查器">×</button>
+              </div>
+              <div class="inspector-tabs"><button class="is-active">实时</button><button>预期路径</button><button>原始日志</button><button>来源</button></div>
+              <div id="inspector-content" class="inspector-content"></div>
+              <div class="inspector-foot">
+                <span><i></i>所有证据已落盘 · 14:04:49</span>
+                <button data-toast="已复制证据链地址">复制证据链接</button>
+              </div>
+            </aside>
+          </div>
+        </section>
+
+        <section id="create-screen" class="screen create-screen">
+          <header class="creation-header">
+            <button class="back-button" data-screen="task">← 返回任务</button>
+            <div><span class="eyebrow">NEW EVOLUTION TASK</span><h2>告诉 FORGE，你希望 Skill 变得怎样。</h2><p>提供得越少，系统探索得越多；任何生成结果都可在执行前审阅。</p></div>
+            <span class="draft-state">草稿自动保存</span>
+          </header>
+          <div class="creation-layout">
+            <div class="creation-form">
+              <section class="form-section is-open">
+                <div class="section-number">01</div>
+                <div class="section-copy"><span>目标</span><h3>这次要升级哪个 Skill？</h3></div>
+                <span class="section-status success">已完成</span>
+                <div class="section-body">
+                  <label class="field full"><span>Skill 仓库</span><div class="repo-input"><b>⌘</b><input value="ssh://git@git.sankuai.com/~liuzhenni/frontend-code-reviewer.git"/><button>检测</button></div><small><i></i>已读取 feature/test-and-optimize · commit 8f4c2e1 · 12 个资源文件</small></label>
+                  <div class="field-grid"><label class="field"><span>任务类型</span><select><option>优化既有能力</option><option>修复问题</option><option>扩展能力</option><option>创建新 Skill</option><option>探索提升</option></select></label><label class="field"><span>目标分支</span><input value="feature/test-and-optimize"/></label></div>
+                  <label class="field full"><span>你希望它变得怎样？</span><textarea>严格遵循代码评审 Skill 定义的完整步骤，提升 React / TypeScript 跨文件问题召回，同时减少没有证据的泛化建议。</textarea></label>
+                </div>
+              </section>
+              <section class="form-section is-open">
+                <div class="section-number">02</div>
+                <div class="section-copy"><span>样例与标准</span><h3>哪些结果算“更好”？</h3></div>
+                <span class="section-status">可选</span>
+                <div class="section-body">
+                  <div class="case-input-head"><p>你可以不给 Case，让系统从目标和 Skill 中探索；也可以批量粘贴、导入 JSON/CSV。</p><div><button class="small-button">导入文件</button><button class="small-button primary">＋ 添加 Case</button></div></div>
+                  <div class="user-case-list">
+                    <div class="user-case"><b>CASE 01</b><span><strong>跨文件状态竞态</strong><small>预期：定位 useEffect 闭包读取旧状态，并给出文件、行号、触发链和修复建议。</small></span><button>•••</button></div>
+                    <div class="user-case"><b>CASE 02</b><span><strong>无问题反例</strong><small>预期：完成完整检查后明确无阻断项，不输出泛化建议。</small></span><button>•••</button></div>
+                    <button class="add-case-row">＋ 再添加一个 Case 或验收标准</button>
+                  </div>
+                </div>
+              </section>
+              <section class="form-section collapsed">
+                <div class="section-number">03</div><div class="section-copy"><span>运行环境</span><h3>代码仓库与验证能力</h3></div><span class="section-status success">预检通过</span><button class="expand-section">⌄</button>
+              </section>
+              <section class="form-section collapsed">
+                <div class="section-number">04</div><div class="section-copy"><span>自动化策略</span><h3>预算、并发与人工确认点</h3></div><span class="section-status">使用推荐设置</span><button class="expand-section">⌄</button>
+              </section>
+            </div>
+            <aside class="launch-card">
+              <span class="eyebrow dark">RUN PREVIEW</span><h3>启动后会发生什么</h3>
+              <ol class="launch-path"><li><i>1</i><span><strong>生成 / 复用 EvalPack</strong><small>提取目标维度和评分标准</small></span></li><li><i>2</i><span><strong>流式生成 Case 与路径</strong><small>用户 Case 2 + 自动补充</small></span></li><li><i>3</i><span><strong>批量线上评测</strong><small>预计 6–10 个 CATX 会话</small></span></li><li><i>4</i><span><strong>分析并请求确认</strong><small>到第一个修改动作前自动运行</small></span></li></ol>
+              <div class="launch-estimate"><span><small>预计耗时</small><strong>12–20 min</strong></span><span><small>Token 上限</small><strong>90k</strong></span></div>
+              <label class="launch-check"><input type="checkbox" checked/><span><b>自动运行到人工确认点</b><small>不自动修改或提交 Skill</small></span></label>
+              <button class="launch-button" data-launch>创建任务并开始 <span>→</span></button>
+              <p>创建后立即进入任务详情，所有生成与执行过程可暂停、重放和追溯。</p>
+            </aside>
+          </div>
+        </section>
+
+        <section id="placeholder-screen" class="screen placeholder-screen">
+          <span class="eyebrow">DESIGN SCOPE</span><h2>该模块将在桌面端实现阶段展开</h2><p>本轮高保真设计集中验证任务创建、实时执行轨迹、证据检查和用户决策。</p><button class="button primary" data-screen="task">返回任务详情</button>
+        </section>
+      </main>
+    </div>
+
+    <div id="toast" class="toast"><span>✓</span><p></p></div>
+    <script src="./app.js"></script>
+  </body>
+</html>

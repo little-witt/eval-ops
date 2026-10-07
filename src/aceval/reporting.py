@@ -401,8 +401,118 @@ def _run_summary(run: EvalRun) -> Dict[str, Any]:
         "splits": [_split_summary(run, split) for split in _ordered_splits(run)],
     }
     summary.update(_measurement_summary(run))
+    summary["process_evidence"] = _process_evidence_summary(run)
+    summary["case_scores"] = [_scenario_score_summary(item) for item in run.scenarios]
     summary["diagnostics"] = _diagnostic_summary(run)
     return summary
+
+
+def _scenario_score_summary(scenario: Any) -> Mapping[str, Any]:
+    """Expose a compact per-case score vector without copying raw traces."""
+
+    observation = getattr(scenario, "observation", None)
+    metadata = getattr(observation, "metadata", {}) if observation is not None else {}
+    if not isinstance(metadata, Mapping):
+        metadata = {}
+    path = metadata.get("path_conformance")
+    if not isinstance(path, Mapping):
+        path = metadata.get("execution_path_result")
+    if not isinstance(path, Mapping):
+        path = None
+    dimensions = []
+    for grade in getattr(scenario, "grades", ()) or ():
+        dimensions.append({
+            "id": str(getattr(grade, "grader_id", "")),
+            "label": str(getattr(grade, "grader_id", "")),
+            "status": getattr(getattr(grade, "status", None), "value", getattr(grade, "status", None)),
+            "score": getattr(grade, "score", None),
+            "hard": bool(getattr(grade, "hard", False)),
+            "message": str(getattr(grade, "message", "") or ""),
+        })
+    trace = getattr(observation, "trace", ()) if observation is not None else ()
+    trace_count = len(trace) if trace is not None else 0
+    trace_complete = metadata.get("trace_complete")
+    if trace_complete is None:
+        completeness = metadata.get("observation_completeness")
+        raw_complete = completeness.get("trace") if isinstance(completeness, Mapping) else None
+        trace_complete = raw_complete if isinstance(raw_complete, bool) else None
+    elif not isinstance(trace_complete, bool):
+        trace_complete = None
+    if metadata.get("trace_may_be_truncated") is True:
+        trace_complete = False
+    return {
+        "case_id": str(getattr(scenario, "scenario_id", "")),
+        "split": str(getattr(scenario, "split", "")),
+        "status": getattr(getattr(scenario, "status", None), "value", getattr(scenario, "status", None)),
+        "passed": bool(getattr(scenario, "passed", False)),
+        "hard_passed": bool(getattr(scenario, "hard_passed", False)),
+        "duration_seconds": float(getattr(scenario, "duration_seconds", 0.0) or 0.0),
+        "error": getattr(scenario, "error", None),
+        "dimensions": dimensions,
+        "path": {
+            "status": path.get("status"),
+            "coverage": path.get("coverage"),
+            "violations": list(path.get("violations", ())) if isinstance(path.get("violations", ()), (list, tuple)) else [],
+        } if path is not None else None,
+        "trace": {
+            "event_count": trace_count,
+            "complete": trace_complete,
+            "tool_call_count": sum(is_tool_call_event(event) for event in trace or ()),
+        },
+    }
+
+
+def _process_evidence_summary(run: EvalRun) -> Mapping[str, Any]:
+    """Aggregate path conformance, trace completeness and retries per run."""
+
+    case_scores = [_scenario_score_summary(item) for item in run.scenarios]
+    path_rows = [item["path"] for item in case_scores if isinstance(item.get("path"), Mapping)]
+    measured_paths = [
+        item
+        for item in path_rows
+        if item.get("status") in ("pass", "fail")
+        or (
+            isinstance(item.get("coverage"), (int, float))
+            and not isinstance(item.get("coverage"), bool)
+        )
+    ]
+    path_not_evaluable = sum(item.get("status") == "not_evaluable" for item in path_rows)
+    path_passes = sum(item.get("status") == "pass" for item in measured_paths)
+    complete = [item for item in case_scores if item.get("trace", {}).get("complete") is not None]
+    retries = 0
+    attempts = 0
+    for scenario in run.scenarios:
+        observation = scenario.observation
+        metadata = observation.metadata if observation is not None else {}
+        if not isinstance(metadata, Mapping):
+            metadata = {}
+        raw_attempts = metadata.get("attempt_count")
+        raw_retries = metadata.get("retry_count")
+        if isinstance(raw_attempts, (int, float)) and not isinstance(raw_attempts, bool):
+            attempts += max(0, int(raw_attempts))
+        if isinstance(raw_retries, (int, float)) and not isinstance(raw_retries, bool):
+            retries += max(0, int(raw_retries))
+    coverage_values = []
+    for item in measured_paths:
+        value = item.get("coverage")
+        if isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(float(value)):
+            coverage_values.append(float(value))
+    return {
+        "path_cases": len(path_rows),
+        "path_measured_cases": len(measured_paths),
+        "path_passes": path_passes,
+        "path_not_evaluable_cases": path_not_evaluable,
+        "path_pass_rate": path_passes / len(measured_paths) if measured_paths else None,
+        "path_coverage": sum(coverage_values) / len(coverage_values) if coverage_values else None,
+        "trace_complete_cases": sum(item.get("trace", {}).get("complete") is True for item in complete),
+        "trace_measured_cases": len(complete),
+        "trace_completeness_rate": (
+            sum(item.get("trace", {}).get("complete") is True for item in complete) / len(complete)
+            if complete else None
+        ),
+        "attempt_count": attempts,
+        "retry_count": retries,
+    }
 
 
 def _diagnostic_summary(run: EvalRun) -> Mapping[str, Any]:
@@ -640,6 +750,9 @@ def _optimization_summary(value: OptimizationResult) -> Dict[str, Any]:
         "mode": value.mode,
         "goal": value.goal,
         "objective": _json_safe(value.objective),
+        "eval_suite_hash": value.eval_suite_hash,
+        "experiment_plan_hash": value.experiment_plan_hash,
+        "experiment_plan_source": value.experiment_plan_source,
         "dev_objective": _objective_summary(value.dev_objective),
         "validation_objective": _objective_summary(displayed_validation_objective),
         "holdout_objective": _objective_summary(value.holdout_objective),
@@ -962,6 +1075,9 @@ def _render_optimization(value: OptimizationResult) -> str:
             ("Field", "Value"),
             (
                 ("Pack", value.pack_name),
+                ("EvalSuite hash", value.eval_suite_hash or "—"),
+                ("ExperimentPlan hash", value.experiment_plan_hash or "—"),
+                ("ExperimentPlan source", value.experiment_plan_source or "—"),
                 ("Runtime", baseline.runtime_id),
                 ("Subject", baseline.subject_uri),
                 ("Mode", value.mode),
@@ -1092,6 +1208,21 @@ def _measurement_table(summary: Mapping[str, Any]) -> str:
                 "Flake rate",
                 _percent_or_null(summary.get("flake_rate")),
                 statuses["flake_rate"],
+            ),
+            (
+                "Path coverage",
+                _percent_or_null(summary.get("process_evidence", {}).get("path_coverage")),
+                "measured" if summary.get("process_evidence", {}).get("path_measured_cases") else "not_measured",
+            ),
+            (
+                "Trace completeness",
+                _percent_or_null(summary.get("process_evidence", {}).get("trace_completeness_rate")),
+                "measured" if summary.get("process_evidence", {}).get("trace_measured_cases") else "not_measured",
+            ),
+            (
+                "Retries",
+                _number_or_null(summary.get("process_evidence", {}).get("retry_count")),
+                "measured" if summary.get("process_evidence", {}).get("attempt_count") else "not_measured",
             ),
         ),
     )

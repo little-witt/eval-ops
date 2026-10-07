@@ -51,9 +51,12 @@ def _canonical_hash(value: Any) -> str:
     return "sha256:" + hashlib.sha256(payload).hexdigest()
 
 
-def _metadata(case: CaseDraft) -> Mapping[str, Any]:
+def _metadata(case: CaseDraft, source_refs: Sequence[str] = (), capability_ids: Sequence[str] = ()) -> Mapping[str, Any]:
+    dimension = case.family.rsplit(".", 1)[-1] if "." in case.family else case.family
+    title = case.family.replace(".", " · ").replace("_", " ").strip()
     return {
         "requirement_ids": list(case.requirement_ids),
+        "capability_ids": list(dict.fromkeys(str(item) for item in capability_ids)),
         "family_id": case.family,
         "origin": case.origin,
         "oracle_trust": case.oracle_level,
@@ -65,6 +68,10 @@ def _metadata(case: CaseDraft) -> Mapping[str, Any]:
         ),
         "needs_user_input": case.needs_user_input,
         "selection_reason": case.selection_reason,
+        "title": title,
+        "kind": dimension,
+        "source_refs": list(source_refs),
+        "generation_reason": case.selection_reason,
     }
 
 
@@ -108,7 +115,18 @@ def compile_case_drafts(
     output = []
     generated = []
     pending = []
+    requirements = {item.id: item for item in plan.requirements}
     for case in plan.cases:
+        source_refs = tuple(
+            ref
+            for requirement_id in case.requirement_ids
+            for ref in (requirements[requirement_id].source_refs if requirement_id in requirements else ())
+        )
+        capability_ids = tuple(
+            requirements[requirement_id].capability_id
+            for requirement_id in case.requirement_ids
+            if requirement_id in requirements
+        )
         if case.origin == "seed":
             if case.id not in seeds:
                 raise CaseGenerationError(
@@ -142,7 +160,7 @@ def compile_case_drafts(
             raise CaseGenerationError(
                 "case %s already defines reserved metadata.aceval_test" % case.id
             )
-        metadata["aceval_test"] = _metadata(case)
+        metadata["aceval_test"] = _metadata(case, source_refs, capability_ids)
         value["metadata"] = metadata
         value.setdefault("split", case.split)
         if not case.oracle_ready or not any(

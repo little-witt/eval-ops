@@ -1,0 +1,19 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>FORGE V3 · Visual Direction</title>
+    <meta http-equiv="refresh" content="0; url=../desktop-v2/index.html?theme=v3&amp;view=task&amp;moment=evaluation" />
+    <script>
+      const target = new URL("../desktop-v2/index.html", window.location.href);
+      const params = new URLSearchParams(window.location.search);
+      params.set("theme", "v3");
+      if (!params.has("view")) params.set("view", "task");
+      if (!params.has("moment")) params.set("moment", "evaluation");
+      target.search = params.toString();
+      window.location.replace(target.href);
+    </script>
+  </head>
+  <body></body>
+</html>

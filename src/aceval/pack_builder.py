@@ -23,6 +23,12 @@ import tempfile
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple, Union
 
 from .contracts import as_primitive
+from .experiments import (
+    ExperimentPlan,
+    adjacent_experiment_path,
+    policy_from_mapping,
+    write_experiment_plan,
+)
 from .pack import EvalPackLoader, LATEST_API_VERSION
 from .pack_lifecycle import (
     CALIBRATION_CALIBRATING,
@@ -78,6 +84,7 @@ class PackBuildResult:
     calibration_status: str
     pack_hash: str
     requested_type: str = ""
+    experiment_path: Optional[Path] = None
 
     @property
     def trusted(self) -> bool:
@@ -116,6 +123,7 @@ def generate_evalpack(
     description: Optional[str] = None,
     source_root: Optional[Union[str, Path]] = None,
     test_design: Optional[Mapping[str, Any]] = None,
+    evaluation_profile: Optional[Mapping[str, Any]] = None,
     registry: Optional[Any] = None,
 ) -> PackBuildResult:
     """Generate a deterministic, structurally validated draft EvalPack.
@@ -163,6 +171,9 @@ def generate_evalpack(
     ).strip()
     normalized_objective = _normalize_objective(objective)
     normalized_test_design = _normalize_test_design(test_design)
+    normalized_evaluation_profile = _normalize_evaluation_profile(
+        evaluation_profile
+    )
     objective_origin = "explicit" if normalized_objective is not None else "none"
     if normalized_objective is None:
         normalized_objective = infer_objective_from_goal(normalized_goal)
@@ -175,8 +186,13 @@ def generate_evalpack(
         else inferred_root
     )
     output = Path(output_dir).expanduser().resolve(strict=False)
+    experiment_path = adjacent_experiment_path(output)
     if output.exists() or output.is_symlink():
         raise PackBuilderError("output_dir must not already exist: %s" % output)
+    if experiment_path.exists() or experiment_path.is_symlink():
+        raise PackBuilderError(
+            "ExperimentPlan output must not already exist: %s" % experiment_path
+        )
     output.parent.mkdir(parents=True, exist_ok=True)
 
     temporary = Path(
@@ -187,23 +203,42 @@ def generate_evalpack(
             temporary,
             normalized_cases,
             normalized_type,
-            normalized_goal,
-            normalized_objective,
             pack_name,
             pack_version,
             pack_description,
             fixture_root,
             requested_type,
-            objective_origin,
             normalized_test_design,
+            normalized_evaluation_profile,
         )
         active_registry = registry if registry is not None else build_builtin_registry()
         EvalPackLoader(active_registry).load(temporary)
         temporary.rename(output)
         frozen = EvalPackLoader(active_registry).load(output)
+        experiment = ExperimentPlan(
+            name="%s-optimization" % pack_name,
+            suite_hash=frozen.suite_hash,
+            optimization=policy_from_mapping(
+                _optimization_for(normalized_goal, normalized_objective)
+            ),
+            source="pack_builder",
+            metadata={
+                "objective_origin": objective_origin,
+                "requested_type": requested_type,
+            },
+        )
+        write_experiment_plan(experiment_path, experiment)
     except Exception:
         if temporary.exists():
             shutil.rmtree(str(temporary))
+        if output.exists() and output.is_dir() and not output.is_symlink():
+            shutil.rmtree(str(output))
+        if (
+            experiment_path.exists()
+            and experiment_path.is_file()
+            and not experiment_path.is_symlink()
+        ):
+            experiment_path.unlink()
         raise
 
     return PackBuildResult(
@@ -213,6 +248,7 @@ def generate_evalpack(
         calibration_status=CALIBRATION_DRAFT,
         pack_hash=frozen.pack_hash,
         requested_type=requested_type,
+        experiment_path=experiment_path,
     )
 
 
@@ -261,6 +297,7 @@ def freeze_evalpack(
             calibration_status=CALIBRATION_FROZEN,
             pack_hash=current_pack.pack_hash,
             requested_type=_generated_requested_type(document, pack_type),
+            experiment_path=_existing_experiment_path(root),
         )
 
     candidate = copy.deepcopy(document)
@@ -287,6 +324,7 @@ def freeze_evalpack(
         calibration_status=CALIBRATION_FROZEN,
         pack_hash=frozen.pack_hash,
         requested_type=_generated_requested_type(candidate, pack_type),
+        experiment_path=_existing_experiment_path(root),
     )
 
 
@@ -304,8 +342,9 @@ def calibration_status(pack_dir: Union[str, Path]) -> str:
 def begin_calibration(pack_dir: Union[str, Path]) -> PackBuildResult:
     """Mark a generated draft as actively being calibrated.
 
-    This transition changes lifecycle metadata only.  Cases, Oracles, Graders,
-    and objectives remain editable until ``freeze_evalpack`` creates the lock.
+    This transition changes lifecycle metadata only.  Cases, Oracles, and Graders
+    remain editable until ``freeze_evalpack`` creates the lock. Optimization
+    goals and budgets live in the adjacent ExperimentPlan and are independent.
     """
 
     root = Path(pack_dir).expanduser().resolve()
@@ -333,6 +372,7 @@ def begin_calibration(pack_dir: Union[str, Path]) -> PackBuildResult:
             requested_type=_generated_requested_type(
                 document, _generated_pack_type(document)
             ),
+            experiment_path=_existing_experiment_path(root),
         )
     candidate = copy.deepcopy(document)
     candidate["metadata"]["calibration_status"] = CALIBRATION_CALIBRATING
@@ -354,6 +394,7 @@ def begin_calibration(pack_dir: Union[str, Path]) -> PackBuildResult:
         calibration_status=CALIBRATION_CALIBRATING,
         pack_hash=loaded.pack_hash,
         requested_type=_generated_requested_type(candidate, pack_type),
+        experiment_path=_existing_experiment_path(root),
     )
 
 
@@ -517,6 +558,25 @@ def _normalize_test_design(
     return normalized
 
 
+def _normalize_evaluation_profile(
+    value: Optional[Mapping[str, Any]],
+) -> Optional[Dict[str, Any]]:
+    if value is None:
+        return None
+    if not isinstance(value, Mapping):
+        raise PackBuilderError("evaluation_profile must be an object")
+    normalized = as_primitive(value)
+    if not isinstance(normalized, Mapping):
+        raise PackBuilderError("evaluation_profile must be an object")
+    try:
+        json.dumps(normalized, allow_nan=False)
+    except (TypeError, ValueError) as exc:
+        raise PackBuilderError(
+            "evaluation_profile must contain finite JSON values"
+        ) from exc
+    return dict(normalized)
+
+
 def infer_objective_from_goal(goal: str) -> Optional[Dict[str, Any]]:
     """Infer one conservative efficiency objective from a natural-language goal.
 
@@ -570,15 +630,13 @@ def _build_pack_tree(
     root: Path,
     cases: Sequence[_Case],
     pack_type: str,
-    goal: str,
-    objective: Optional[Mapping[str, Any]],
     name: str,
     version: str,
     description: str,
     source_root: Path,
     requested_type: str,
-    objective_origin: str,
     test_design: Optional[Mapping[str, Any]],
+    evaluation_profile: Optional[Mapping[str, Any]],
 ) -> None:
     for directory in ("scenarios", "oracles", "fixtures", "schemas"):
         (root / directory).mkdir(parents=True, exist_ok=True)
@@ -605,15 +663,13 @@ def _build_pack_tree(
     manifest = _manifest_for(
         cases,
         pack_type,
-        goal,
-        objective,
         name,
         version,
         description,
         schema_path,
         requested_type,
-        objective_origin,
         test_design,
+        evaluation_profile,
     )
     by_split = {split: [] for split in _SPLITS}  # type: Dict[str, List[Dict[str, Any]]]
     for case in cases:
@@ -639,15 +695,13 @@ def _build_pack_tree(
 def _manifest_for(
     cases: Sequence[_Case],
     pack_type: str,
-    goal: str,
-    objective: Optional[Mapping[str, Any]],
     name: str,
     version: str,
     description: str,
     schema_path: str,
     requested_type: str,
-    objective_origin: str,
     test_design: Optional[Mapping[str, Any]],
+    evaluation_profile: Optional[Mapping[str, Any]],
 ) -> Dict[str, Any]:
     suites = {item.split for item in cases}
     suite = {"dev": "scenarios/dev.yaml"}  # type: Dict[str, Any]
@@ -655,22 +709,6 @@ def _manifest_for(
         suite["validation_ref"] = "scenarios/validation.yaml"
     if "holdout" in suites:
         suite["holdout_ref"] = "scenarios/holdout.yaml"
-
-    optimizer = {
-        "adapter": "skill_markdown_v1",
-        "patchable_components": ["skill_instruction"],
-        "allowed_paths": ["SKILL.md"],
-        "visible_splits": ["dev"],
-        "beam_width": 1,
-        "max_rounds": 2,
-        "max_candidate_snapshots": 2,
-        "max_added_lines": 30,
-        "forbid_case_literals": True,
-        "mode": "auto",
-        "goal": goal,
-    }
-    if objective is not None:
-        optimizer["objective"] = dict(objective)
 
     metadata = {
         "name": name,
@@ -690,7 +728,6 @@ def _manifest_for(
         "template_fallback": (
             requested_type if requested_type != pack_type else None
         ),
-        "objective_origin": objective_origin,
     }
     if test_design is not None:
         graph = test_design["capability_graph"]
@@ -702,6 +739,8 @@ def _manifest_for(
             "coverage_target_ref": "design/coverage-target.json",
             "generation_provenance_ref": "design/generation-provenance.json",
         }
+    if evaluation_profile is not None:
+        metadata["evaluation_profile"] = dict(evaluation_profile)
 
     return {
         "api_version": LATEST_API_VERSION,
@@ -715,8 +754,36 @@ def _manifest_for(
         "driver": _driver_for(pack_type),
         "suite": suite,
         "graders": _graders_for(pack_type, schema_path),
-        "optimizer_policy": optimizer,
     }
+
+
+def _optimization_for(
+    goal: str,
+    objective: Optional[Mapping[str, Any]],
+) -> Dict[str, Any]:
+    """Return optimizer controls without placing them in the EvalPack."""
+
+    optimization = {
+        "adapter": "skill_markdown_v1",
+        "patchable_components": ["skill_instruction"],
+        "allowed_paths": ["SKILL.md"],
+        "visible_splits": ["dev"],
+        "beam_width": 1,
+        "max_rounds": 2,
+        "max_candidate_snapshots": 2,
+        "max_added_lines": 30,
+        "forbid_case_literals": True,
+        "mode": "auto",
+        "goal": goal,
+    }
+    if objective is not None:
+        optimization["objective"] = dict(objective)
+    return optimization
+
+
+def _existing_experiment_path(pack_root: Path) -> Optional[Path]:
+    path = adjacent_experiment_path(pack_root)
+    return path if path.is_file() else None
 
 
 def _driver_for(pack_type: str) -> Dict[str, Any]:

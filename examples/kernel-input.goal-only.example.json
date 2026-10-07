@@ -1,0 +1,12 @@
+{
+  "api_version": "aceval.kernel-input/v1",
+  "skill_name": "frontend-code-reviewer",
+  "goal": "提升前端代码评审的缺陷召回、证据质量和建议可执行性",
+  "standards": [
+    "覆盖 React Native、TypeScript 与微信小程序的典型高风险问题",
+    "严格遵循 Skill 执行路径",
+    "避免无证据误报"
+  ],
+  "cases": [],
+  "notes": "没有现成 case，由 Kernel 从 Skill 能力图补充生成。"
+}

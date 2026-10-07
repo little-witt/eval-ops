@@ -249,6 +249,7 @@ class GraderTest(unittest.IsolatedAsyncioTestCase):
                 "source_reference",
                 "trace_assert",
                 "workspace_diff",
+                "code_review_findings_v1",
             },
             set(builtin_graders()),
         )

@@ -132,6 +132,34 @@ class SkillAnalysisTest(unittest.TestCase):
         self.assertEqual("sha256:%s" % snapshot.content_hash, from_path.subject_hash)
         self.assertEqual("SKILL.md", from_path.source_path)
 
+    def test_skill_file_and_checkout_directory_share_resource_closure_hash(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            (root / "references").mkdir()
+            (root / "references" / "rules.md").write_text(
+                "Use the reviewed rules.\n", encoding="utf-8"
+            )
+            (root / "SKILL.md").write_text(
+                "# Review\n\nOutputs:\n- result\n\n"
+                "See [rules](references/rules.md).\n",
+                encoding="utf-8",
+            )
+            (root / "subject.json").write_text(
+                '{"metadata":{"id":"review","version":"1"}}',
+                encoding="utf-8",
+            )
+
+            directory_snapshot = SkillMarkdownSubjectAdapter().snapshot(str(root))
+            file_snapshot = SkillMarkdownSubjectAdapter().snapshot(
+                str(root / "SKILL.md")
+            )
+            directory_graph = analyze_skill(root)
+            file_graph = analyze_skill(root / "SKILL.md")
+
+        self.assertEqual(directory_snapshot.content_hash, file_snapshot.content_hash)
+        self.assertEqual(directory_snapshot.files, file_snapshot.files)
+        self.assertEqual(directory_graph, file_graph)
+
     def test_fails_closed_for_invalid_utf8_hashes_and_changed_source(self):
         with self.assertRaisesRegex(SkillAnalysisError, "UTF-8"):
             analyze_skill(b"\xff")
@@ -170,6 +198,52 @@ class SkillAnalysisTest(unittest.TestCase):
         )
         self.assertEqual(graph.capabilities[0].id, ambiguity.capability_id)
         self.assertEqual("inferred", ambiguity.source_ref.binding)
+
+    def test_resource_closure_normalizes_nested_parent_reference_within_root(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            (root / "references").mkdir()
+            (root / "scripts").mkdir()
+            (root / "SKILL.md").write_text(
+                "# Review\n\nOutputs:\n- result\n\nSee [rules](references/rules.md).\n",
+                encoding="utf-8",
+            )
+            (root / "references" / "rules.md").write_text(
+                "Run [the checker](../scripts/check.py).\n",
+                encoding="utf-8",
+            )
+            (root / "scripts" / "check.py").write_text(
+                "print('ok')\n", encoding="utf-8"
+            )
+
+            snapshot = SkillMarkdownSubjectAdapter().snapshot(str(root))
+
+        self.assertIn("references/rules.md", snapshot.files)
+        self.assertIn("scripts/check.py", snapshot.files)
+        self.assertFalse(snapshot.metadata["resource_issues"])
+
+    def test_missing_and_escaping_resource_references_are_not_silent(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            (root / "references").mkdir()
+            (root / "SKILL.md").write_text(
+                "# Review\n\nOutputs:\n- result\n\nSee [missing](references/missing.md).\n",
+                encoding="utf-8",
+            )
+            (root / "references" / "rules.md").write_text(
+                "Do not load [outside](../../private.txt).\n",
+                encoding="utf-8",
+            )
+
+            snapshot = SkillMarkdownSubjectAdapter().snapshot(str(root))
+
+        issues = snapshot.metadata["resource_issues"]
+        self.assertTrue(
+            any("does not exist" in item["reason"] for item in issues), issues
+        )
+        self.assertTrue(
+            any("escaped its root" in item["reason"] for item in issues), issues
+        )
 
 
 if __name__ == "__main__":

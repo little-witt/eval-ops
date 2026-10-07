@@ -61,6 +61,9 @@ class MaterializedCandidateSnapshot:
     patch: str
     rationale: str
     usage: Mapping[str, Any] = None
+    changed_paths: Tuple[str, ...] = ()
+    created_paths: Tuple[str, ...] = ()
+    validation: Tuple[Mapping[str, Any], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -289,29 +292,34 @@ def materialize_candidate(
     parent_subject_hash = parent_snapshot.content_hash
     parent_file_hash = _hash_text(original)
     manifest_bytes = parent_snapshot.files.get("subject.json")
-    subject_hash = hash_skill_subject(encoded, manifest_bytes)
+    resource_files = {
+        str(path): content
+        for path, content in parent_snapshot.files.items()
+        if path not in ("SKILL.md", "subject.json")
+    }
+    subject_hash = hash_skill_subject(encoded, manifest_bytes, resource_files)
     snapshot_id = subject_hash[:16]
     snapshot_path = output_root / snapshot_id
+    expected_files = {
+        key: value
+        for key, value in (
+            ("SKILL.md", encoded),
+            ("subject.json", manifest_bytes),
+            *tuple(sorted(resource_files.items())),
+        )
+        if value is not None
+    }
     if snapshot_path.exists():
         existing = SkillMarkdownSubjectAdapter().snapshot(str(snapshot_path))
-        if existing.content_hash != subject_hash or dict(existing.files) != {
-            key: value
-            for key, value in (
-                ("SKILL.md", encoded),
-                ("subject.json", manifest_bytes),
-            )
-            if value is not None
-        }:
+        if existing.content_hash != subject_hash or dict(existing.files) != expected_files:
             raise CandidateRejected("candidate hash collision")
     else:
         snapshot_path.mkdir(parents=True, exist_ok=False)
-        skill_target = snapshot_path / "SKILL.md"
-        skill_target.write_bytes(encoded)
-        skill_target.chmod(0o444)
-        if manifest_bytes is not None:
-            manifest_target = snapshot_path / "subject.json"
-            manifest_target.write_bytes(manifest_bytes)
-            manifest_target.chmod(0o444)
+        for relative, content in sorted(expected_files.items()):
+            target = snapshot_path / relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(content)
+            target.chmod(0o444)
         (snapshot_path / "candidate.patch").write_text("\n".join(diff_lines) + "\n", encoding="utf-8")
         (snapshot_path / "candidate.json").write_text(
             json.dumps(
@@ -344,7 +352,12 @@ def materialize_candidate(
 def _skill_file(subject: Path) -> Path:
     path = subject.resolve()
     if path.is_dir():
-        path = path / "SKILL.md"
+        # Skills in the wild use both a repository-root entrypoint and the
+        # conventional src/SKILL.md layout.  The iteration Kernel already
+        # accepts both; the candidate materializer must use the same contract
+        # or optimization fails before the model is even called.
+        candidates = (path / "SKILL.md", path / "src" / "SKILL.md")
+        path = next((candidate for candidate in candidates if candidate.is_file()), candidates[0])
     if not path.is_file():
         raise CandidateRejected("SKILL.md not found: %s" % path)
     return path

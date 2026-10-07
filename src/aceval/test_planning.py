@@ -1018,8 +1018,8 @@ def _requirements(graph: CapabilityGraph, goal: str) -> Tuple[TestRequirement, .
         )
         happy_factors = _risk_factors(capability, goal, 3, 4, "happy", "output")
         expected = (
-            tuple("Produce declared output: %s" % item for item in capability.outputs)
-            or ("Complete the declared capability: %s" % capability.name,)
+            tuple("产出 Skill 声明的结果：%s" % item for item in capability.outputs)
+            or ("完成 Skill 声明的能力：%s" % capability.name,)
         )
         result.append(
             _requirement(
@@ -1029,7 +1029,7 @@ def _requirements(graph: CapabilityGraph, goal: str) -> Tuple[TestRequirement, .
                 "happy_path",
                 binding,
                 capability.preconditions,
-                "Exercise the declared capability: %s" % capability.name,
+                "执行 Skill 声明的能力：%s" % capability.name,
                 expected,
                 "workspace_state" if _has_artifact_output(capability) else "semantic_rubric",
                 base_runtime,
@@ -1059,7 +1059,7 @@ def _requirements(graph: CapabilityGraph, goal: str) -> Tuple[TestRequirement, .
                     binding,
                     capability.preconditions,
                     condition,
-                    ("Follow the explicitly declared branch behavior: %s" % condition,),
+                    ("遵循 Skill 明确声明的分支行为：%s" % condition,),
                     "output_invariant" if capability.outputs else "semantic_rubric",
                     base_runtime,
                     (branch.id,),
@@ -1077,7 +1077,7 @@ def _requirements(graph: CapabilityGraph, goal: str) -> Tuple[TestRequirement, .
                     binding,
                     (),
                     "Remove or violate precondition: %s" % precondition,
-                    ("Fail clearly or recover safely without unauthorized effects.",),
+                    ("清晰报告失败或安全恢复，且不产生未授权副作用。",),
                     "output_invariant+workspace_diff",
                     set(base_runtime) | {"workspace_fixture"},
                     source_refs,
@@ -1095,7 +1095,7 @@ def _requirements(graph: CapabilityGraph, goal: str) -> Tuple[TestRequirement, .
                     binding,
                     capability.preconditions,
                     "Exercise the declared risk boundary: %s" % risk,
-                    ("The declared prohibited or unsafe outcome does not occur: %s" % risk,),
+                    ("不得发生 Skill 声明的禁止或不安全结果：%s" % risk,),
                     "workspace_diff+output_invariant",
                     base_runtime,
                     source_refs,
@@ -1123,7 +1123,7 @@ def _requirements(graph: CapabilityGraph, goal: str) -> Tuple[TestRequirement, .
                     binding,
                     capability.preconditions,
                     "Inject a failure from: %s" % names,
-                    ("The Skill reports or recovers from the tool failure without unsafe partial effects.",),
+                    ("Skill 必须报告或恢复工具失败，且不留下不安全的部分修改。",),
                     "fault_signal+workspace_diff",
                     set(base_runtime) | {"fault_injection"},
                     source_refs,
@@ -1428,11 +1428,13 @@ def _candidate(
         id="generated.%s" % (requirement.id[4:] if requirement.id.startswith("req.") else requirement.id),
         split=split,
         prompt=(
-            "Exercise capability %s. %s Verify only these source-grounded observables: %s"
+            "请针对 Skill 中的能力“%s”执行真实任务：%s。"
+            "重点验证：%s。执行时必须先读取并遵循 Skill，"
+            "最后说明实际采取的步骤、产出和未满足项；不要把能力名称本身当作结果。"
             % (
                 requirement.capability_id,
                 requirement.stimulus,
-                "; ".join(expected),
+                "；".join(expected),
             )
         ),
         requirement_ids=tuple(sorted(covered)),
@@ -1445,7 +1447,17 @@ def _candidate(
         executable=_is_executable(runtime_required, runtime),
         estimated_cost=estimated_cost,
         needs_user_input=oracle_level not in ORACLE_READY_LEVELS,
-        selection_reason="Candidate for uncovered requirement %s." % requirement.id,
+        selection_reason=(
+            "围绕未覆盖要求 %s 生成；对应能力 %s，评测维度为 %s，"
+            "依据 Skill 来源 %s，检查 %s。"
+            % (
+                requirement.id,
+                requirement.capability_id,
+                requirement.dimension,
+                "、".join(requirement.source_refs) or "未声明来源",
+                "；".join(expected),
+            )
+        ),
     )
     return _Candidate(case=case, covers=frozenset(covered))
 

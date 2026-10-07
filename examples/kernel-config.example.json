@@ -1,0 +1,67 @@
+{
+  "api_version": "aceval.kernel-config/v1",
+  "skill_repository": {
+    "ssh_url": "ssh://git@git.sankuai.com/~user/my-skill.git",
+    "branch": "feature/eval-and-optimize",
+    "local_path": "/absolute/path/to/my-skill",
+    "authorization_token_env": "CATX_REPOSITORY_AUTHORIZATION_TOKEN",
+    "mount_path": "/workspace/skill"
+  },
+  "code_repository": {
+    "ssh_url": "ssh://git@git.sankuai.com/~user/fixture-lab.git",
+    "branch": "case/frontend-review-001",
+    "local_path": "/absolute/path/to/fixture-lab",
+    "authorization_token_env": "CATX_REPOSITORY_AUTHORIZATION_TOKEN",
+    "mount_path": "/workspace/repo"
+  },
+  "local_analysis": {
+    "model_command": [
+      "your-model-bridge",
+      "--json"
+    ],
+    "model_id": "your-analysis-model",
+    "api_base_url_env": "LOCAL_MODEL_API_BASE",
+    "api_key_env": "LOCAL_MODEL_API_KEY",
+    "env_allowlist": [
+      "LOCAL_MODEL_API_BASE",
+      "LOCAL_MODEL_API_KEY"
+    ],
+    "timeout_seconds": 120,
+    "max_prompt_chars": 48000,
+    "max_output_chars": 24000
+  },
+  "remote_agent": {
+    "profile_path": "/absolute/path/to/catx-profile.local.json",
+    "max_parallel": 8,
+    "poll_interval_seconds": 5,
+    "max_wait_seconds": 1200
+  },
+  "policy": {
+    "max_generated_cases": 12,
+    "max_rounds": 5,
+    "pass_verification_runs": 1,
+    "max_analysis_evidence_chars_per_case": 4000,
+    "max_remote_prompt_chars": 12000,
+    "max_total_remote_sessions": 200,
+    "min_improvement": 0.01,
+    "convergence_patience": 2,
+    "optimization_editable_patterns": [
+      "SKILL.md",
+      "src/SKILL.md",
+      "scripts/**",
+      "references/**",
+      "workflow/**",
+      "knowledge/**",
+      "specs/**",
+      "config/**",
+      "assets/**"
+    ],
+    "optimization_validation_commands": [
+      ["python3", "-m", "unittest", "discover", "-s", "scripts/tests"]
+    ],
+    "max_optimization_changed_files": 8,
+    "max_optimization_added_lines": 300,
+    "max_optimization_changed_bytes": 524288,
+    "max_optimization_context_chars": 120000
+  }
+}

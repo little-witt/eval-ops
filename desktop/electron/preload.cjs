@@ -1,0 +1,31 @@
+const { contextBridge, ipcRenderer } = require("electron");
+
+const RPC_METHODS = new Set([
+  "system.bootstrap", "tasks.list", "tasks.get", "tasks.events", "tasks.create",
+  "tasks.run", "tasks.restart", "tasks.confirm", "tasks.retry_failed", "tasks.retry_evidence", "tasks.reopen_case_review", "tasks.log", "operations.get", "d2c.check", "d2c.validate",
+]);
+
+contextBridge.exposeInMainWorld("forge", Object.freeze({
+  rpc(method, params = {}) {
+    if (!RPC_METHODS.has(method)) return Promise.reject(new Error("Unsupported desktop method"));
+    return ipcRenderer.invoke("forge:rpc", method, params);
+  },
+  selectDirectory() { return ipcRenderer.invoke("forge:select-directory"); },
+  selectFile(filters = []) { return ipcRenderer.invoke("forge:select-file", filters); },
+  selectImage() { return ipcRenderer.invoke("forge:select-image"); },
+  openPreview(url) { return ipcRenderer.invoke("forge:open-preview", url); },
+  readArtifact(path) { return ipcRenderer.invoke("forge:read-artifact", path); },
+  secretStatus() { return ipcRenderer.invoke("forge:secret-status"); },
+  catxDefault() { return ipcRenderer.invoke("forge:catx-default"); },
+  saveCatxDefault(value) { return ipcRenderer.invoke("forge:save-catx-default", value); },
+  prepareCatxProfile(value) { return ipcRenderer.invoke("forge:prepare-catx-profile", value); },
+  saveSecrets(values) { return ipcRenderer.invoke("forge:save-secrets", values); },
+  modelProfiles() { return ipcRenderer.invoke("forge:model-profiles"); },
+  importCodexFile(kind) { return ipcRenderer.invoke("forge:import-codex-file", kind); },
+  importCodexCcSwitch() { return ipcRenderer.invoke("forge:import-codex-cc-switch"); },
+  refreshCodexProfile(profileId = "default") { return ipcRenderer.invoke("forge:refresh-codex-profile", profileId); },
+  testCodexProfile(profileId, modelId, reasoningEffort) { return ipcRenderer.invoke("forge:test-codex-profile", profileId, modelId, reasoningEffort); },
+  installExtension() { return ipcRenderer.invoke("forge:install-extension"); },
+  listExtensions() { return ipcRenderer.invoke("forge:list-extensions"); },
+  platform: process.platform,
+}));

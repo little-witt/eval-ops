@@ -1,0 +1,12 @@
+{
+  "api_version": "aceval.kernel-input/v1",
+  "skill_name": "frontend-code-reviewer",
+  "operation": "discover",
+  "goal": "探索当前 Skill 最值得增加的高价值能力",
+  "standards": [
+    "方案必须说明用户价值、触发边界、风险和旧能力回归策略",
+    "只选择能由现有远程与 Fixture Lab 环境稳定验证的能力"
+  ],
+  "cases": [],
+  "notes": "Harness 至少生成两个能力方案，用户选择后才进入实现。"
+}
