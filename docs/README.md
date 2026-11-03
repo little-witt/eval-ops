@@ -2,6 +2,8 @@
 
 ## 当前有效
 
+- [`current/FORGE_PROJECT_EVALUATION_SUMMARY.md`](./current/FORGE_PROJECT_EVALUATION_SUMMARY.md)：项目亮点、评测对象、三层裁决、归因、迭代版本和幂等机制的快速说明。
+- [`current/FORGE_EVAL_ENGINEERING_PRACTICE.md`](./current/FORGE_EVAL_ENGINEERING_PRACTICE.md)：以 Security Review EvalPack 为贯穿案例的评测与自迭代工程实践。
 - [`current/FINAL_SYSTEM_ARCHITECTURE.md`](./current/FINAL_SYSTEM_ARCHITECTURE.md)：唯一有效的产品与系统架构基线。
 - [`current/EVALUATION_SELF_ITERATION_KERNEL_V2.md`](./current/EVALUATION_SELF_ITERATION_KERNEL_V2.md)：自迭代 Kernel 算法与契约。
 - [`current/SKILL_EVALUATION_CASE_PIPELINE_V3.md`](./current/SKILL_EVALUATION_CASE_PIPELINE_V3.md)：路径契约驱动的 Case 生成、严格执行、完整证据、多维评分与总结分析方案（V3 演进提案）。
